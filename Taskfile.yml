@@ -1,0 +1,22 @@
+version: '3'
+
+tasks:
+  up:
+    desc: Build and start the app + db
+    cmd: docker compose up -d --build
+
+  down:
+    desc: Stop the app + db
+    cmd: docker compose down
+
+  logs:
+    desc: Tail app logs
+    cmd: docker compose logs -f app
+
+  build:
+    desc: Compile the Go server (no docker)
+    cmd: go build ./...
+
+  restart:
+    desc: Rebuild and restart just the app container
+    cmd: docker compose up -d --build app

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1c1714">
+<title>Sift</title>
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="style.css">
+<script>
+  var t = localStorage.getItem('theme');
+  if (t) document.documentElement.dataset.theme = t;
+</script>
+</head>
+<body>
+  <header class="topbar">
+    Sift
+    <span>
+      <button id="themeBtn" class="logout-btn">Theme</button>
+      <button id="accountsBtn" class="logout-btn">Accounts</button>
+      <button id="logoutBtn" class="logout-btn">Log out</button>
+    </span>
+  </header>
+
+  <div class="pull-indicator" id="pullIndicator">↓ pull to refresh</div>
+
+  <ul class="inbox" id="inbox"></ul>
+
+  <div id="accountsPanel" class="accounts-panel hidden">
+    <h2>Accounts</h2>
+    <ul id="accountsList" class="accounts-list"></ul>
+    <form id="addAccountForm">
+      <input name="email" type="email" placeholder="Email address" required>
+      <input name="host" type="text" placeholder="IMAP host (e.g. imap.fastmail.com)" required>
+      <input name="port" type="number" placeholder="Port (e.g. 993)" value="993" required>
+      <input name="username" type="text" placeholder="Username" required>
+      <input name="password" type="password" placeholder="Password" required>
+      <button type="submit">Add account</button>
+      <p id="addAccountError" class="form-error"></p>
+    </form>
+    <button id="closeAccountsBtn">Close</button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
