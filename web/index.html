@@ -27,7 +27,10 @@
 
   <div class="dry-run-banner" id="dryRunBanner">Dry run mode — nothing will be saved</div>
 
-  <div class="pull-indicator" id="pullIndicator">↓ pull to refresh</div>
+  <div class="pull-indicator" id="pullIndicator">
+    <span class="pull-icon" id="pullIcon">📨</span>
+    <span class="pull-text" id="pullText">Pull to refresh</span>
+  </div>
 
   <ul class="inbox" id="inbox"></ul>
 
@@ -44,6 +47,25 @@
       <p id="addAccountError" class="form-error"></p>
     </form>
     <button id="closeAccountsBtn">Close</button>
+  </div>
+
+  <div id="moveModal" class="move-modal hidden">
+    <div class="move-modal-content">
+      <div class="move-modal-header">
+        <span>Move to…</span>
+        <button id="moveModalClose">✕</button>
+      </div>
+      <p id="moveModalError" class="form-error"></p>
+      <div id="moveModalTree" class="folder-tree move-folder-tree"></div>
+    </div>
+  </div>
+
+  <div id="folderViewPanel" class="accounts-panel folder-view-panel hidden">
+    <div class="folder-view-header">
+      <button id="folderViewBack">← Inbox</button>
+      <span id="folderViewTitle"></span>
+    </div>
+    <ul id="folderViewList" class="inbox"></ul>
   </div>
 
   <script src="app.js"></script>

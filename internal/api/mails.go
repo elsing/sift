@@ -5,7 +5,6 @@ package api
 
 import (
 	"database/sql"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,16 +16,15 @@ import (
 
 const pageSize = 30
 
-//go:embed schema.sql
-var schema string
-
 type Mail struct {
-	ID      string `json:"id"`
-	Sender  string `json:"sender"`
-	Subject string `json:"subject"`
-	Snippet string `json:"snippet"`
-	Time    string `json:"time"`
-	Unread  bool   `json:"unread"`
+	ID        string `json:"id"`
+	Sender    string `json:"sender"`
+	Subject   string `json:"subject"`
+	Snippet   string `json:"snippet"`
+	Time      string `json:"time"`
+	Unread    bool   `json:"unread"`
+	AccountID string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
+	UID       uint32 `json:"-"`                   // IMAP UID within INBOX; zero for mock mail, used to move/delete on the server
 }
 
 var senders = []string{"Alex Chen", "Notion", "Sarah Park", "GitHub", "Mom", "Stripe", "Figma", "Delta", "Sam Lee", "Linear"}
@@ -48,10 +46,8 @@ type Store struct {
 	crypto *encryptor
 }
 
+// NewStore assumes db.Migrate has already been run by the caller.
 func NewStore(db *sql.DB) (*Store, error) {
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("apply schema: %w", err)
-	}
 	crypto, err := newEncryptor()
 	if err != nil {
 		return nil, err
@@ -63,7 +59,12 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("check accounts: %w", err)
 	}
 	if hasAccounts {
-		return s, nil // real accounts exist, don't seed mock data over them
+		// a real account exists now; purge any mock rows seeded before it was added
+		// (account_id is only ever NULL for mock data, never for real IMAP-synced mail)
+		if _, err := db.Exec("DELETE FROM mails WHERE account_id IS NULL"); err != nil {
+			return nil, fmt.Errorf("clean up mock mail: %w", err)
+		}
+		return s, nil
 	}
 
 	var count int
@@ -120,9 +121,14 @@ func randomMail() Mail {
 func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/mails", s.handleList)
 	mux.HandleFunc("POST /api/mails/refresh", s.handleRefresh)
-	mux.HandleFunc("POST /api/mails/{id}/archive", s.handleRemove)
-	mux.HandleFunc("POST /api/mails/{id}/delete", s.handleRemove)
+	mux.HandleFunc("POST /api/mails/{id}/archive", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRemove(w, r, "archive")
+	})
+	mux.HandleFunc("POST /api/mails/{id}/delete", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRemove(w, r, "delete")
+	})
 	mux.HandleFunc("POST /api/mails/{id}/read", s.handleToggleRead)
+	mux.HandleFunc("POST /api/mails/{id}/move", s.handleMove)
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
@@ -132,12 +138,20 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if len(mails) < pageSize {
+		// scrolled past what's cached locally; pull another batch of older mail before answering
+		if _, err := s.backfillAllAccounts(pageSize); err != nil {
+			log.Printf("backfill: %v", err)
+		} else if refreshed, err := s.list(offset, pageSize); err == nil {
+			mails = refreshed
+		}
+	}
 	writeJSON(w, mails)
 }
 
 func (s *Store) list(offset, limit int) ([]Mail, error) {
 	rows, err := s.db.Query(
-		"SELECT id, sender, subject, snippet, time, unread FROM mails ORDER BY id DESC LIMIT $1 OFFSET $2",
+		"SELECT id, sender, subject, snippet, time, unread, coalesce(account_id, '') FROM mails ORDER BY id DESC LIMIT $1 OFFSET $2",
 		limit, offset,
 	)
 	if err != nil {
@@ -148,7 +162,7 @@ func (s *Store) list(offset, limit int) ([]Mail, error) {
 	mails := []Mail{}
 	for rows.Next() {
 		var m Mail
-		if err := rows.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread); err != nil {
+		if err := rows.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID); err != nil {
 			return nil, err
 		}
 		mails = append(mails, m)
@@ -179,11 +193,44 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, mails)
 }
 
-func (s *Store) handleRemove(w http.ResponseWriter, r *http.Request) {
+func (s *Store) handleRemove(w http.ResponseWriter, r *http.Request, action string) {
 	id := r.PathValue("id")
 	if isDryRun(r) {
-		log.Printf("[dry-run] would remove mail %s", id)
+		log.Printf("[dry-run] would %s mail %s", action, id)
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.archiveOrDeleteOnServer(id, action); err != nil {
+		log.Printf("%s mail %s on server: %v", action, id, err)
+		http.Error(w, fmt.Sprintf("couldn't %s on the server: %v", action, err), http.StatusBadGateway)
+		return
+	}
+	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleMove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Folder string `json:"folder"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Folder == "" {
+		http.Error(w, "a destination folder is required", http.StatusBadRequest)
+		return
+	}
+
+	if isDryRun(r) {
+		log.Printf("[dry-run] would move mail %s to %s", id, req.Folder)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if err := s.moveMailToFolder(id, req.Folder); err != nil {
+		log.Printf("move mail %s to %s: %v", id, req.Folder, err)
+		http.Error(w, "couldn't move that mail: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {

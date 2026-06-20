@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	imap "github.com/emersion/go-imap/v2"
 )
 
 type dbAccount struct {
@@ -45,6 +47,7 @@ func (s *Store) AccountsRoutes(mux *http.ServeMux, ownerSubject func(*http.Reque
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/sync", s.handleSyncAccount)
 	mux.HandleFunc("GET /api/accounts/{id}/folders", s.handleListFolders)
+	mux.HandleFunc("GET /api/accounts/{id}/folder-mails", s.handleFolderMails)
 }
 
 // isDryRun reports whether the request asked to simulate a mutation rather than perform it.
@@ -163,6 +166,27 @@ func (s *Store) handleListFolders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, buildFolderTree(names, delim))
 }
 
+func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	folder := r.URL.Query().Get("path")
+	if folder == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	acct, password, err := s.loadAccountCreds(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	mails, err := fetchFolderMail(acct, password, folder, pageSize)
+	if err != nil {
+		log.Printf("folder mails %s/%s: %v", acct.Email, folder, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, mails)
+}
+
 func (s *Store) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.syncAccount(id); err != nil {
@@ -184,38 +208,197 @@ func (s *Store) syncAccount(accountID string) error {
 		return err
 	}
 
-	mails, err := syncIMAP(acct, password)
+	mails, oldestUID, err := syncIMAP(acct, password)
 	if err != nil {
 		syncErr := fmt.Errorf("imap sync: %w", err)
 		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", syncErr.Error(), accountID)
 		return syncErr
 	}
 
+	if err := s.upsertMails(accountID, mails); err != nil {
+		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
+		return err
+	}
+	// only move the backfill boundary down (older); a regular sync's window can be
+	// newer than what backfill has already reached further back in history.
+	if oldestUID > 0 {
+		s.db.Exec(
+			"UPDATE accounts SET last_sync_error = NULL, oldest_synced_uid = LEAST(coalesce(oldest_synced_uid, $1), $1) WHERE id = $2",
+			int64(oldestUID), accountID,
+		)
+	} else {
+		s.db.Exec("UPDATE accounts SET last_sync_error = NULL WHERE id = $1", accountID)
+	}
+	return nil
+}
+
+// upsertMails inserts/updates mails for an account inside a single transaction.
+func (s *Store) upsertMails(accountID string, mails []Mail) error {
+	if len(mails) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
 		return err
 	}
 	defer tx.Rollback()
 
 	for _, m := range mails {
 		_, err := tx.Exec(`
-			INSERT INTO mails (id, account_id, sender, subject, snippet, time, unread)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (id) DO UPDATE SET unread = excluded.unread`,
-			m.ID, accountID, m.Sender, m.Subject, m.Snippet, m.Time, m.Unread,
+			INSERT INTO mails (id, account_id, sender, subject, snippet, time, unread, uid)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (id) DO UPDATE SET
+				sender = excluded.sender, subject = excluded.subject,
+				snippet = excluded.snippet, time = excluded.time, unread = excluded.unread,
+				uid = excluded.uid`,
+			m.ID, accountID, m.Sender, m.Subject, m.Snippet, m.Time, m.Unread, m.UID,
 		)
 		if err != nil {
-			s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
 			return err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
+	return tx.Commit()
+}
+
+// resolveFolders returns the account's Archive/Trash mailbox names, detecting and
+// caching them on first use so we don't re-run a full folder LIST on every swipe.
+// Either value can be "" if the server has no such folder.
+func (s *Store) resolveFolders(accountID string) (archive, trash string, err error) {
+	var archiveCol, trashCol *string
+	err = s.db.QueryRow(
+		"SELECT archive_folder, trash_folder FROM accounts WHERE id = $1", accountID,
+	).Scan(&archiveCol, &trashCol)
+	if err != nil {
+		return "", "", err
+	}
+	if archiveCol != nil && trashCol != nil {
+		return *archiveCol, *trashCol, nil
+	}
+
+	acct, password, err := s.loadAccountCreds(accountID)
+	if err != nil {
+		return "", "", err
+	}
+	archive, trash, err = detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password)
+	if err != nil {
+		return "", "", err
+	}
+	s.db.Exec("UPDATE accounts SET archive_folder = $1, trash_folder = $2 WHERE id = $3", archive, trash, accountID)
+	return archive, trash, nil
+}
+
+// moveMailToFolder loads a mail's account + UID and moves it to destFolder on the
+// real IMAP server.
+func (s *Store) moveMailToFolder(mailID, destFolder string) error {
+	var accountID *string
+	var uid *int64
+	err := s.db.QueryRow("SELECT account_id, uid FROM mails WHERE id = $1", mailID).Scan(&accountID, &uid)
+	if err != nil {
 		return err
 	}
-	s.db.Exec("UPDATE accounts SET last_sync_error = NULL WHERE id = $1", accountID)
-	return nil
+	if accountID == nil || uid == nil {
+		return fmt.Errorf("mock mail has no real mailbox to move it in")
+	}
+	acct, password, err := s.loadAccountCreds(*accountID)
+	if err != nil {
+		return err
+	}
+	return moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), destFolder)
+}
+
+// archiveOrDeleteOnServer moves a mail to the account's Archive/Trash folder for the
+// given action. Mock mail (no account_id) has nothing real to move and is a no-op.
+func (s *Store) archiveOrDeleteOnServer(mailID, action string) error {
+	var accountID *string
+	if err := s.db.QueryRow("SELECT account_id FROM mails WHERE id = $1", mailID).Scan(&accountID); err != nil {
+		return err
+	}
+	if accountID == nil {
+		return nil
+	}
+
+	archive, trash, err := s.resolveFolders(*accountID)
+	if err != nil {
+		return fmt.Errorf("resolve folders: %w", err)
+	}
+
+	var dest string
+	switch action {
+	case "archive":
+		dest = archive
+		if dest == "" {
+			return fmt.Errorf("no Archive folder found on this account")
+		}
+	case "delete":
+		dest = trash
+		if dest == "" {
+			return fmt.Errorf("no Trash folder found on this account")
+		}
+	}
+	return s.moveMailToFolder(mailID, dest)
+}
+
+// backfillAccount pulls one more batch of older mail for an account, continuing from
+// wherever the previous sync/backfill left off. Returns how many mails were added.
+func (s *Store) backfillAccount(accountID string, batchSize int) (int, error) {
+	var oldestSyncedUID *int64
+	if err := s.db.QueryRow("SELECT oldest_synced_uid FROM accounts WHERE id = $1", accountID).Scan(&oldestSyncedUID); err != nil {
+		return 0, fmt.Errorf("load boundary: %w", err)
+	}
+	if oldestSyncedUID == nil {
+		return 0, nil // hasn't completed a regular sync yet; nothing to continue from
+	}
+
+	acct, password, err := s.loadAccountCreds(accountID)
+	if err != nil {
+		return 0, err
+	}
+
+	mails, newOldestUID, err := backfillIMAP(acct, password, imap.UID(*oldestSyncedUID), batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("imap backfill: %w", err)
+	}
+	if len(mails) == 0 {
+		// nothing older than the current boundary; mark exhausted so we stop retrying
+		s.db.Exec("UPDATE accounts SET oldest_synced_uid = 1 WHERE id = $1", accountID)
+		return 0, nil
+	}
+
+	if err := s.upsertMails(accountID, mails); err != nil {
+		return 0, err
+	}
+	s.db.Exec("UPDATE accounts SET oldest_synced_uid = $1 WHERE id = $2", int64(newOldestUID), accountID)
+	return len(mails), nil
+}
+
+// backfillAllAccounts tops up every account that hasn't yet reached the start of its
+// mailbox, so the inbox isn't capped at the most recent syncCount messages forever.
+func (s *Store) backfillAllAccounts(batchSize int) (int, error) {
+	rows, err := s.db.Query("SELECT id FROM accounts WHERE oldest_synced_uid IS NULL OR oldest_synced_uid > 1")
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+
+	total := 0
+	for _, id := range ids {
+		n, err := s.backfillAccount(id, batchSize)
+		if err != nil {
+			log.Printf("backfill account %s: %v", id, err)
+			continue
+		}
+		total += n
+	}
+	return total, nil
 }
 
 func (s *Store) syncAllAccounts() error {

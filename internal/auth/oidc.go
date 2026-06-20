@@ -6,9 +6,9 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -26,20 +26,17 @@ type Auth struct {
 	oauthConfig oauth2.Config
 	verifier    *oidc.IDTokenVerifier
 
-	mu       sync.Mutex
-	sessions map[string]session // ponytail: in-memory sessions, move to Postgres if surviving restarts matters
-}
-
-type session struct {
-	user      User
-	expiresAt time.Time
+	db         *sql.DB
+	sessionTTL time.Duration
 }
 
 const sessionCookie = "session"
 const stateCookie = "oidc_state"
-const sessionTTL = 7 * 24 * time.Hour
 
-func New(ctx context.Context, issuer, clientID, clientSecret, redirectURL string) (*Auth, error) {
+// New sets up OIDC login backed by Postgres-stored sessions, so logins survive app
+// restarts. sessionTTL controls how long a login lasts before requiring re-auth.
+// Assumes db.Migrate has already been run by the caller.
+func New(ctx context.Context, db *sql.DB, issuer, clientID, clientSecret, redirectURL string, sessionTTL time.Duration) (*Auth, error) {
 	provider, err := oidc.NewProvider(ctx, issuer)
 	if err != nil {
 		return nil, err
@@ -53,8 +50,9 @@ func New(ctx context.Context, issuer, clientID, clientSecret, redirectURL string
 			Endpoint:     provider.Endpoint(),
 			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		verifier: provider.Verifier(&oidc.Config{ClientID: clientID}),
-		sessions: make(map[string]session),
+		verifier:   provider.Verifier(&oidc.Config{ClientID: clientID}),
+		db:         db,
+		sessionTTL: sessionTTL,
 	}, nil
 }
 
@@ -103,22 +101,25 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := randomToken()
-	a.mu.Lock()
-	a.sessions[sessionID] = session{user: user, expiresAt: time.Now().Add(sessionTTL)}
-	a.mu.Unlock()
+	expiresAt := time.Now().Add(a.sessionTTL)
+	if _, err := a.db.Exec(
+		"INSERT INTO sessions (id, subject, email, name, expires_at) VALUES ($1, $2, $3, $4, $5)",
+		sessionID, user.Subject, user.Email, user.Name, expiresAt,
+	); err != nil {
+		http.Error(w, "couldn't create session: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: sessionID, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, MaxAge: int(sessionTTL.Seconds()),
+		SameSite: http.SameSiteLaxMode, MaxAge: int(a.sessionTTL.Seconds()),
 	})
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if ck, err := r.Cookie(sessionCookie); err == nil {
-		a.mu.Lock()
-		delete(a.sessions, ck.Value)
-		a.mu.Unlock()
+		a.db.Exec("DELETE FROM sessions WHERE id = $1", ck.Value)
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
@@ -135,14 +136,21 @@ func (a *Auth) Require(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/auth/login", http.StatusFound)
 			return
 		}
-		a.mu.Lock()
-		sess, ok := a.sessions[ck.Value]
-		a.mu.Unlock()
-		if !ok || time.Now().After(sess.expiresAt) {
+
+		var user User
+		var expiresAt time.Time
+		row := a.db.QueryRow("SELECT subject, email, name, expires_at FROM sessions WHERE id = $1", ck.Value)
+		if err := row.Scan(&user.Subject, &user.Email, &user.Name, &expiresAt); err != nil {
 			http.Redirect(w, r, "/auth/login", http.StatusFound)
 			return
 		}
-		ctx := context.WithValue(r.Context(), userCtxKey{}, sess.user)
+		if time.Now().After(expiresAt) {
+			a.db.Exec("DELETE FROM sessions WHERE id = $1", ck.Value)
+			http.Redirect(w, r, "/auth/login", http.StatusFound)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userCtxKey{}, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
