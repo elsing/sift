@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"sort"
@@ -10,6 +12,7 @@ import (
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message/mail"
 )
 
 const syncCount = 30 // most recent N messages to pull per account, per regular sync
@@ -67,7 +70,7 @@ func syncIMAP(acct dbAccount, password string) ([]Mail, imap.UID, error) {
 		return nil, 0, fmt.Errorf("fetch: %w", err)
 	}
 
-	mails, oldestUID := mailsFromFetch(acct.ID, msgs)
+	mails, oldestUID := mailsFromFetch(acct.ID, "INBOX", msgs)
 	return mails, oldestUID, nil
 }
 
@@ -119,11 +122,13 @@ func backfillIMAP(acct dbAccount, password string, beforeUID imap.UID, batchSize
 		return nil, 0, fmt.Errorf("fetch: %w", err)
 	}
 
-	mails, oldestUID := mailsFromFetch(acct.ID, msgs)
+	mails, oldestUID := mailsFromFetch(acct.ID, "INBOX", msgs)
 	return mails, oldestUID, nil
 }
 
-func mailsFromFetch(accountID string, msgs []*imapclient.FetchMessageBuffer) ([]Mail, imap.UID) {
+// mailsFromFetch converts fetched IMAP messages to Mails. folder is baked into the ID
+// (UIDs are only unique within a single mailbox, not across all of an account's folders).
+func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuffer) ([]Mail, imap.UID) {
 	mails := make([]Mail, 0, len(msgs))
 	oldestUID := imap.UID(0)
 	for _, m := range msgs {
@@ -131,13 +136,16 @@ func mailsFromFetch(accountID string, msgs []*imapclient.FetchMessageBuffer) ([]
 			oldestUID = m.UID
 		}
 		mails = append(mails, Mail{
-			ID:      fmt.Sprintf("%s-%d", accountID, m.UID),
-			Sender:  envelopeSender(m.Envelope),
-			Subject: m.Envelope.Subject,
-			Snippet: "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
-			Time:    formatMailTime(m.Envelope.Date),
-			Unread:  !slices.Contains(m.Flags, imap.FlagSeen),
-			UID:     uint32(m.UID),
+			ID:          fmt.Sprintf("%s|%s|%d", accountID, folder, m.UID),
+			Sender:      envelopeSender(m.Envelope),
+			SenderEmail: envelopeSenderEmail(m.Envelope),
+			Subject:     m.Envelope.Subject,
+			Snippet:     "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
+			Time:        formatMailTime(m.Envelope.Date),
+			Date:        m.Envelope.Date.Format(time.RFC3339),
+			Unread:      !slices.Contains(m.Flags, imap.FlagSeen),
+			UID:         uint32(m.UID),
+			Folder:      folder,
 		})
 	}
 	return mails, oldestUID
@@ -177,7 +185,7 @@ func fetchFolderMail(acct dbAccount, password, folder string, limit int) ([]Mail
 		return nil, fmt.Errorf("fetch: %w", err)
 	}
 
-	mails, _ := mailsFromFetch(acct.ID, msgs)
+	mails, _ := mailsFromFetch(acct.ID, folder, msgs)
 	return mails, nil
 }
 
@@ -282,6 +290,16 @@ func envelopeSender(env *imap.Envelope) string {
 	return from.Mailbox + "@" + from.Host
 }
 
+// envelopeSenderEmail returns the actual address, even when envelopeSender shows a
+// display name instead — e.g. for the reveal-and-copy affordance on a mail row.
+func envelopeSenderEmail(env *imap.Envelope) string {
+	if env == nil || len(env.From) == 0 {
+		return ""
+	}
+	from := env.From[0]
+	return from.Mailbox + "@" + from.Host
+}
+
 // detectSpecialUseFolders finds the account's Archive and Trash mailboxes. It prefers
 // the SPECIAL-USE extension (RFC 6154); servers that don't support it (common on
 // self-hosted Dovecot) fall back to matching common folder names. Either return value
@@ -330,8 +348,8 @@ func matchFolderName(data []*imap.ListData, needles ...string) string {
 	return ""
 }
 
-// moveMail moves a single message (by UID, within INBOX) to destFolder.
-func moveMail(host string, port int, username, password string, uid uint32, destFolder string) error {
+// moveMail moves a single message (by UID, within sourceFolder) to destFolder.
+func moveMail(host string, port int, username, password string, uid uint32, sourceFolder, destFolder string) error {
 	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -340,11 +358,79 @@ func moveMail(host string, port int, username, password string, uid uint32, dest
 	if err := c.Login(username, password).Wait(); err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
-	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
-		return fmt.Errorf("select inbox: %w", err)
+	if _, err := c.Select(sourceFolder, nil).Wait(); err != nil {
+		return fmt.Errorf("select %s: %w", sourceFolder, err)
 	}
 	if _, err := c.Move(imap.UIDSetNum(imap.UID(uid)), destFolder).Wait(); err != nil {
 		return fmt.Errorf("move: %w", err)
 	}
 	return nil
+}
+
+// MailBody holds whichever parts of a message we could extract. The client renders
+// HTML (sandboxed, scripts disabled) when present, falling back to plain text.
+type MailBody struct {
+	Text string `json:"text,omitempty"`
+	HTML string `json:"html,omitempty"`
+}
+
+// fetchMailBody fetches the raw message and extracts its text/plain and text/html
+// parts (whichever exist — a message may have one, both, or neither).
+// ponytail: no inline images/attachments resolved into the HTML yet — cid: references
+// will show as broken images. Add a part-fetching pass if that's needed.
+func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBody, error) {
+	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	if err != nil {
+		return MailBody{}, fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(acct.Username, password).Wait(); err != nil {
+		return MailBody{}, fmt.Errorf("login: %w", err)
+	}
+	if _, err := c.Select(folder, nil).Wait(); err != nil {
+		return MailBody{}, fmt.Errorf("select %s: %w", folder, err)
+	}
+
+	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{{}},
+	})
+	defer fetchCmd.Close()
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		return MailBody{}, fmt.Errorf("fetch: %w", err)
+	}
+	if len(msgs) == 0 || len(msgs[0].BodySection) == 0 {
+		return MailBody{}, fmt.Errorf("message not found")
+	}
+
+	mr, err := mail.CreateReader(bytes.NewReader(msgs[0].BodySection[0].Bytes))
+	if mr == nil {
+		return MailBody{}, fmt.Errorf("parse message: %w", err)
+	}
+
+	var body MailBody
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break // best-effort: stop at the first unparseable part rather than failing the whole body
+		}
+		if _, ok := part.Header.(*mail.InlineHeader); !ok {
+			continue // skip attachments
+		}
+		contentType, _, _ := part.Header.(*mail.InlineHeader).ContentType()
+		raw, _ := io.ReadAll(part.Body)
+		switch {
+		case contentType == "text/plain" && body.Text == "":
+			body.Text = string(raw)
+		case contentType == "text/html" && body.HTML == "":
+			body.HTML = string(raw)
+		}
+	}
+	if body.Text == "" && body.HTML == "" {
+		body.Text = "(no readable body)"
+	}
+	return body, nil
 }

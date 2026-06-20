@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	imap "github.com/emersion/go-imap/v2"
 )
@@ -20,11 +21,12 @@ type dbAccount struct {
 }
 
 type accountOut struct {
-	ID            string `json:"id"`
-	Email         string `json:"email"`
-	Host          string `json:"host"`
-	Port          int    `json:"port"`
-	LastSyncError string `json:"lastSyncError,omitempty"`
+	ID              string   `json:"id"`
+	Email           string   `json:"email"`
+	Host            string   `json:"host"`
+	Port            int      `json:"port"`
+	LastSyncError   string   `json:"lastSyncError,omitempty"`
+	ExpandedFolders []string `json:"expandedFolders"`
 }
 
 type addAccountReq struct {
@@ -48,6 +50,7 @@ func (s *Store) AccountsRoutes(mux *http.ServeMux, ownerSubject func(*http.Reque
 	mux.HandleFunc("POST /api/accounts/{id}/sync", s.handleSyncAccount)
 	mux.HandleFunc("GET /api/accounts/{id}/folders", s.handleListFolders)
 	mux.HandleFunc("GET /api/accounts/{id}/folder-mails", s.handleFolderMails)
+	mux.HandleFunc("PUT /api/accounts/{id}/expanded-folders", s.handleSetExpandedFolders)
 }
 
 // isDryRun reports whether the request asked to simulate a mutation rather than perform it.
@@ -73,7 +76,10 @@ func (s *Store) loadAccountCreds(id string) (dbAccount, string, error) {
 }
 
 func (s *Store) handleListAccounts(w http.ResponseWriter, r *http.Request, owner string) {
-	rows, err := s.db.Query("SELECT id, email, host, port, coalesce(last_sync_error, '') FROM accounts WHERE owner_subject = $1 ORDER BY created_at", owner)
+	rows, err := s.db.Query(
+		"SELECT id, email, host, port, coalesce(last_sync_error, ''), expanded_folders FROM accounts WHERE owner_subject = $1 ORDER BY created_at",
+		owner,
+	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -83,13 +89,36 @@ func (s *Store) handleListAccounts(w http.ResponseWriter, r *http.Request, owner
 	out := []accountOut{}
 	for rows.Next() {
 		var a accountOut
-		if err := rows.Scan(&a.ID, &a.Email, &a.Host, &a.Port, &a.LastSyncError); err != nil {
+		var expandedJSON string
+		if err := rows.Scan(&a.ID, &a.Email, &a.Host, &a.Port, &a.LastSyncError, &expandedJSON); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		json.Unmarshal([]byte(expandedJSON), &a.ExpandedFolders)
 		out = append(out, a)
 	}
 	writeJSON(w, out)
+}
+
+func (s *Store) handleSetExpandedFolders(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Paths []string `json:"paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	encoded, err := json.Marshal(req.Paths)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := s.db.Exec("UPDATE accounts SET expanded_folders = $1 WHERE id = $2", string(encoded), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Store) handleAddAccount(w http.ResponseWriter, r *http.Request, owner string) {
@@ -184,6 +213,11 @@ func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// persist so archive/delete/move/read endpoints (which look mail up by id) work
+	// the same inside a folder view as they do in the inbox.
+	if err := s.upsertMails(id, mails); err != nil {
+		log.Printf("cache folder mails %s/%s: %v", acct.Email, folder, err)
+	}
 	writeJSON(w, mails)
 }
 
@@ -244,14 +278,15 @@ func (s *Store) upsertMails(accountID string, mails []Mail) error {
 	defer tx.Rollback()
 
 	for _, m := range mails {
+		sentAt, _ := time.Parse(time.RFC3339, m.Date)
 		_, err := tx.Exec(`
-			INSERT INTO mails (id, account_id, sender, subject, snippet, time, unread, uid)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			INSERT INTO mails (id, account_id, sender, sender_email, subject, snippet, time, unread, uid, folder, sent_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (id) DO UPDATE SET
-				sender = excluded.sender, subject = excluded.subject,
+				sender = excluded.sender, sender_email = excluded.sender_email, subject = excluded.subject,
 				snippet = excluded.snippet, time = excluded.time, unread = excluded.unread,
-				uid = excluded.uid`,
-			m.ID, accountID, m.Sender, m.Subject, m.Snippet, m.Time, m.Unread, m.UID,
+				uid = excluded.uid, folder = excluded.folder, sent_at = excluded.sent_at`,
+			m.ID, accountID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, m.UID, m.Folder, sentAt,
 		)
 		if err != nil {
 			return err
@@ -287,12 +322,13 @@ func (s *Store) resolveFolders(accountID string) (archive, trash string, err err
 	return archive, trash, nil
 }
 
-// moveMailToFolder loads a mail's account + UID and moves it to destFolder on the
-// real IMAP server.
+// moveMailToFolder loads a mail's account + UID + source folder and moves it to
+// destFolder on the real IMAP server.
 func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	var accountID *string
 	var uid *int64
-	err := s.db.QueryRow("SELECT account_id, uid FROM mails WHERE id = $1", mailID).Scan(&accountID, &uid)
+	var sourceFolder string
+	err := s.db.QueryRow("SELECT account_id, uid, folder FROM mails WHERE id = $1", mailID).Scan(&accountID, &uid, &sourceFolder)
 	if err != nil {
 		return err
 	}
@@ -303,7 +339,7 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if err != nil {
 		return err
 	}
-	return moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), destFolder)
+	return moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), sourceFolder, destFolder)
 }
 
 // archiveOrDeleteOnServer moves a mail to the account's Archive/Trash folder for the

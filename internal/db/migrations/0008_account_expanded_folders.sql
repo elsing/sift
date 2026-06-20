@@ -1,0 +1,1 @@
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS expanded_folders TEXT NOT NULL DEFAULT '[]';

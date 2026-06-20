@@ -5,27 +5,34 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#1c1714">
+<meta name="theme-color" content="#1a1625">
 <title>Sift</title>
 <link rel="manifest" href="manifest.json">
 <link rel="stylesheet" href="style.css">
 <script>
   var t = localStorage.getItem('theme');
   if (t) document.documentElement.dataset.theme = t;
+  var p = localStorage.getItem('palette');
+  if (p) document.documentElement.dataset.palette = p;
 </script>
 </head>
 <body>
-  <header class="topbar">
-    Sift
-    <span>
-      <button id="themeBtn" class="icon-btn" title="Theme">A</button>
-      <button id="dryRunBtn" class="icon-btn" title="Dry run">⏚</button>
-      <button id="accountsBtn" class="logout-btn">Accounts</button>
-      <button id="logoutBtn" class="logout-btn">Log out</button>
-    </span>
-  </header>
+  <div class="sticky-header">
+    <header class="topbar">
+      Sift
+      <span>
+        <button id="foldersBtn" class="icon-btn" title="Folders">📁</button>
+        <button id="settingsBtn" class="logout-btn">Settings</button>
+      </span>
+    </header>
 
-  <div class="dry-run-banner" id="dryRunBanner">Dry run mode — nothing will be saved</div>
+    <div class="dry-run-banner" id="dryRunBanner">Dry run mode — nothing will be saved</div>
+
+    <div class="folder-banner hidden" id="folderBanner">
+      <button id="folderBannerBack">← Inbox</button>
+      <span id="folderBannerName"></span>
+    </div>
+  </div>
 
   <div class="pull-indicator" id="pullIndicator">
     <span class="pull-icon" id="pullIcon">📨</span>
@@ -37,7 +44,8 @@
   <div id="accountsPanel" class="accounts-panel hidden">
     <h2>Accounts</h2>
     <ul id="accountsList" class="accounts-list"></ul>
-    <form id="addAccountForm">
+    <button id="showAddAccountBtn" class="show-add-account-btn">+ Add account</button>
+    <form id="addAccountForm" class="hidden">
       <input name="email" type="email" placeholder="Email address" required>
       <input name="host" type="text" placeholder="IMAP host (e.g. imap.fastmail.com)" required>
       <input name="port" type="number" placeholder="Port (e.g. 993)" value="993" required>
@@ -47,6 +55,20 @@
       <p id="addAccountError" class="form-error"></p>
     </form>
     <button id="closeAccountsBtn">Close</button>
+  </div>
+
+  <div id="settingsPanel" class="accounts-panel hidden">
+    <h2>Settings</h2>
+    <h3 class="settings-subhead">Theme</h3>
+    <div id="themeOptions" class="theme-options"></div>
+    <h3 class="settings-subhead">Color palette</h3>
+    <div id="paletteSwatches" class="palette-swatches"></div>
+    <h3 class="settings-subhead">Account</h3>
+    <button id="accountsBtn" class="settings-row-btn">Accounts</button>
+    <h3 class="settings-subhead">Advanced</h3>
+    <button id="dryRunBtn" class="settings-row-btn">Dry run mode</button>
+    <button id="logoutBtn" class="settings-row-btn logout-row">Log out</button>
+    <button id="closeSettingsBtn" class="close-panel-btn">Close</button>
   </div>
 
   <div id="moveModal" class="move-modal hidden">
@@ -60,14 +82,19 @@
     </div>
   </div>
 
-  <div id="folderViewPanel" class="accounts-panel folder-view-panel hidden">
-    <div class="folder-view-header">
-      <button id="folderViewBack">← Inbox</button>
-      <span id="folderViewTitle"></span>
+  <div id="mailReaderPanel" class="accounts-panel mail-reader-panel hidden">
+    <div class="mail-reader-header">
+      <button id="mailReaderBack">← Back</button>
     </div>
-    <ul id="folderViewList" class="inbox"></ul>
+    <div class="mail-reader-meta">
+      <div class="mail-reader-subject" id="mailReaderSubject"></div>
+      <div class="mail-reader-sender" id="mailReaderSender"></div>
+      <div class="mail-reader-time" id="mailReaderTime"></div>
+    </div>
+    <pre class="mail-reader-body" id="mailReaderBody"></pre>
+    <iframe class="mail-reader-html hidden" id="mailReaderHtml" sandbox></iframe>
   </div>
 
-  <script src="app.js"></script>
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>

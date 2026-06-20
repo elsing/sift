@@ -11,20 +11,24 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const pageSize = 30
 
 type Mail struct {
-	ID        string `json:"id"`
-	Sender    string `json:"sender"`
-	Subject   string `json:"subject"`
-	Snippet   string `json:"snippet"`
-	Time      string `json:"time"`
-	Unread    bool   `json:"unread"`
-	AccountID string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
-	UID       uint32 `json:"-"`                   // IMAP UID within INBOX; zero for mock mail, used to move/delete on the server
+	ID          string `json:"id"`
+	Sender      string `json:"sender"`
+	SenderEmail string `json:"senderEmail,omitempty"` // the actual address; Sender may be a display name instead
+	Subject     string `json:"subject"`
+	Snippet     string `json:"snippet"`
+	Time        string `json:"time"` // pre-formatted for display (today's time, or a date for older mail)
+	Date        string `json:"date"` // RFC3339; the client groups by this (Today/This Week/Last Week/Older)
+	Unread      bool   `json:"unread"`
+	AccountID   string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
+	UID         uint32 `json:"-"`                   // IMAP UID within Folder; zero for mock mail, used to move/delete/read on the server
+	Folder      string `json:"-"`                   // IMAP mailbox this UID belongs to; "INBOX" for mock mail
 }
 
 var senders = []string{"Alex Chen", "Notion", "Sarah Park", "GitHub", "Mom", "Stripe", "Figma", "Delta", "Sam Lee", "Linear"}
@@ -91,9 +95,10 @@ func (s *Store) reseed() error {
 	}
 	for i := 0; i < 18; i++ {
 		m := randomMail()
+		sentAt, _ := time.Parse(time.RFC3339, m.Date)
 		if _, err := tx.Exec(
-			"INSERT INTO mails (id, sender, subject, snippet, time, unread) VALUES ($1, $2, $3, $4, $5, $6)",
-			m.ID, m.Sender, m.Subject, m.Snippet, m.Time, m.Unread,
+			"INSERT INTO mails (id, sender, sender_email, subject, snippet, time, unread, sent_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+			m.ID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, sentAt,
 		); err != nil {
 			return err
 		}
@@ -108,13 +113,17 @@ func randomMail() Mail {
 	if hour < 7 {
 		period = "AM"
 	}
+	sentAt := time.Now().AddDate(0, 0, -rand.Intn(20)) // spread across Today/This Week/Last Week/Older for testing
+	handle := strings.ToLower(strings.ReplaceAll(senders[i], " ", "."))
 	return Mail{
-		ID:      fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Intn(1_000_000)),
-		Sender:  senders[i],
-		Subject: subjects[i],
-		Snippet: snippets[i],
-		Time:    fmt.Sprintf("%d:%02d %s", hour, rand.Intn(60), period),
-		Unread:  rand.Float64() > 0.4,
+		ID:          fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Intn(1_000_000)),
+		Sender:      senders[i],
+		SenderEmail: handle + "@example.com",
+		Subject:     subjects[i],
+		Snippet:     snippets[i],
+		Time:        fmt.Sprintf("%d:%02d %s", hour, rand.Intn(60), period),
+		Date:        sentAt.Format(time.RFC3339),
+		Unread:      rand.Float64() > 0.4,
 	}
 }
 
@@ -129,6 +138,7 @@ func (s *Store) Routes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("POST /api/mails/{id}/read", s.handleToggleRead)
 	mux.HandleFunc("POST /api/mails/{id}/move", s.handleMove)
+	mux.HandleFunc("GET /api/mails/{id}/body", s.handleMailBody)
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +147,21 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// self-heal an empty-but-should-have-mail inbox (e.g. right after a cache-clearing
+	// migration) instead of silently staying empty until the next manual pull-to-refresh.
+	// Also clear any "backfill exhausted" markers: those were recorded against the old
+	// cache, which is gone, so they'd otherwise wrongly block backfill forever even
+	// though the freshly-rebuilt cache has plenty more history to pull.
+	if offset == 0 && len(mails) == 0 {
+		if _, err := s.db.Exec("UPDATE accounts SET oldest_synced_uid = NULL"); err != nil {
+			log.Printf("reset backfill progress: %v", err)
+		}
+		if err := s.syncAllAccounts(); err != nil {
+			log.Printf("auto-sync: %v", err)
+		} else if refreshed, err := s.list(offset, pageSize); err == nil {
+			mails = refreshed
+		}
 	}
 	if len(mails) < pageSize {
 		// scrolled past what's cached locally; pull another batch of older mail before answering
@@ -151,7 +176,7 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) list(offset, limit int) ([]Mail, error) {
 	rows, err := s.db.Query(
-		"SELECT id, sender, subject, snippet, time, unread, coalesce(account_id, '') FROM mails ORDER BY id DESC LIMIT $1 OFFSET $2",
+		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE folder = 'INBOX' ORDER BY id DESC LIMIT $1 OFFSET $2",
 		limit, offset,
 	)
 	if err != nil {
@@ -162,8 +187,12 @@ func (s *Store) list(offset, limit int) ([]Mail, error) {
 	mails := []Mail{}
 	for rows.Next() {
 		var m Mail
-		if err := rows.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID); err != nil {
+		var sentAt sql.NullTime
+		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt); err != nil {
 			return nil, err
+		}
+		if sentAt.Valid {
+			m.Date = sentAt.Time.Format(time.RFC3339)
 		}
 		mails = append(mails, m)
 	}
@@ -274,6 +303,39 @@ func (s *Store) handleToggleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, m)
+}
+
+func (s *Store) handleMailBody(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var accountID *string
+	var uid *int64
+	var folder string
+	row := s.db.QueryRow("SELECT account_id, uid, folder FROM mails WHERE id = $1", id)
+	if err := row.Scan(&accountID, &uid, &folder); err != nil {
+		if err == sql.ErrNoRows {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if accountID == nil || uid == nil {
+		writeJSON(w, MailBody{Text: "This is mock mail — there's no real content to show."})
+		return
+	}
+
+	acct, password, err := s.loadAccountCreds(*accountID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, err := fetchMailBody(acct, password, folder, uint32(*uid))
+	if err != nil {
+		log.Printf("fetch body %s: %v", id, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, body)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

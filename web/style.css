@@ -1,45 +1,57 @@
 :root {
-  --bg: #1c1714;
-  --bg-row: #1c1714;
-  --text: #f1e6da;
-  --text-dim: #a8967f;
-  --border: #332a23;
-  --input-bg: #261f1a;
-  --accent: #c9763e;
-  --archive: #7a8f4e;
-  --delete: #b8593f;
-  --error-bg: #3a2420;
-  --error-border: #7a3a30;
-  --error-text: #f0a08c;
+  --bg: #1a1625;
+  --bg-row: #1a1625;
+  --text: #f5f0ff;
+  --text-dim: #a89cc8;
+  --border: #392f52;
+  --input-bg: #251f38;
+  --accent: #ff3d81;
+  --archive: #00d9a3;
+  --delete: #ff4d4d;
+  --move: #9b5de5;
+  --error-bg: #3a1f33;
+  --error-border: #c2185b;
+  --error-text: #ff8fb3;
+  --bounce: cubic-bezier(.34, 1.56, .64, 1);
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #faf3ea;
-    --bg-row: #faf3ea;
-    --text: #2b2218;
-    --text-dim: #8a7763;
-    --border: #e6d8c4;
+    --bg: #fff8fb;
+    --bg-row: #fff8fb;
+    --text: #261b35;
+    --text-dim: #8a7a9c;
+    --border: #f0d9e8;
     --input-bg: #fff;
-    --accent: #b5612a;
-    --archive: #6b8a3f;
-    --delete: #a8492f;
-    --error-bg: #fbe6e0;
-    --error-border: #e3a392;
-    --error-text: #8a2f1c;
+    --accent: #e6005c;
+    --archive: #00b386;
+    --delete: #e63950;
+    --move: #7c3aed;
+    --error-bg: #ffe3ef;
+    --error-border: #ff9cc4;
+    --error-text: #b3004f;
   }
 }
 [data-theme="dark"] {
-  --bg: #1c1714; --bg-row: #1c1714; --text: #f1e6da; --text-dim: #a8967f;
-  --border: #332a23; --input-bg: #261f1a; --accent: #c9763e;
-  --archive: #7a8f4e; --delete: #b8593f;
-  --error-bg: #3a2420; --error-border: #7a3a30; --error-text: #f0a08c;
+  --bg: #1a1625; --bg-row: #1a1625; --text: #f5f0ff; --text-dim: #a89cc8;
+  --border: #392f52; --input-bg: #251f38; --accent: #ff3d81;
+  --archive: #00d9a3; --delete: #ff4d4d; --move: #9b5de5;
+  --error-bg: #3a1f33; --error-border: #c2185b; --error-text: #ff8fb3;
 }
 [data-theme="light"] {
-  --bg: #faf3ea; --bg-row: #faf3ea; --text: #2b2218; --text-dim: #8a7763;
-  --border: #e6d8c4; --input-bg: #fff; --accent: #b5612a;
-  --archive: #6b8a3f; --delete: #a8492f;
-  --error-bg: #fbe6e0; --error-border: #e3a392; --error-text: #8a2f1c;
+  --bg: #fff8fb; --bg-row: #fff8fb; --text: #261b35; --text-dim: #8a7a9c;
+  --border: #f0d9e8; --input-bg: #fff; --accent: #e6005c;
+  --archive: #00b386; --delete: #e63950; --move: #7c3aed;
+  --error-bg: #ffe3ef; --error-border: #ff9cc4; --error-text: #b3004f;
 }
+
+/* Color palettes only swap the accent/archive/delete/move colors — bg/text/border stay
+   governed by the light/dark theme above. "funky" (no attribute) is the default set
+   defined in :root/[data-theme] above; these are the alternatives. Source order matters
+   here: these need to come after the theme blocks to win when both attributes are set. */
+[data-palette="warm"] { --accent: #c9763e; --archive: #7a8f4e; --delete: #b8593f; --move: #a87b4f; }
+[data-palette="ocean"] { --accent: #00b4d8; --archive: #2dd4bf; --delete: #fb7185; --move: #6366f1; }
+[data-palette="sunset"] { --accent: #ff6b35; --archive: #f7b801; --delete: #d72638; --move: #6a0572; }
+[data-palette="candy"] { --accent: #ff6fae; --archive: #4ecdc4; --delete: #ff6b6b; --move: #c77dff; }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
@@ -47,17 +59,18 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   scrollbar-width: none; transition: background-color 0.25s ease, color 0.25s ease; }
 html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
 
-button { cursor: pointer; transition: transform 0.12s ease, opacity 0.12s ease,
+button { cursor: pointer; transition: transform 0.18s var(--bounce), opacity 0.12s ease,
   background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease; }
-button:active { transform: scale(0.94); opacity: 0.8; }
+button:active { transform: scale(0.9); opacity: 0.8; }
 
 .topbar, .row-content, #addAccountForm input, .logout-btn, .icon-btn,
 .accounts-list li, .account-sync-error, .form-error {
   transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
 }
 
+.sticky-header { position: sticky; top: 0; z-index: 10; background: var(--bg); }
+
 .topbar {
-  position: sticky; top: 0; z-index: 10;
   padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 12px;
   font-size: 22px; font-weight: 700; background: var(--bg);
   border-bottom: 1px solid var(--border);
@@ -67,21 +80,21 @@ button:active { transform: scale(0.94); opacity: 0.8; }
 .topbar span { display: flex; gap: 8px; }
 
 .logout-btn {
-  font-size: 13px; font-weight: 500; color: var(--text-dim); background: none;
-  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+  font-size: 13px; font-weight: 600; color: var(--text-dim); background: none;
+  border: 2px solid var(--border); border-radius: 14px; padding: 4px 12px;
 }
 
 .icon-btn {
   font-size: 15px; font-weight: 600; color: var(--text-dim); background: none;
-  border: 1px solid var(--border); border-radius: 6px; width: 32px; height: 32px;
+  border: 2px solid var(--border); border-radius: 50%; width: 34px; height: 34px;
   display: flex; align-items: center; justify-content: center; line-height: 1;
 }
 .icon-btn.active { color: var(--accent); border-color: var(--accent); }
 
 .dry-run-banner {
   text-align: center; font-size: 12px; color: var(--accent); background: var(--error-bg);
-  height: 0; margin: 0 10px; border-radius: 0 0 8px 8px; overflow: hidden;
-  transition: height 0.25s ease, opacity 0.25s ease; opacity: 0;
+  height: 0; margin: 0 10px; border-radius: 0 0 14px 14px; overflow: hidden;
+  transition: height 0.25s var(--bounce), opacity 0.25s ease; opacity: 0;
 }
 .dry-run-banner.visible { height: 26px; line-height: 26px; opacity: 1; }
 
@@ -92,30 +105,36 @@ button:active { transform: scale(0.94); opacity: 0.8; }
 }
 .pull-indicator.refreshing { height: 36px; }
 
-.pull-icon { display: inline-block; font-size: 16px; transition: transform 0.2s ease; }
-.pull-icon.tilt { transform: rotate(-15deg) scale(1.15); }
-.pull-icon.spin { animation: pull-spin 0.9s linear infinite; }
+.pull-icon { display: inline-block; font-size: 16px; transition: transform 0.3s var(--bounce); }
+.pull-icon.tilt { transform: rotate(-15deg) scale(1.25); }
+.pull-icon.spin { animation: pull-spin 0.8s var(--bounce) infinite; }
 @keyframes pull-spin {
   0%, 100% { transform: rotate(0deg) scale(1); }
-  50% { transform: rotate(180deg) scale(1.2); }
+  50% { transform: rotate(180deg) scale(1.35); }
 }
 
 .inbox { list-style: none; margin: 0; padding: 0; }
 
+.date-section-header {
+  padding: 10px 16px 6px; font-size: 12px; font-weight: 800; color: var(--accent);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+
 .row {
   position: relative; overflow: hidden;
   border-bottom: 1px solid var(--border);
-  animation: row-in 0.25s ease both;
+  animation: row-in 0.3s var(--bounce) both;
 }
 @keyframes row-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .row-action {
   position: absolute; top: 0; bottom: 0; width: 0; overflow: hidden;
   display: flex; align-items: center; justify-content: center;
-  color: #fff; font-size: 14px; font-weight: 600; white-space: nowrap;
+  color: #fff; font-size: 14px; font-weight: 800; white-space: nowrap;
+  letter-spacing: 0.02em;
 }
 .row-action.right-swipe { left: 0; }
 .row-action.left-swipe  { right: 0; }
@@ -124,17 +143,29 @@ button:active { transform: scale(0.94); opacity: 0.8; }
   position: relative; background: var(--bg-row);
   display: flex; gap: 10px; align-items: flex-start;
   padding: 12px 16px; will-change: transform;
+  touch-action: pan-y; /* let the browser own vertical scroll natively; JS only claims horizontal */
 }
 
 .unread-dot {
-  width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
-  margin-top: 6px; flex: none; visibility: hidden;
+  width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 6px var(--accent); margin-top: 6px; flex: none; visibility: hidden;
 }
 .row.unread .unread-dot { visibility: visible; }
 
 .row-text { flex: 1; min-width: 0; }
 .row-text .sender { font-weight: 600; font-size: 15px; }
 .row.unread .row-text .sender { font-weight: 700; }
+
+.sender-name.revealable { cursor: pointer; border-bottom: 1px dotted var(--text-dim); }
+.sender-email {
+  display: inline-flex; align-items: center; gap: 4px; overflow: hidden;
+  max-width: 0; opacity: 0; margin-left: 0;
+  transition: max-width 0.3s var(--bounce), opacity 0.25s ease, margin-left 0.3s var(--bounce);
+  font-size: 12px; font-weight: 500; color: var(--text-dim); white-space: nowrap;
+}
+.revealed .sender-email { max-width: 220px; opacity: 1; margin-left: 8px; }
+.sender-email-text { overflow: hidden; text-overflow: ellipsis; }
+.sender-copy { background: none; border: none; color: var(--accent); font-size: 13px; padding: 0; flex: none; }
 .row-text .subject { font-size: 14px; color: var(--text); opacity: 0.85; margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-text .snippet { font-size: 13px; color: var(--text-dim); margin-top: 2px;
@@ -148,55 +179,102 @@ button:active { transform: scale(0.94); opacity: 0.8; }
   position: fixed; inset: 0; background: var(--bg); z-index: 20;
   padding: calc(env(safe-area-inset-top, 0px) + 20px) 16px 20px; overflow-y: auto;
   transform: translateY(100%); opacity: 0;
-  transition: transform 0.3s cubic-bezier(.2,.8,.2,1), opacity 0.3s ease, background-color 0.25s ease;
+  transition: transform 0.35s var(--bounce), opacity 0.3s ease, background-color 0.25s ease;
 }
 .accounts-panel.hidden { pointer-events: none; }
 .accounts-panel:not(.hidden) { transform: translateY(0); opacity: 1; }
 .accounts-panel h2 { font-size: 18px; margin: 0 0 12px; }
+.settings-subhead { font-size: 13px; font-weight: 700; color: var(--text-dim); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.theme-options { display: flex; gap: 8px; margin-bottom: 20px; }
+.theme-option {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: var(--input-bg); border: 2px solid var(--border); border-radius: 14px;
+  padding: 10px 0; color: var(--text-dim); font-size: 12px; font-weight: 600;
+}
+.theme-option.selected { border-color: var(--accent); color: var(--accent); }
+.theme-option-icon { font-size: 18px; }
+
+.palette-swatches { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+.palette-swatch {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  background: var(--input-bg); border: 2px solid var(--border); border-radius: 14px;
+  padding: 10px 14px; text-align: left;
+}
+.palette-swatch.selected { border-color: var(--accent); }
+.palette-swatch-dots { display: flex; gap: 4px; flex: none; }
+.palette-swatch-dots span { width: 16px; height: 16px; border-radius: 50%; display: block; }
+.palette-swatch-name { font-size: 14px; font-weight: 600; color: var(--text); }
 
 .accounts-list { list-style: none; margin: 0 0 20px; padding: 0; }
 .accounts-list li { padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
 .account-row { display: flex; justify-content: space-between; align-items: center; }
 .account-row span { display: flex; gap: 6px; }
 .accounts-list button {
-  font-size: 12px; color: var(--text-dim); background: none; border: 1px solid var(--border);
-  border-radius: 6px; padding: 3px 8px;
+  font-size: 12px; font-weight: 600; color: var(--text-dim); background: none; border: 2px solid var(--border);
+  border-radius: 12px; padding: 3px 10px;
 }
-.account-row button:last-child { color: var(--delete); }
+.account-row button:last-child { color: var(--delete); border-color: var(--delete); }
 .account-sync-error {
   margin: 6px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.4;
-  background: var(--error-bg); border: 1px solid var(--error-border);
-  color: var(--error-text); border-radius: 6px;
+  background: var(--error-bg); border: 2px solid var(--error-border);
+  color: var(--error-text); border-radius: 12px;
 }
 
 .folder-tree {
-  margin-top: 8px; padding: 8px; font-size: 14px;
-  background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px;
+  margin-top: 8px; padding: 4px; font-size: 13px;
+  background: var(--input-bg); border: 2px solid var(--border); border-radius: 14px;
   animation: row-in 0.2s ease both;
 }
 .folder-tree.hidden { display: none; }
-.folder-tree ul { list-style: none; margin: 0; padding-left: 14px; }
+.folder-tree ul { list-style: none; margin: 0; padding-left: 15px; }
+.folder-tree ul.hidden { display: none; } /* the actual collapse toggle — was missing, "collapse did nothing" */
 .folder-tree > ul { padding-left: 0; }
-.folder-tree ul ul { border-left: 1px solid var(--border); margin-left: 9px; }
-.folder-tree li { margin: 1px 0; }
+.folder-tree li { margin: 0; position: relative; } /* no gap between rows, or the connector lines below break */
+
+/* Elbow connectors: each non-root <li> gets a vertical line down its left edge
+   (connecting to the next sibling) and a short horizontal stub into its own row.
+   Both use top:50%/bottom:50% (not a guessed pixel offset) so they stay centered on
+   the row regardless of actual rendered row height — a fixed-px guess is exactly
+   what made these look off-center before. The last child's vertical line stops
+   halfway, at its own row, finishing the "L". */
+.folder-tree ul ul > li::before {
+  content: ''; position: absolute; left: -8px; top: 0; bottom: 0; width: 1px;
+  background: var(--border);
+}
+.folder-tree ul ul > li:last-child::before { bottom: 50%; }
+.folder-tree ul ul > li::after {
+  content: ''; position: absolute; left: -8px; top: 50%; width: 8px; height: 1px;
+  background: var(--border); transform: translateY(-0.5px);
+}
 
 .folder-row {
-  display: flex; align-items: center; gap: 4px; padding: 7px 6px;
-  border-radius: 6px; color: var(--text);
+  display: flex; align-items: center; gap: 3px; padding: 0 3px;
+  border-radius: 4px; color: var(--text); height: 18px;
 }
 .folder-row:hover { background: var(--bg); }
 .folder-row.has-children .folder-label { font-weight: 600; }
 .folder-row.leaf .folder-label { color: var(--text-dim); }
 
-.folder-toggle, .folder-toggle-spacer { width: 22px; height: 22px; flex: none; }
+/* explicit resets: <button> carries UA-stylesheet padding/min-height on some browsers
+   that ignored the width/height alone, which is why this still looked oversized */
+.folder-toggle, .folder-toggle-spacer { width: 12px; height: 18px; flex: none; }
 .folder-toggle {
-  background: none; border: none; color: var(--text-dim);
-  display: flex; align-items: center; justify-content: center; font-size: 15px;
+  -webkit-appearance: none; appearance: none; background: none; border: none;
+  margin: 0; padding: 0; min-width: 0; min-height: 0; line-height: 0;
+  display: flex; align-items: center; justify-content: center;
 }
-.folder-toggle::before { content: '›'; display: inline-block; transition: transform 0.15s ease; }
+/* a drawn triangle, not a Unicode glyph — font glyphs don't optically center the
+   same way real geometry does, which was part of why this looked misaligned */
+.folder-toggle::before {
+  content: ''; width: 0; height: 0; flex: none;
+  border-style: solid; border-width: 3.5px 0 3.5px 4.5px;
+  border-color: transparent transparent transparent var(--text-dim);
+  transition: transform 0.15s ease;
+}
 .folder-toggle.open::before { transform: rotate(90deg); }
 
-.folder-label { flex: 1; padding: 2px 0; }
+.folder-label { flex: 1; line-height: 18px; font-size: 12.5px; }
 .folder-label.navigable { cursor: pointer; }
 .folder-label.navigable:hover { color: var(--accent); }
 
@@ -211,9 +289,9 @@ button:active { transform: scale(0.94); opacity: 0.8; }
 .move-modal.hidden { opacity: 0; pointer-events: none; }
 .move-modal-content {
   width: 100%; max-height: 70vh; overflow-y: auto; background: var(--bg);
-  border-radius: 14px 14px 0 0; padding: 16px;
+  border-radius: 24px 24px 0 0; padding: 16px;
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
-  transform: translateY(0); transition: transform 0.25s cubic-bezier(.2,.8,.2,1);
+  transform: translateY(0); transition: transform 0.35s var(--bounce);
 }
 .move-modal.hidden .move-modal-content { transform: translateY(100%); }
 .move-modal-header {
@@ -223,33 +301,63 @@ button:active { transform: scale(0.94); opacity: 0.8; }
 .move-modal-header button { background: none; border: none; color: var(--text-dim); font-size: 16px; }
 .move-folder-tree { background: none; border: none; padding: 0; margin: 0; }
 
-.folder-view-header {
-  display: flex; align-items: center; gap: 12px;
-  padding-bottom: 14px; margin-bottom: 8px; border-bottom: 1px solid var(--border);
+.folder-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px; background: var(--input-bg); border-bottom: 1px solid var(--border);
+  height: auto; overflow: hidden; animation: row-in 0.2s ease both;
 }
-.folder-view-header button {
-  background: none; border: 1px solid var(--border); border-radius: 6px;
+.folder-banner.hidden { display: none; }
+.folder-banner button {
+  background: none; border: 2px solid var(--move); border-radius: 12px;
+  color: var(--move); font-weight: 700; font-size: 12px; padding: 4px 10px;
+}
+.folder-banner span { font-size: 14px; font-weight: 700; }
+
+.mail-reader-header { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.mail-reader-header button {
+  background: none; border: 2px solid var(--border); border-radius: 12px;
   color: var(--text-dim); font-size: 13px; padding: 5px 10px;
 }
-.folder-view-header span { font-size: 16px; font-weight: 700; }
-.folder-view-status { padding: 20px 0; text-align: center; color: var(--text-dim); font-size: 14px; }
-.folder-view-row .row-content { padding: 12px 4px; }
-
-#addAccountForm { display: flex; flex-direction: column; gap: 8px; }
-#addAccountForm input {
-  background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text); padding: 10px; font-size: 14px;
+.mail-reader-meta { margin-bottom: 16px; }
+.mail-reader-subject { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+.mail-reader-sender { font-size: 14px; font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; }
+.mail-reader-time { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.mail-reader-body {
+  font-family: inherit; font-size: 14px; line-height: 1.6; color: var(--text);
+  white-space: pre-wrap; word-wrap: break-word; margin: 0;
 }
+.mail-reader-body.hidden { display: none; }
+.mail-reader-html {
+  width: 100%; height: 70vh; border: none; background: #fff; border-radius: 14px;
+}
+.mail-reader-html.hidden { display: none; }
+
+.folder-empty-status { padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 14px; }
+.end-of-list-footer { padding: 20px 16px 40px; text-align: center; color: var(--text-dim); font-size: 13px; }
+
+.show-add-account-btn {
+  display: block; width: 100%; background: none; border: 2px dashed var(--border);
+  border-radius: 14px; color: var(--accent); font-weight: 700; font-size: 14px;
+  padding: 10px; margin-bottom: 16px;
+}
+
+#addAccountForm { display: flex; flex-direction: column; gap: 10px; }
+#addAccountForm.hidden { display: none; }
+#addAccountForm input {
+  background: var(--input-bg); border: 2px solid var(--border); border-radius: 12px;
+  color: var(--text); padding: 10px 12px; font-size: 14px;
+}
+#addAccountForm input:focus { border-color: var(--accent); outline: none; }
 #addAccountForm button[type="submit"] {
-  background: var(--accent); color: #fff; border: none; border-radius: 6px;
-  padding: 10px; font-size: 14px; font-weight: 600; margin-top: 4px;
+  background: var(--accent); color: #fff; border: none; border-radius: 999px;
+  padding: 11px; font-size: 14px; font-weight: 700; margin-top: 4px;
 }
 #addAccountForm button[type="submit"]:disabled { opacity: 0.7; }
 
 .form-error {
   display: none; align-items: flex-start; gap: 8px;
-  background: var(--error-bg); border: 1px solid var(--error-border);
-  color: var(--error-text); border-radius: 8px; padding: 10px 12px;
+  background: var(--error-bg); border: 2px solid var(--error-border);
+  color: var(--error-text); border-radius: 14px; padding: 10px 12px;
   font-size: 13px; line-height: 1.4; margin: 0;
 }
 .form-error:not(:empty) { display: flex; }
@@ -267,7 +375,16 @@ button:active { transform: scale(0.94); opacity: 0.8; }
   66% { content: '...'; }
 }
 
-#closeAccountsBtn {
+#closeAccountsBtn, .close-panel-btn {
   display: block; width: 100%; margin-top: 16px; background: none;
-  border: 1px solid var(--border); border-radius: 6px; color: var(--text-dim); padding: 10px;
+  border: 2px solid var(--border); border-radius: 999px; color: var(--text-dim); padding: 10px;
+  font-weight: 600;
 }
+
+.settings-row-btn {
+  display: block; width: 100%; text-align: left; background: var(--input-bg);
+  border: 2px solid var(--border); border-radius: 14px; color: var(--text);
+  font-weight: 600; font-size: 14px; padding: 12px 14px; margin-bottom: 8px;
+}
+.settings-row-btn.logout-row { color: var(--delete); border-color: var(--delete); }
+.settings-row-btn.active { color: var(--accent); border-color: var(--accent); }
