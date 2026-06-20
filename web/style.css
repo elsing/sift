@@ -44,8 +44,17 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, sans-serif; overscroll-behavior-y: contain;
-  scrollbar-width: none; }
+  scrollbar-width: none; transition: background-color 0.25s ease, color 0.25s ease; }
 html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
+
+button { cursor: pointer; transition: transform 0.12s ease, opacity 0.12s ease,
+  background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease; }
+button:active { transform: scale(0.94); opacity: 0.8; }
+
+.topbar, .row-content, #addAccountForm input, .logout-btn, .icon-btn,
+.accounts-list li, .account-sync-error, .form-error {
+  transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
+}
 
 .topbar {
   position: sticky; top: 0; z-index: 10;
@@ -62,6 +71,19 @@ html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
 }
 
+.icon-btn {
+  font-size: 15px; font-weight: 600; color: var(--text-dim); background: none;
+  border: 1px solid var(--border); border-radius: 6px; width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center; line-height: 1;
+}
+.icon-btn.active { color: var(--accent); border-color: var(--accent); }
+
+.dry-run-banner {
+  text-align: center; font-size: 12px; color: var(--accent); background: var(--error-bg);
+  height: 0; overflow: hidden; transition: height 0.25s ease, opacity 0.25s ease; opacity: 0;
+}
+.dry-run-banner.visible { height: 28px; line-height: 28px; opacity: 1; }
+
 .pull-indicator {
   text-align: center; font-size: 13px; color: var(--text-dim);
   height: 0; overflow: hidden; transition: height 0.15s;
@@ -73,6 +95,11 @@ html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
 .row {
   position: relative; overflow: hidden;
   border-bottom: 1px solid var(--border);
+  animation: row-in 0.25s ease both;
+}
+@keyframes row-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .row-action {
@@ -110,22 +137,33 @@ html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
 .accounts-panel {
   position: fixed; inset: 0; background: var(--bg); z-index: 20;
   padding: calc(env(safe-area-inset-top, 0px) + 20px) 16px 20px; overflow-y: auto;
+  transform: translateY(100%); opacity: 0;
+  transition: transform 0.3s cubic-bezier(.2,.8,.2,1), opacity 0.3s ease, background-color 0.25s ease;
 }
-.accounts-panel.hidden { display: none; }
+.accounts-panel.hidden { pointer-events: none; }
+.accounts-panel:not(.hidden) { transform: translateY(0); opacity: 1; }
 .accounts-panel h2 { font-size: 18px; margin: 0 0 12px; }
 
 .accounts-list { list-style: none; margin: 0 0 20px; padding: 0; }
 .accounts-list li { padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
 .account-row { display: flex; justify-content: space-between; align-items: center; }
+.account-row span { display: flex; gap: 6px; }
 .accounts-list button {
-  font-size: 12px; color: var(--delete); background: none; border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-dim); background: none; border: 1px solid var(--border);
   border-radius: 6px; padding: 3px 8px;
 }
+.account-row button:last-child { color: var(--delete); }
 .account-sync-error {
   margin: 6px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.4;
   background: var(--error-bg); border: 1px solid var(--error-border);
   color: var(--error-text); border-radius: 6px;
 }
+
+.folder-tree { margin-top: 8px; font-size: 13px; color: var(--text-dim); animation: row-in 0.2s ease both; }
+.folder-tree.hidden { display: none; }
+.folder-tree ul { list-style: none; margin: 2px 0 0; padding-left: 16px; }
+.folder-tree > ul { padding-left: 0; }
+.folder-tree li { padding: 3px 0; border-left: 1px solid var(--border); padding-left: 8px; }
 
 #addAccountForm { display: flex; flex-direction: column; gap: 8px; }
 #addAccountForm input {

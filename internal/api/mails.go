@@ -8,10 +8,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 )
+
+const pageSize = 30
 
 //go:embed schema.sql
 var schema string
@@ -122,7 +126,8 @@ func (s *Store) Routes(mux *http.ServeMux) {
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
-	mails, err := s.list()
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	mails, err := s.list(offset, pageSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,8 +135,11 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, mails)
 }
 
-func (s *Store) list() ([]Mail, error) {
-	rows, err := s.db.Query("SELECT id, sender, subject, snippet, time, unread FROM mails ORDER BY id DESC")
+func (s *Store) list(offset, limit int) ([]Mail, error) {
+	rows, err := s.db.Query(
+		"SELECT id, sender, subject, snippet, time, unread FROM mails ORDER BY id DESC LIMIT $1 OFFSET $2",
+		limit, offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +171,7 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	mails, err := s.list()
+	mails, err := s.list(0, pageSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -173,6 +181,11 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleRemove(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if isDryRun(r) {
+		log.Printf("[dry-run] would remove mail %s", id)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -182,6 +195,24 @@ func (s *Store) handleRemove(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleToggleRead(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	if isDryRun(r) {
+		var m Mail
+		row := s.db.QueryRow("SELECT id, sender, subject, snippet, time, unread FROM mails WHERE id = $1", id)
+		if err := row.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread); err != nil {
+			if err == sql.ErrNoRows {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		m.Unread = !m.Unread
+		log.Printf("[dry-run] would toggle read on mail %s", id)
+		writeJSON(w, m)
+		return
+	}
+
 	var m Mail
 	row := s.db.QueryRow(
 		"UPDATE mails SET unread = NOT unread WHERE id = $1 RETURNING id, sender, subject, snippet, time, unread",

@@ -30,7 +30,8 @@
       "Bash(node --check /Users/elliotsinger/Documents/Dev/sift/web/app.js)",
       "Bash(go vet *)",
       "Bash(task build *)",
-      "Bash(task restart *)"
+      "Bash(task restart *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8080/api/mails)"
     ]
   }
 }

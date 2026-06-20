@@ -6,16 +6,45 @@
 const EDGE_GUARD = 20;      // px from screen edge where swipe is ignored, avoids iOS back/app-switcher gesture
 const COMMIT_RATIO = 0.3;   // fraction of row width dragged at release-time to commit; below this, releasing cancels
 
+const PAGE_SIZE = 30;
 let mails = [];
+let hasMore = true;
+let loadingMore = false;
+
+function dryRunHeaders() {
+  return localStorage.getItem('dryRun') === '1' ? { 'X-Dry-Run': '1' } : {};
+}
 
 async function fetchMails() {
   const res = await fetch('/api/mails');
   mails = await res.json();
+  hasMore = mails.length === PAGE_SIZE;
 }
 
 async function refreshMails() {
   const res = await fetch('/api/mails/refresh', { method: 'POST' });
   mails = await res.json();
+  hasMore = mails.length === PAGE_SIZE;
+}
+
+async function loadMore() {
+  if (loadingMore || !hasMore) return;
+  loadingMore = true;
+  const res = await fetch(`/api/mails?offset=${mails.length}`);
+  const more = await res.json();
+  hasMore = more.length === PAGE_SIZE;
+  mails = mails.concat(more);
+  const list = document.getElementById('inbox');
+  for (const mail of more) list.appendChild(renderRow(mail));
+  loadingMore = false;
+}
+
+function setupInfiniteScroll() {
+  window.addEventListener('scroll', () => {
+    if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 300) {
+      loadMore();
+    }
+  });
 }
 
 function render() {
@@ -121,7 +150,7 @@ function attachSwipe(row) {
   content.addEventListener('click', () => {
     if (Math.abs(dx) > 4) return; // suppress tap right after a drag
     row.classList.toggle('unread');
-    fetch(`/api/mails/${row.dataset.id}/read`, { method: 'POST' });
+    fetch(`/api/mails/${row.dataset.id}/read`, { method: 'POST', headers: dryRunHeaders() });
   });
 }
 
@@ -129,7 +158,7 @@ function commit(row, action) {
   row.classList.add('removing');
   const content = row.querySelector('.row-content');
   content.style.transform = `translateX(${action === 'archive' ? '100%' : '-100%'})`;
-  fetch(`/api/mails/${row.dataset.id}/${action}`, { method: 'POST' });
+  fetch(`/api/mails/${row.dataset.id}/${action}`, { method: 'POST', headers: dryRunHeaders() });
   setTimeout(() => {
     mails = mails.filter((m) => m.id !== row.dataset.id);
     row.remove();
@@ -210,21 +239,25 @@ function setupPullToRefresh() {
 
 fetchMails().then(render);
 setupPullToRefresh();
+setupInfiniteScroll();
 
 document.getElementById('logoutBtn').addEventListener('click', () => {
   fetch('/auth/logout', { method: 'POST' }).then(() => location.reload());
 });
 
 setupThemeToggle();
+setupDryRunToggle();
 setupAccountsPanel();
 
 function setupThemeToggle() {
   const order = ['auto', 'light', 'dark'];
+  const icons = { auto: 'A', light: '☀', dark: '☾' };
   const btn = document.getElementById('themeBtn');
   function apply(theme) {
     if (theme === 'auto') delete document.documentElement.dataset.theme;
     else document.documentElement.dataset.theme = theme;
-    btn.textContent = 'Theme: ' + theme;
+    btn.textContent = icons[theme];
+    btn.title = 'Theme: ' + theme;
   }
   apply(localStorage.getItem('theme') || 'auto');
   btn.addEventListener('click', () => {
@@ -232,6 +265,22 @@ function setupThemeToggle() {
     const next = order[(order.indexOf(current) + 1) % order.length];
     localStorage.setItem('theme', next);
     apply(next);
+  });
+}
+
+function setupDryRunToggle() {
+  const btn = document.getElementById('dryRunBtn');
+  const banner = document.getElementById('dryRunBanner');
+  function apply(on) {
+    btn.classList.toggle('active', on);
+    btn.title = on ? 'Dry run: on (no changes are saved)' : 'Dry run: off';
+    banner.classList.toggle('visible', on);
+  }
+  apply(localStorage.getItem('dryRun') === '1');
+  btn.addEventListener('click', () => {
+    const on = localStorage.getItem('dryRun') !== '1';
+    localStorage.setItem('dryRun', on ? '1' : '0');
+    apply(on);
   });
 }
 
@@ -251,13 +300,17 @@ function setupAccountsPanel() {
       row.className = 'account-row';
       const label = document.createElement('span');
       label.textContent = `${a.email} (${a.host})`;
+      const foldersBtn = document.createElement('button');
+      foldersBtn.textContent = 'Folders';
       const removeBtn = document.createElement('button');
       removeBtn.textContent = 'Remove';
       removeBtn.addEventListener('click', async () => {
-        await fetch(`/api/accounts/${a.id}`, { method: 'DELETE' });
+        await fetch(`/api/accounts/${a.id}`, { method: 'DELETE', headers: dryRunHeaders() });
         loadAccounts();
       });
-      row.append(label, removeBtn);
+      const btnGroup = document.createElement('span');
+      btnGroup.append(foldersBtn, removeBtn);
+      row.append(label, btnGroup);
       li.appendChild(row);
       if (a.lastSyncError) {
         const err = document.createElement('p');
@@ -265,8 +318,41 @@ function setupAccountsPanel() {
         err.textContent = `Sync failed: ${a.lastSyncError}`;
         li.appendChild(err);
       }
+      const tree = document.createElement('div');
+      tree.className = 'folder-tree hidden';
+      li.appendChild(tree);
+      foldersBtn.addEventListener('click', async () => {
+        const showing = !tree.classList.contains('hidden');
+        if (showing) {
+          tree.classList.add('hidden');
+          return;
+        }
+        tree.classList.remove('hidden');
+        tree.textContent = 'Loading…';
+        const res = await fetch(`/api/accounts/${a.id}/folders`);
+        if (!res.ok) {
+          tree.textContent = await res.text();
+          return;
+        }
+        const folders = await res.json();
+        tree.innerHTML = '';
+        tree.appendChild(renderFolderTree(folders));
+      });
       list.appendChild(li);
     }
+  }
+
+  function renderFolderTree(nodes) {
+    const ul = document.createElement('ul');
+    for (const node of nodes) {
+      const li = document.createElement('li');
+      li.textContent = node.name;
+      if (node.children && node.children.length) {
+        li.appendChild(renderFolderTree(node.children));
+      }
+      ul.appendChild(li);
+    }
+    return ul;
   }
 
   document.getElementById('accountsBtn').addEventListener('click', () => {

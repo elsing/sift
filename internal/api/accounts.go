@@ -169,7 +169,7 @@ func (s *Store) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	mails, err := s.list()
+	mails, err := s.list(0, pageSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
