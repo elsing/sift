@@ -2,12 +2,6 @@ import { dryRunHeaders } from './util.js';
 import { renderFolderTree } from './folders.js';
 import { openFolder, fetchMails, render } from './inbox.js';
 
-// Lets the topbar Folders shortcut jump straight to the Accounts panel (where
-// per-account folder trees live) without duplicating its open/load logic.
-export function openAccountsPanel() {
-  document.getElementById('accountsBtn').click();
-}
-
 export function setupAccountsPanel() {
   const panel = document.getElementById('accountsPanel');
   const list = document.getElementById('accountsList');

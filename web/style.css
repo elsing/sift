@@ -222,12 +222,12 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 
 .folder-tree {
-  margin-top: 8px; padding: 4px; font-size: 13px;
+  margin-top: 8px; padding: 6px; font-size: 14px;
   background: var(--input-bg); border: 2px solid var(--border); border-radius: 14px;
   animation: row-in 0.2s ease both;
 }
 .folder-tree.hidden { display: none; }
-.folder-tree ul { list-style: none; margin: 0; padding-left: 15px; }
+.folder-tree ul { list-style: none; margin: 0; padding-left: 18px; }
 .folder-tree ul.hidden { display: none; } /* the actual collapse toggle — was missing, "collapse did nothing" */
 .folder-tree > ul { padding-left: 0; }
 .folder-tree li { margin: 0; position: relative; } /* no gap between rows, or the connector lines below break */
@@ -239,18 +239,18 @@ button:active { transform: scale(0.9); opacity: 0.8; }
    what made these look off-center before. The last child's vertical line stops
    halfway, at its own row, finishing the "L". */
 .folder-tree ul ul > li::before {
-  content: ''; position: absolute; left: -8px; top: 0; bottom: 0; width: 1px;
+  content: ''; position: absolute; left: -10px; top: 0; bottom: 0; width: 1px;
   background: var(--border);
 }
 .folder-tree ul ul > li:last-child::before { bottom: 50%; }
 .folder-tree ul ul > li::after {
-  content: ''; position: absolute; left: -8px; top: 50%; width: 8px; height: 1px;
+  content: ''; position: absolute; left: -10px; top: 50%; width: 10px; height: 1px;
   background: var(--border); transform: translateY(-0.5px);
 }
 
 .folder-row {
-  display: flex; align-items: center; gap: 3px; padding: 0 3px;
-  border-radius: 4px; color: var(--text); height: 18px;
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px;
+  border-radius: 8px; color: var(--text); height: 26px;
 }
 .folder-row:hover { background: var(--bg); }
 .folder-row.has-children .folder-label { font-weight: 600; }
@@ -258,7 +258,7 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 
 /* explicit resets: <button> carries UA-stylesheet padding/min-height on some browsers
    that ignored the width/height alone, which is why this still looked oversized */
-.folder-toggle, .folder-toggle-spacer { width: 12px; height: 18px; flex: none; }
+.folder-toggle, .folder-toggle-spacer { width: 14px; height: 26px; flex: none; }
 .folder-toggle {
   -webkit-appearance: none; appearance: none; background: none; border: none;
   margin: 0; padding: 0; min-width: 0; min-height: 0; line-height: 0;
@@ -268,13 +268,13 @@ button:active { transform: scale(0.9); opacity: 0.8; }
    same way real geometry does, which was part of why this looked misaligned */
 .folder-toggle::before {
   content: ''; width: 0; height: 0; flex: none;
-  border-style: solid; border-width: 3.5px 0 3.5px 4.5px;
+  border-style: solid; border-width: 4.5px 0 4.5px 5.5px;
   border-color: transparent transparent transparent var(--text-dim);
   transition: transform 0.15s ease;
 }
 .folder-toggle.open::before { transform: rotate(90deg); }
 
-.folder-label { flex: 1; line-height: 18px; font-size: 12.5px; }
+.folder-label { flex: 1; line-height: 26px; font-size: 13.5px; }
 .folder-label.navigable { cursor: pointer; }
 .folder-label.navigable:hover { color: var(--accent); }
 

@@ -1,5 +1,5 @@
 import { dryRunHeaders } from './util.js';
-import { removeMailById } from './inbox.js';
+import { removeMailById, openFolder } from './inbox.js';
 
 // Renders a folder tree as nested <ul>s, in one of two modes:
 // - onSelect: the whole row is a tap target (move-to-folder picker — any folder,
@@ -117,4 +117,87 @@ function moveRowToFolder(row, path) {
       content.style.transform = 'translateX(0)';
       setTimeout(() => { content.style.transition = ''; }, 280);
     });
+}
+
+let folderBrowserModal, folderBrowserBody, folderBrowserError, folderBrowserTitle;
+
+export function setupFolderBrowser() {
+  folderBrowserModal = document.getElementById('folderBrowserModal');
+  folderBrowserBody = document.getElementById('folderBrowserBody');
+  folderBrowserError = document.getElementById('folderBrowserError');
+  folderBrowserTitle = document.getElementById('folderBrowserTitle');
+  document.getElementById('folderBrowserClose').addEventListener('click', closeFolderBrowser);
+}
+
+function closeFolderBrowser() {
+  folderBrowserModal.classList.add('hidden');
+  folderBrowserBody.innerHTML = '';
+  folderBrowserError.textContent = '';
+}
+
+// The topbar Folders shortcut: jumps straight to a folder tree (same picker UI as
+// move-to-folder) instead of going through the full Accounts panel. With one account
+// it skips straight to that account's tree; with several, it asks which one first.
+export async function openFolderBrowser() {
+  folderBrowserModal.classList.remove('hidden');
+  folderBrowserTitle.textContent = 'Folders';
+  folderBrowserError.textContent = '';
+  folderBrowserBody.textContent = 'Loading…';
+
+  const res = await fetch('/api/accounts');
+  if (!res.ok) {
+    folderBrowserBody.textContent = '';
+    folderBrowserError.textContent = await res.text();
+    return;
+  }
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    folderBrowserBody.textContent = '';
+    folderBrowserError.textContent = 'Add an account first (Settings > Accounts) to browse folders.';
+    return;
+  }
+  if (accounts.length === 1) {
+    showAccountFolders(accounts[0]);
+    return;
+  }
+
+  folderBrowserBody.innerHTML = '';
+  for (const a of accounts) {
+    const btn = document.createElement('button');
+    btn.className = 'settings-row-btn';
+    btn.textContent = a.email;
+    btn.addEventListener('click', () => showAccountFolders(a));
+    folderBrowserBody.appendChild(btn);
+  }
+}
+
+async function showAccountFolders(account) {
+  folderBrowserTitle.textContent = account.email;
+  folderBrowserError.textContent = '';
+  folderBrowserBody.textContent = 'Loading…';
+  const res = await fetch(`/api/accounts/${account.id}/folders`);
+  if (!res.ok) {
+    folderBrowserBody.textContent = '';
+    folderBrowserError.textContent = await res.text();
+    return;
+  }
+  const folders = await res.json();
+  const expandedSet = new Set(account.expandedFolders || []);
+  folderBrowserBody.innerHTML = '';
+  folderBrowserBody.appendChild(renderFolderTree(folders, {
+    expandedSet,
+    onNavigate: (path, name) => {
+      closeFolderBrowser();
+      openFolder(account.id, path, name);
+    },
+    onToggle: (path, isExpanded) => {
+      if (isExpanded) expandedSet.add(path);
+      else expandedSet.delete(path);
+      fetch(`/api/accounts/${account.id}/expanded-folders`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: Array.from(expandedSet) }),
+      });
+    },
+  }));
 }

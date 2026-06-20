@@ -21,7 +21,11 @@
     <header class="topbar">
       Sift
       <span>
-        <button id="foldersBtn" class="icon-btn" title="Folders">📁</button>
+        <button id="foldersBtn" class="icon-btn" title="Folders">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>
+          </svg>
+        </button>
         <button id="settingsBtn" class="logout-btn">Settings</button>
       </span>
     </header>
@@ -69,6 +73,17 @@
     <button id="dryRunBtn" class="settings-row-btn">Dry run mode</button>
     <button id="logoutBtn" class="settings-row-btn logout-row">Log out</button>
     <button id="closeSettingsBtn" class="close-panel-btn">Close</button>
+  </div>
+
+  <div id="folderBrowserModal" class="move-modal hidden">
+    <div class="move-modal-content">
+      <div class="move-modal-header">
+        <span id="folderBrowserTitle">Folders</span>
+        <button id="folderBrowserClose">✕</button>
+      </div>
+      <p id="folderBrowserError" class="form-error"></p>
+      <div id="folderBrowserBody" class="folder-tree move-folder-tree"></div>
+    </div>
   </div>
 
   <div id="moveModal" class="move-modal hidden">

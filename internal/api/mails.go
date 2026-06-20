@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,6 +50,12 @@ var snippets = []string{
 type Store struct {
 	db     *sql.DB
 	crypto *encryptor
+
+	broadcaster *broadcaster
+
+	watchCtx     context.Context
+	watchMu      sync.Mutex
+	watchCancels map[string]context.CancelFunc
 }
 
 // NewStore assumes db.Migrate has already been run by the caller.
@@ -56,7 +64,7 @@ func NewStore(db *sql.DB) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, crypto: crypto}
+	s := &Store{db: db, crypto: crypto, broadcaster: newBroadcaster(), watchCancels: make(map[string]context.CancelFunc)}
 
 	hasAccounts, err := s.hasAccounts()
 	if err != nil {
@@ -139,6 +147,7 @@ func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/mails/{id}/read", s.handleToggleRead)
 	mux.HandleFunc("POST /api/mails/{id}/move", s.handleMove)
 	mux.HandleFunc("GET /api/mails/{id}/body", s.handleMailBody)
+	mux.HandleFunc("GET /api/events", s.handleEvents)
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
