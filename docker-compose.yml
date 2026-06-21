@@ -1,31 +1,24 @@
 services:
   db:
     image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: mailapp
-      POSTGRES_PASSWORD: mailapp
-      POSTGRES_DB: mailapp
-    ports:
-      - "5432:5432"
+    env_file: .env
+    expose:
+      - "5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mailapp"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 2s
       timeout: 5s
       retries: 10
 
   app:
     build: .
+    env_file: .env
     environment:
-      DATABASE_URL: postgres://mailapp:mailapp@db:5432/mailapp?sslmode=disable
-      OIDC_ISSUER: ${OIDC_ISSUER}
-      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
-      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
-      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
-      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
-      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      # the only one not a direct passthrough from .env — composed from the Postgres
+      # vars above, which env_file already injected
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
     ports:
       - "8080:8080"
     depends_on:

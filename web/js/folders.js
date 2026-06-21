@@ -182,9 +182,38 @@ function showFolderSheet(accountId, title, treeOpts) {
     });
 }
 
-export function openMoveModal(row, direction = 'left') {
+export async function openMoveModal(row, direction = 'left') {
   row.dataset.moveDirection = direction;
-  showFolderSheet(row.dataset.accountId, 'Move to…', { onSelect: (path) => moveRowToFolder(row, path) });
+  const accountId = row.dataset.accountId;
+
+  // Match whatever's expanded in the Folder Browser for this account — without this,
+  // the move picker always opened fully collapsed regardless of where you'd actually
+  // navigated to elsewhere, which felt like it had no memory of its own.
+  let expandedSet = new Set();
+  try {
+    const res = await fetch('/api/accounts');
+    if (res.ok) {
+      const accounts = await res.json();
+      const account = accounts.find((a) => a.id === accountId);
+      if (account) expandedSet = new Set(account.expandedFolders || []);
+    }
+  } catch {
+    // best-effort — worst case the tree just opens collapsed, same as before this fix
+  }
+
+  showFolderSheet(accountId, 'Move to…', {
+    onSelect: (path) => moveRowToFolder(row, path),
+    expandedSet,
+    onToggle: (path, isExpanded) => {
+      if (isExpanded) expandedSet.add(path);
+      else expandedSet.delete(path);
+      fetch(`/api/accounts/${accountId}/expanded-folders`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: Array.from(expandedSet) }),
+      });
+    },
+  });
 }
 
 function moveRowToFolder(row, path) {

@@ -3,6 +3,17 @@ import { getMailById } from './inbox.js';
 
 let mailReaderPanel, mailReaderBody, mailReaderHtml, mailReaderSubject, mailReaderSender, mailReaderTime;
 
+// Real email HTML routinely has fixed-pixel-width tables/layouts (the classic 600px
+// newsletter table) built for desktop, with no idea it'll ever render in a narrow
+// iframe — without this, that forces horizontal scroll on a phone. Prepended ahead of
+// whatever the message contains; later, more specific author CSS in the message can
+// still override anything here that isn't !important.
+const RESPONSIVE_RESET = `<style>
+  html, body { max-width: 100%; overflow-x: hidden; word-wrap: break-word; }
+  img, table { max-width: 100% !important; height: auto !important; }
+  table { width: auto !important; }
+</style>`;
+
 // One-shot hook for "where did opening this mail come from". Defaults to nothing extra
 // (just close, landing on whatever's underneath — the inbox/folder). Set by a caller
 // like search.js that wants Back to return somewhere specific instead, e.g. reopening
@@ -120,7 +131,7 @@ async function loadMailBody(id) {
     // this is untrusted content, so render it but never let it run anything.
     mailReaderBody.classList.add('hidden');
     mailReaderHtml.classList.remove('hidden');
-    mailReaderHtml.srcdoc = data.html;
+    mailReaderHtml.srcdoc = RESPONSIVE_RESET + data.html;
   } else {
     mailReaderBody.textContent = data.text || '(no readable body)';
   }
