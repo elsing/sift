@@ -157,11 +157,12 @@ func (s *Store) handleAddAccount(w http.ResponseWriter, r *http.Request, owner s
 	}
 
 	out := accountOut{ID: id, Email: req.Email, Host: req.Host, Port: req.Port}
-	if err := s.syncAccount(id); err != nil {
+	if _, err := s.syncAccount(id); err != nil {
 		// account is saved; record the sync failure instead of rolling back, surfaced via lastSyncError
 		log.Printf("add account %s: initial sync failed: %v", req.Email, err)
 		out.LastSyncError = err.Error()
 	}
+	s.watchAccount(id)
 	writeJSON(w, out)
 }
 
@@ -176,6 +177,7 @@ func (s *Store) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.stopWatching(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -223,11 +225,11 @@ func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.syncAccount(id); err != nil {
+	if _, err := s.syncAccount(id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	mails, err := s.list(0, pageSize)
+	mails, err := s.list(0, pageSize, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -236,22 +238,24 @@ func (s *Store) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // syncAccount fetches recent mail for one account and upserts it into the mails table.
-func (s *Store) syncAccount(accountID string) error {
+// Returns the mails IMAP actually reported this round (newest-first by UID is not
+// guaranteed; callers that need "what's new" should look at UID, not slice order).
+func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	mails, oldestUID, err := syncIMAP(acct, password)
 	if err != nil {
 		syncErr := fmt.Errorf("imap sync: %w", err)
 		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", syncErr.Error(), accountID)
-		return syncErr
+		return nil, syncErr
 	}
 
 	if err := s.upsertMails(accountID, mails); err != nil {
 		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
-		return err
+		return nil, err
 	}
 	// only move the backfill boundary down (older); a regular sync's window can be
 	// newer than what backfill has already reached further back in history.
@@ -263,7 +267,7 @@ func (s *Store) syncAccount(accountID string) error {
 	} else {
 		s.db.Exec("UPDATE accounts SET last_sync_error = NULL WHERE id = $1", accountID)
 	}
-	return nil
+	return mails, nil
 }
 
 // upsertMails inserts/updates mails for an account inside a single transaction.
@@ -454,7 +458,7 @@ func (s *Store) syncAllAccounts() error {
 	rows.Close()
 
 	for _, id := range ids {
-		if err := s.syncAccount(id); err != nil {
+		if _, err := s.syncAccount(id); err != nil {
 			return fmt.Errorf("sync account %s: %w", id, err)
 		}
 	}

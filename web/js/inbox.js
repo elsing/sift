@@ -23,6 +23,23 @@ let nextOffset = 0;
 // null when viewing the inbox; { accountId, path, name } when browsing a folder.
 export let currentFolder = null;
 
+// null means "all accounts" (the common case, and the only case with one account).
+// Setting it restricts the inbox to a chosen subset — one account, or any mix.
+let accountFilterIds = null;
+
+// Called by the account-filter chip strip when the selection changes. Clears the
+// list immediately (same pattern as switching folders) rather than leaving stale
+// rows up while the new fetch is in flight.
+export function applyAccountFilter(ids) {
+  accountFilterIds = ids && ids.length ? ids : null;
+  mails = [];
+  render();
+  fetchMails().then(render);
+}
+function accountsQueryParam(prefix) {
+  return accountFilterIds ? `${prefix}accounts=${accountFilterIds.map(encodeURIComponent).join(',')}` : '';
+}
+
 // Swipe actions are config-driven so a future settings UI just needs to write new
 // values to localStorage — no gesture/dispatch code to touch. 'move' is special: it
 // doesn't commit immediately, it asks the injected onMoveRequested to open the folder picker.
@@ -62,7 +79,7 @@ export async function fetchMails() {
     hasMore = false; // ponytail: folder view doesn't paginate yet, just the most recent page
     return;
   }
-  const res = await fetch('/api/mails');
+  const res = await fetch(`/api/mails?${accountsQueryParam('')}`);
   mails = await res.json();
   nextOffset = mails.length;
   hasMore = mails.length === PAGE_SIZE;
@@ -70,7 +87,7 @@ export async function fetchMails() {
 
 export async function refreshMails() {
   if (currentFolder) return fetchMails(); // folder view: a refresh just re-fetches live from IMAP
-  const res = await fetch('/api/mails/refresh', { method: 'POST' });
+  const res = await fetch(`/api/mails/refresh?${accountsQueryParam('')}`, { method: 'POST' });
   mails = await res.json();
   nextOffset = mails.length;
   hasMore = mails.length === PAGE_SIZE;
@@ -79,7 +96,7 @@ export async function refreshMails() {
 export async function loadMore() {
   if (loadingMore || !hasMore || currentFolder) return;
   loadingMore = true;
-  const res = await fetch(`/api/mails?offset=${nextOffset}`);
+  const res = await fetch(`/api/mails?offset=${nextOffset}${accountsQueryParam('&')}`);
   const more = await res.json();
   nextOffset += more.length;
   hasMore = more.length === PAGE_SIZE;
@@ -157,11 +174,43 @@ export function openFolder(accountId, path, name) {
 export function backToInbox() {
   currentFolder = null;
   document.getElementById('folderBanner').classList.add('hidden');
-  fetchMails().then(render);
+  window.scrollTo(0, 0);
+  mails = [];
+  render(); // clear the folder's rows immediately, same as entering a folder does
+  fetchMails().then(render).catch((err) => {
+    console.error(err);
+    const list = document.getElementById('inbox');
+    list.innerHTML = '';
+    const li = document.createElement('li');
+    li.className = 'folder-empty-status';
+    li.textContent = "Couldn't load the inbox: " + err.message;
+    list.appendChild(li);
+  });
 }
 
 export function setupFolderBanner() {
   document.getElementById('folderBannerBack').addEventListener('click', backToInbox);
+}
+
+// Live push: the server holds an SSE connection open and sends a "mail" event whenever
+// an IMAP IDLE watcher sees new mail land. We just refresh the current view in response —
+// browsers auto-reconnect EventSource on drop, so no retry/backoff logic needed here.
+//
+// ponytail: a reverse proxy/tunnel in front of the app can silently stall a long-lived
+// connection without ever firing onerror, so SSE alone isn't fully trustworthy end-to-end.
+// Backstop with a refresh whenever the tab/PWA regains focus — cheap, and catches anything
+// SSE missed without needing real reconnect/backoff logic.
+export function setupLiveUpdates() {
+  const es = new EventSource('/api/events');
+  es.addEventListener('mail', () => {
+    if (!currentFolder) fetchMails().then(render);
+  });
+  es.addEventListener('error', () => {
+    console.warn('live updates: SSE connection error (browser will retry)', es.readyState);
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !currentFolder) fetchMails().then(render);
+  });
 }
 
 export function setupInfiniteScroll() {

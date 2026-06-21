@@ -1,16 +1,18 @@
-import { fetchMails, render, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setHandlers } from './inbox.js';
-import { setupMoveModal, openMoveModal, setupFolderBrowser, openFolderBrowser } from './folders.js';
-import { setupMailReader, openMailReader } from './reader.js';
+import { fetchMails, render, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setHandlers, setupLiveUpdates } from './inbox.js';
+import { setupFolderSheet, openMoveModal, openFolderBrowser } from './folders.js';
+import { setupMailReader, openMailReader, openMailReaderById } from './reader.js';
 import { setupAccountsPanel } from './accounts.js';
 import { setupThemeOptions, setupDryRunToggle, setupPaletteSwatches, setupSettingsPanel } from './settings.js';
+import { setupPushNotifications } from './push.js';
+import { setupAccountFilter } from './accountFilter.js';
+import { setupSearch } from './search.js';
 
 setHandlers({ onMove: openMoveModal, onTap: openMailReader });
 
 fetchMails().then(render);
 setupPullToRefresh();
 setupInfiniteScroll();
-setupMoveModal();
-setupFolderBrowser();
+setupFolderSheet();
 setupFolderBanner();
 setupMailReader();
 setupThemeOptions();
@@ -18,9 +20,21 @@ setupPaletteSwatches();
 setupSettingsPanel();
 setupDryRunToggle();
 setupAccountsPanel();
+setupLiveUpdates();
+setupPushNotifications();
+setupAccountFilter();
+setupSearch();
 
 document.getElementById('foldersBtn').addEventListener('click', openFolderBrowser);
 
 document.getElementById('logoutBtn').addEventListener('click', () => {
   fetch('/auth/logout', { method: 'POST' }).then(() => location.reload());
 });
+
+// Deep-link from a push notification: the service worker opens/focuses the app at
+// /?openMail=<id>, and the page loads straight into that specific email.
+const openMailId = new URLSearchParams(location.search).get('openMail');
+if (openMailId) {
+  history.replaceState({}, '', location.pathname);
+  openMailReaderById(openMailId);
+}

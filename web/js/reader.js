@@ -3,6 +3,15 @@ import { getMailById } from './inbox.js';
 
 let mailReaderPanel, mailReaderBody, mailReaderHtml, mailReaderSubject, mailReaderSender, mailReaderTime;
 
+// One-shot hook for "where did opening this mail come from". Defaults to nothing extra
+// (just close, landing on whatever's underneath — the inbox/folder). Set by a caller
+// like search.js that wants Back to return somewhere specific instead, e.g. reopening
+// the search panel rather than leaving you on the folder it jumped to.
+let onBack = null;
+export function setReaderBack(fn) {
+  onBack = fn;
+}
+
 export function setupMailReader() {
   mailReaderPanel = document.getElementById('mailReaderPanel');
   mailReaderBody = document.getElementById('mailReaderBody');
@@ -13,6 +22,9 @@ export function setupMailReader() {
   document.getElementById('mailReaderBack').addEventListener('click', () => {
     mailReaderPanel.classList.add('hidden');
     mailReaderHtml.removeAttribute('srcdoc'); // stop any media/connections the message kicked off
+    const cb = onBack;
+    onBack = null;
+    if (cb) cb();
   });
 }
 
@@ -52,8 +64,41 @@ function renderSender(mail) {
 }
 
 export async function openMailReader(row) {
+  onBack = null; // plain inbox-row tap — Back just closes, no special destination
   const id = row.dataset.id;
   const mail = getMailById(id) || {};
+  showMailMeta(mail);
+
+  if (row.classList.contains('unread')) {
+    row.classList.remove('unread');
+    fetch(`/api/mails/${id}/read`, { method: 'POST', headers: dryRunHeaders() });
+  }
+
+  await loadMailBody(id);
+}
+
+// Opens the reader from just an id, with no inbox row to read cached metadata or
+// swipe state from — used to deep-link a push notification straight to its mail,
+// since that mail may not be on the currently-loaded page (or in the inbox at all).
+export async function openMailReaderById(id) {
+  onBack = null; // caller sets a destination via setReaderBack right after, if it wants one
+  showMailMeta({});
+  const metaRes = await fetch(`/api/mails/${id}`);
+  if (!metaRes.ok) {
+    mailReaderBody.textContent = await metaRes.text();
+    return;
+  }
+  const mail = await metaRes.json();
+  showMailMeta(mail);
+
+  if (mail.unread) {
+    fetch(`/api/mails/${id}/read`, { method: 'POST', headers: dryRunHeaders() });
+  }
+
+  await loadMailBody(id);
+}
+
+function showMailMeta(mail) {
   mailReaderSubject.textContent = mail.subject || '';
   renderSender(mail);
   mailReaderTime.textContent = mail.time || '';
@@ -61,12 +106,9 @@ export async function openMailReader(row) {
   mailReaderBody.classList.remove('hidden');
   mailReaderHtml.classList.add('hidden');
   mailReaderPanel.classList.remove('hidden');
+}
 
-  if (row.classList.contains('unread')) {
-    row.classList.remove('unread');
-    fetch(`/api/mails/${id}/read`, { method: 'POST', headers: dryRunHeaders() });
-  }
-
+async function loadMailBody(id) {
   const res = await fetch(`/api/mails/${id}/body`);
   if (!res.ok) {
     mailReaderBody.textContent = await res.text();

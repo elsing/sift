@@ -55,6 +55,12 @@ func main() {
 	store.AccountsRoutes(protected, func(r *http.Request) string {
 		return auth.UserFromContext(r.Context()).Subject
 	})
+	store.PushRoutes(protected, func(r *http.Request) string {
+		return auth.UserFromContext(r.Context()).Subject
+	})
+	store.SearchRoutes(protected, func(r *http.Request) string {
+		return auth.UserFromContext(r.Context()).Subject
+	})
 	// no-cache (not no-store) so the browser always revalidates via ETag/Last-Modified
 	// instead of serving a stale copy outright — this app gets redeployed often, and a
 	// PWA on a home screen is especially prone to caching static assets aggressively.
@@ -64,6 +70,8 @@ func main() {
 		static.ServeHTTP(w, r)
 	}))
 	mux.Handle("/", a.Require(protected))
+
+	store.StartWatching(ctx)
 
 	log.Println("listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))

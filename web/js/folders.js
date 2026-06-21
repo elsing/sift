@@ -1,14 +1,68 @@
 import { dryRunHeaders } from './util.js';
 import { removeMailById, openFolder } from './inbox.js';
 
-// Renders a folder tree as nested <ul>s, in one of two modes:
+// Folder lists rarely change, so every sheet open here uses cache-then-network:
+// show the last-known tree instantly (no spinner, no flash) while quietly refetching
+// in the background, swapping in fresh data only if it actually differs.
+const folderCache = new Map(); // accountId -> folders array
+
+export async function fetchFolders(accountId) {
+  const res = await fetch(`/api/accounts/${accountId}/folders`);
+  if (!res.ok) throw new Error(await res.text());
+  const folders = await res.json();
+  folderCache.set(accountId, folders);
+  return folders;
+}
+
+export function cachedFolders(accountId) {
+  return folderCache.get(accountId);
+}
+
+// A skeleton at roughly the height of a real folder tree, not "Loading…" text —
+// swapping a couple of words for the actual tree was the "double bump": the sheet
+// slides up to a tiny height, then immediately jumps taller once real content lands.
+// Matching heights up front makes that swap barely noticeable instead of jarring.
+const SKELETON_WIDTHS = [62, 78, 48, 70, 55, 82, 40, 65, 50, 74, 58, 45, 68, 80];
+
+export function setLoading(el, isLoading) {
+  if (!isLoading) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'folder-skeleton';
+  for (const width of SKELETON_WIDTHS) {
+    const row = document.createElement('div');
+    row.className = 'skeleton-row';
+    const bar = document.createElement('div');
+    bar.className = 'skeleton-bar';
+    bar.style.width = width + '%';
+    row.appendChild(bar);
+    wrap.appendChild(row);
+  }
+  el.appendChild(wrap);
+}
+
+// Closing a bottom-sheet modal by tapping the dimmed backdrop, not just its X button —
+// matches what every native sheet/picker does.
+function closeOnBackdropTap(modal, close) {
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+}
+
+// Renders a folder tree as nested <ul>s, in one of three modes:
 // - onSelect: the whole row is a tap target (move-to-folder picker — any folder,
 //   branch or leaf, is a valid destination).
-// - onNavigate: the chevron toggles expand/collapse, the label opens that folder
-//   (Accounts panel's folder browser). expandedSet/onToggle persist which folders
-//   are expanded (server-side, per account — see handleSetExpandedFolders).
+// - onNavigate: the chevron toggles expand/collapse, the label opens that folder.
+//   expandedSet/onToggle persist which folders are expanded (server-side, per
+//   account — see handleSetExpandedFolders).
+// - checkSet/onCheck: a checkbox per row, independent of expand/collapse — picking a
+//   specific set of folders (e.g. the search filter's folder picker). checkSet holds
+//   the currently-checked paths; checking a branch does not cascade to its children.
 export function renderFolderTree(nodes, opts = {}) {
-  const { onSelect, onNavigate, expandedSet, onToggle } = opts;
+  const { onSelect, onNavigate, checkSet, onCheck, expandedSet, onToggle } = opts;
   const ul = document.createElement('ul');
   for (const node of nodes) {
     const hasChildren = node.children && node.children.length > 0;
@@ -34,6 +88,26 @@ export function renderFolderTree(nodes, opts = {}) {
       });
     } else {
       row.appendChild(document.createElement('span')).className = 'folder-toggle-spacer';
+    }
+
+    if (checkSet) {
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'folder-checkbox';
+      checkbox.checked = checkSet.has(node.path);
+      checkbox.addEventListener('click', (e) => e.stopPropagation());
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) checkSet.add(node.path);
+        else checkSet.delete(node.path);
+        if (onCheck) onCheck(node.path, checkbox.checked);
+      });
+      row.appendChild(checkbox);
+      row.classList.add('selectable');
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        checkbox.checked = !checkbox.checked;
+        checkbox.dispatchEvent(new Event('change'));
+      });
     }
 
     const label = document.createElement('span');
@@ -62,39 +136,59 @@ export function renderFolderTree(nodes, opts = {}) {
   return ul;
 }
 
-let moveModal, moveModalTree, moveModalError;
+let sheetModal, sheetBody, sheetError, sheetTitle;
 
-export function setupMoveModal() {
-  moveModal = document.getElementById('moveModal');
-  moveModalTree = document.getElementById('moveModalTree');
-  moveModalError = document.getElementById('moveModalError');
-  document.getElementById('moveModalClose').addEventListener('click', closeMoveModal);
+export function setupFolderSheet() {
+  sheetModal = document.getElementById('folderSheetModal');
+  sheetBody = document.getElementById('folderSheetBody');
+  sheetError = document.getElementById('folderSheetError');
+  sheetTitle = document.getElementById('folderSheetTitle');
+  document.getElementById('folderSheetClose').addEventListener('click', closeFolderSheet);
+  closeOnBackdropTap(sheetModal, closeFolderSheet);
 }
 
-function closeMoveModal() {
-  moveModal.classList.add('hidden');
-  moveModalTree.innerHTML = '';
-  moveModalError.textContent = '';
+function closeFolderSheet() {
+  sheetModal.classList.add('hidden');
+  sheetBody.innerHTML = '';
+  sheetError.textContent = '';
 }
 
-export async function openMoveModal(row, direction = 'left') {
+// Shows one account's folder tree in the shared sheet, cache-then-network. treeOpts is
+// passed straight to renderFolderTree (onSelect, or onNavigate+expandedSet+onToggle).
+function showFolderSheet(accountId, title, treeOpts) {
+  sheetModal.classList.remove('hidden');
+  sheetTitle.textContent = title;
+  sheetError.textContent = '';
+
+  const render = (folders) => {
+    sheetBody.innerHTML = '';
+    sheetBody.appendChild(renderFolderTree(folders, treeOpts));
+  };
+
+  const cached = folderCache.get(accountId);
+  if (cached) render(cached);
+  else setLoading(sheetBody, true);
+
+  fetchFolders(accountId)
+    .then((folders) => {
+      // still showing this same account's tree (not closed/switched while the fetch ran)
+      if (!sheetModal.classList.contains('hidden') && sheetTitle.textContent === title) render(folders);
+    })
+    .catch((err) => {
+      if (!cached) {
+        sheetBody.textContent = '';
+        sheetError.textContent = err.message;
+      }
+    });
+}
+
+export function openMoveModal(row, direction = 'left') {
   row.dataset.moveDirection = direction;
-  moveModal.classList.remove('hidden');
-  moveModalError.textContent = '';
-  moveModalTree.textContent = 'Loading…';
-  const res = await fetch(`/api/accounts/${row.dataset.accountId}/folders`);
-  if (!res.ok) {
-    moveModalTree.textContent = '';
-    moveModalError.textContent = await res.text();
-    return;
-  }
-  const folders = await res.json();
-  moveModalTree.innerHTML = '';
-  moveModalTree.appendChild(renderFolderTree(folders, { onSelect: (path) => moveRowToFolder(row, path) }));
+  showFolderSheet(row.dataset.accountId, 'Move to…', { onSelect: (path) => moveRowToFolder(row, path) });
 }
 
 function moveRowToFolder(row, path) {
-  closeMoveModal();
+  closeFolderSheet();
   row.classList.add('removing');
   const content = row.querySelector('.row-content');
   content.style.transition = 'transform 0.28s cubic-bezier(.34,1.56,.64,1)';
@@ -119,41 +213,25 @@ function moveRowToFolder(row, path) {
     });
 }
 
-let folderBrowserModal, folderBrowserBody, folderBrowserError, folderBrowserTitle;
-
-export function setupFolderBrowser() {
-  folderBrowserModal = document.getElementById('folderBrowserModal');
-  folderBrowserBody = document.getElementById('folderBrowserBody');
-  folderBrowserError = document.getElementById('folderBrowserError');
-  folderBrowserTitle = document.getElementById('folderBrowserTitle');
-  document.getElementById('folderBrowserClose').addEventListener('click', closeFolderBrowser);
-}
-
-function closeFolderBrowser() {
-  folderBrowserModal.classList.add('hidden');
-  folderBrowserBody.innerHTML = '';
-  folderBrowserError.textContent = '';
-}
-
-// The topbar Folders shortcut: jumps straight to a folder tree (same picker UI as
+// The topbar Folders shortcut: jumps straight to a folder tree (same sheet as
 // move-to-folder) instead of going through the full Accounts panel. With one account
 // it skips straight to that account's tree; with several, it asks which one first.
 export async function openFolderBrowser() {
-  folderBrowserModal.classList.remove('hidden');
-  folderBrowserTitle.textContent = 'Folders';
-  folderBrowserError.textContent = '';
-  folderBrowserBody.textContent = 'Loading…';
+  sheetModal.classList.remove('hidden');
+  sheetTitle.textContent = 'Folders';
+  sheetError.textContent = '';
+  setLoading(sheetBody, true);
 
   const res = await fetch('/api/accounts');
   if (!res.ok) {
-    folderBrowserBody.textContent = '';
-    folderBrowserError.textContent = await res.text();
+    sheetBody.textContent = '';
+    sheetError.textContent = await res.text();
     return;
   }
   const accounts = await res.json();
   if (accounts.length === 0) {
-    folderBrowserBody.textContent = '';
-    folderBrowserError.textContent = 'Add an account first (Settings > Accounts) to browse folders.';
+    sheetBody.textContent = '';
+    sheetError.textContent = 'Add an account first (Settings > Accounts) to browse folders.';
     return;
   }
   if (accounts.length === 1) {
@@ -161,33 +239,23 @@ export async function openFolderBrowser() {
     return;
   }
 
-  folderBrowserBody.innerHTML = '';
+  sheetBody.classList.remove('dot-loader');
+  sheetBody.innerHTML = '';
   for (const a of accounts) {
     const btn = document.createElement('button');
     btn.className = 'settings-row-btn';
     btn.textContent = a.email;
     btn.addEventListener('click', () => showAccountFolders(a));
-    folderBrowserBody.appendChild(btn);
+    sheetBody.appendChild(btn);
   }
 }
 
-async function showAccountFolders(account) {
-  folderBrowserTitle.textContent = account.email;
-  folderBrowserError.textContent = '';
-  folderBrowserBody.textContent = 'Loading…';
-  const res = await fetch(`/api/accounts/${account.id}/folders`);
-  if (!res.ok) {
-    folderBrowserBody.textContent = '';
-    folderBrowserError.textContent = await res.text();
-    return;
-  }
-  const folders = await res.json();
+function showAccountFolders(account) {
   const expandedSet = new Set(account.expandedFolders || []);
-  folderBrowserBody.innerHTML = '';
-  folderBrowserBody.appendChild(renderFolderTree(folders, {
+  showFolderSheet(account.id, account.email, {
     expandedSet,
     onNavigate: (path, name) => {
-      closeFolderBrowser();
+      closeFolderSheet();
       openFolder(account.id, path, name);
     },
     onToggle: (path, isExpanded) => {
@@ -199,5 +267,5 @@ async function showAccountFolders(account) {
         body: JSON.stringify({ paths: Array.from(expandedSet) }),
       });
     },
-  }));
+  });
 }

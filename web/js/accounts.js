@@ -1,6 +1,7 @@
 import { dryRunHeaders } from './util.js';
-import { renderFolderTree } from './folders.js';
+import { renderFolderTree, fetchFolders, cachedFolders, setLoading } from './folders.js';
 import { openFolder, fetchMails, render } from './inbox.js';
+import { refreshAccountFilter } from './accountFilter.js';
 
 export function setupAccountsPanel() {
   const panel = document.getElementById('accountsPanel');
@@ -11,8 +12,10 @@ export function setupAccountsPanel() {
   async function loadAccounts() {
     const res = await fetch('/api/accounts');
     const accounts = await res.json();
+    console.log('loadAccounts:', accounts); // temporary — diagnosing an empty-list report
     list.innerHTML = '';
     for (const a of accounts) {
+      try {
       const li = document.createElement('li');
       const row = document.createElement('div');
       row.className = 'account-row';
@@ -25,6 +28,7 @@ export function setupAccountsPanel() {
       removeBtn.addEventListener('click', async () => {
         await fetch(`/api/accounts/${a.id}`, { method: 'DELETE', headers: dryRunHeaders() });
         loadAccounts();
+        refreshAccountFilter();
       });
       const btnGroup = document.createElement('span');
       btnGroup.append(foldersBtn, removeBtn);
@@ -39,24 +43,14 @@ export function setupAccountsPanel() {
       const tree = document.createElement('div');
       tree.className = 'folder-tree hidden';
       li.appendChild(tree);
-      foldersBtn.addEventListener('click', async () => {
-        const showing = !tree.classList.contains('hidden');
-        if (showing) {
-          tree.classList.add('hidden');
-          return;
-        }
-        tree.classList.remove('hidden');
-        tree.textContent = 'Loading…';
-        const res = await fetch(`/api/accounts/${a.id}/folders`);
-        if (!res.ok) {
-          tree.textContent = await res.text();
-          return;
-        }
-        const folders = await res.json();
-        const expandedSet = new Set(a.expandedFolders || []);
+      const expandedSet = new Set(a.expandedFolders || []);
+      const renderTree = (folders) => {
         tree.innerHTML = '';
         tree.appendChild(renderFolderTree(folders, {
-          onNavigate: (path, name) => openFolder(a.id, path, name),
+          onNavigate: (path, name) => {
+            panel.classList.add('hidden');
+            openFolder(a.id, path, name);
+          },
           expandedSet,
           onToggle: (path, isExpanded) => {
             if (isExpanded) expandedSet.add(path);
@@ -68,8 +62,33 @@ export function setupAccountsPanel() {
             });
           },
         }));
+      };
+      foldersBtn.addEventListener('click', async () => {
+        const showing = !tree.classList.contains('hidden');
+        if (showing) {
+          tree.classList.add('hidden');
+          return;
+        }
+        tree.classList.remove('hidden');
+
+        const cached = cachedFolders(a.id);
+        if (cached) renderTree(cached);
+        else setLoading(tree, true);
+
+        try {
+          const folders = await fetchFolders(a.id);
+          if (!tree.classList.contains('hidden')) renderTree(folders);
+        } catch (err) {
+          if (!cached) {
+            tree.classList.remove('dot-loader');
+            tree.textContent = err.message;
+          }
+        }
       });
       list.appendChild(li);
+      } catch (err) {
+        console.error('render account row failed:', a, err); // temporary
+      }
     }
   }
 
@@ -110,6 +129,7 @@ export function setupAccountsPanel() {
       form.port.value = '993';
       form.classList.add('hidden');
       loadAccounts();
+      refreshAccountFilter();
     } finally {
       submitBtn.disabled = false;
       submitBtn.classList.remove('dot-loader');

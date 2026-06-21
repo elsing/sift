@@ -12,7 +12,7 @@
   --error-bg: #3a1f33;
   --error-border: #c2185b;
   --error-text: #ff8fb3;
-  --bounce: cubic-bezier(.34, 1.56, .64, 1);
+  --bounce: cubic-bezier(.34, 1.12, .64, 1); /* toned down from a much springier 1.56 overshoot */
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -250,15 +250,32 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 
 .folder-row {
   display: flex; align-items: center; gap: 6px; padding: 3px 6px;
-  border-radius: 8px; color: var(--text); height: 26px;
+  border-radius: 8px; color: var(--text); height: 40px; /* ~Apple's 44px touch-target guidance */
 }
 .folder-row:hover { background: var(--bg); }
+
+/* Roughly fills the sheet's real max-height (70vh) up front — a folder tree with
+   many entries (this app has seen 100+) settles at that cap anyway, so opening at
+   a much shorter skeleton height and then jumping to it was the visible "bump". */
+.folder-skeleton { min-height: 55vh; }
+.skeleton-row { display: flex; align-items: center; height: 40px; padding: 3px 6px; }
+.skeleton-bar {
+  height: 14px; border-radius: 7px;
+  background: linear-gradient(90deg, var(--border) 25%, var(--input-bg) 50%, var(--border) 75%);
+  background-size: 200% 100%; animation: skeleton-shimmer 1.2s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
 .folder-row.has-children .folder-label { font-weight: 600; }
 .folder-row.leaf .folder-label { color: var(--text-dim); }
 
 /* explicit resets: <button> carries UA-stylesheet padding/min-height on some browsers
-   that ignored the width/height alone, which is why this still looked oversized */
-.folder-toggle, .folder-toggle-spacer { width: 14px; height: 26px; flex: none; }
+   that ignored the width/height alone, which is why this still looked oversized.
+   Toggle is wider than visually necessary so the chevron has its own real tap target
+   instead of sharing a cramped edge with the label next to it. */
+.folder-toggle, .folder-toggle-spacer { width: 28px; height: 40px; flex: none; }
 .folder-toggle {
   -webkit-appearance: none; appearance: none; background: none; border: none;
   margin: 0; padding: 0; min-width: 0; min-height: 0; line-height: 0;
@@ -274,7 +291,8 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .folder-toggle.open::before { transform: rotate(90deg); }
 
-.folder-label { flex: 1; line-height: 26px; font-size: 13.5px; }
+.folder-label { flex: 1; line-height: 40px; font-size: 13.5px; }
+.folder-checkbox { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
 .folder-label.navigable { cursor: pointer; }
 .folder-label.navigable:hover { color: var(--accent); }
 
@@ -313,6 +331,18 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .folder-banner span { font-size: 14px; font-weight: 700; }
 
+.account-filter-bar {
+  display: flex; gap: 6px; padding: 8px 16px; overflow-x: auto;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.account-filter-bar.hidden { display: none; }
+.account-chip {
+  flex: none; border: 2px solid var(--border); border-radius: 999px;
+  background: none; color: var(--text-dim); font-size: 12px; font-weight: 700;
+  padding: 6px 14px; white-space: nowrap;
+}
+.account-chip.active { border-color: var(--accent); color: var(--accent); background: var(--input-bg); }
+
 .mail-reader-header { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
 .mail-reader-header button {
   background: none; border: 2px solid var(--border); border-radius: 12px;
@@ -333,6 +363,40 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .mail-reader-html.hidden { display: none; }
 
 .folder-empty-status { padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 14px; }
+
+.search-form { margin-bottom: 10px; }
+.search-form-row { display: flex; align-items: center; gap: 8px; }
+.search-form input {
+  flex: 1; min-width: 0; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 10px 16px; font-size: 15px;
+}
+.search-form-row .icon-btn { flex: none; }
+.search-scope-btn {
+  display: block; width: 100%; margin-top: 8px; background: none;
+  border: 2px solid var(--border); border-radius: 999px; color: var(--text-dim);
+  font-size: 12px; font-weight: 700; padding: 6px 12px;
+}
+.search-scope-btn.hidden { display: none; }
+.search-scope-label { color: var(--text-dim); font-size: 12px; font-weight: 600; margin: 0 0 10px; }
+.search-advanced-toggle {
+  background: none; border: none; color: var(--text-dim); font-size: 12px;
+  font-weight: 700; padding: 0; margin-bottom: 8px;
+}
+.search-advanced { margin-bottom: 12px; }
+.search-advanced.hidden { display: none; }
+.search-advanced input[type="text"] {
+  width: 100%; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 8px;
+}
+.search-folder-picker.hidden { display: none; }
+.search-folder-picker { margin-bottom: 8px; max-height: 240px; overflow-y: auto; }
+.search-progress { margin-bottom: 10px; }
+.search-progress.hidden { display: none; }
+.search-progress-bar { height: 4px; border-radius: 999px; background: var(--border); overflow: hidden; }
+.search-progress-fill { height: 100%; background: var(--accent); transition: width 0.25s ease; width: 0%; }
+.search-progress-text { margin: 6px 0 0; font-size: 12px; color: var(--text-dim); }
+.search-results { margin-top: 4px; }
+.search-result-row .snippet { color: var(--text-dim); }
 .end-of-list-footer { padding: 20px 16px 40px; text-align: center; color: var(--text-dim); font-size: 13px; }
 
 .show-add-account-btn {

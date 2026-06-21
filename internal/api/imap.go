@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -136,7 +137,13 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 			oldestUID = m.UID
 		}
 		mails = append(mails, Mail{
-			ID:          fmt.Sprintf("%s|%s|%d", accountID, folder, m.UID),
+			// folder is base64url-encoded, not embedded raw: a nested IMAP folder like
+			// "Uni/4th Year" contains "/", and a literal "/" inside this ID broke every
+			// /api/mails/{id}... route — net/http's mux decodes %2F to "/" before
+			// matching, so even percent-encoding the slash client-side can't fix this,
+			// it has to never be a literal "/" in the first place. The ID is otherwise
+			// opaque (nothing parses it back apart elsewhere), so this is safe.
+			ID:          fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
 			Sender:      envelopeSender(m.Envelope),
 			SenderEmail: envelopeSenderEmail(m.Envelope),
 			Subject:     m.Envelope.Subject,

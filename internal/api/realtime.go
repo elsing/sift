@@ -61,7 +61,9 @@ func (s *Store) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// no "Connection: keep-alive" — that's a connection-specific header forbidden under
+	// HTTP/2 (which a proxy/tunnel in front of this app may negotiate with the browser),
+	// and setting it can trip a protocol error that kills the stream outright.
 
 	ch := s.broadcaster.subscribe()
 	defer s.broadcaster.unsubscribe(ch)
@@ -165,6 +167,7 @@ func (s *Store) idleOnce(ctx context.Context, accountID string) error {
 	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), &imapclient.Options{
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Mailbox: func(data *imapclient.UnilateralDataMailbox) {
+				log.Printf("idle %s: mailbox update, numMessages=%v", accountID, data.NumMessages)
 				if data.NumMessages != nil {
 					select {
 					case newMail <- struct{}{}:
@@ -193,6 +196,7 @@ func (s *Store) idleOnce(ctx context.Context, accountID string) error {
 	if err != nil {
 		return fmt.Errorf("idle: %w", err)
 	}
+	log.Printf("idle %s: connected, watching INBOX", accountID)
 
 	select {
 	case <-ctx.Done():
@@ -202,9 +206,37 @@ func (s *Store) idleOnce(ctx context.Context, accountID string) error {
 		idleCmd.Close()
 	}
 
-	if err := s.syncAccount(accountID); err != nil {
+	log.Printf("idle %s: new mail signal, syncing", accountID)
+	mails, err := s.syncAccount(accountID)
+	if err != nil {
 		return fmt.Errorf("sync after idle: %w", err)
 	}
 	s.broadcaster.publish("mail")
+	s.notifyNewMail(accountID, mails)
 	return nil
+}
+
+// notifyNewMail sends a browser push naming the mail that just arrived. mails is
+// whatever this sync round fetched from IMAP — UID increases monotonically per
+// mailbox, so the highest-UID mail in that batch is reliably "what's new", unlike
+// sorting the whole mailbox by a parsed Date header (which a backdated or unparsed
+// message can throw off). Best-effort: a lookup/send failure here shouldn't fail the
+// IDLE loop, it just means no notification this round.
+func (s *Store) notifyNewMail(accountID string, mails []Mail) {
+	if len(mails) == 0 {
+		return
+	}
+	newest := mails[0]
+	for _, m := range mails[1:] {
+		if m.UID > newest.UID {
+			newest = m
+		}
+	}
+
+	var owner string
+	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&owner); err != nil {
+		log.Printf("notify new mail %s: %v", accountID, err)
+		return
+	}
+	s.notifyOwner(owner, newest.Sender, newest.Subject, newest.ID)
 }

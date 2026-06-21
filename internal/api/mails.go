@@ -30,7 +30,7 @@ type Mail struct {
 	Unread      bool   `json:"unread"`
 	AccountID   string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
 	UID         uint32 `json:"-"`                   // IMAP UID within Folder; zero for mock mail, used to move/delete/read on the server
-	Folder      string `json:"-"`                   // IMAP mailbox this UID belongs to; "INBOX" for mock mail
+	Folder      string `json:"folder,omitempty"`    // IMAP mailbox this UID belongs to; shown for search results spanning folders
 }
 
 var senders = []string{"Alex Chen", "Notion", "Sarah Park", "GitHub", "Mom", "Stripe", "Figma", "Delta", "Sam Lee", "Linear"}
@@ -137,6 +137,7 @@ func randomMail() Mail {
 
 func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/mails", s.handleList)
+	mux.HandleFunc("GET /api/mails/{id}", s.handleGetMail)
 	mux.HandleFunc("POST /api/mails/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/mails/{id}/archive", func(w http.ResponseWriter, r *http.Request) {
 		s.handleRemove(w, r, "archive")
@@ -150,9 +151,20 @@ func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 }
 
+// accountFilter parses the optional ?accounts=id1,id2 query param. An empty result
+// means "all accounts" — the common case, and the only case for a single-account setup.
+func accountFilter(r *http.Request) []string {
+	raw := r.URL.Query().Get("accounts")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	mails, err := s.list(offset, pageSize)
+	accountIDs := accountFilter(r)
+	mails, err := s.list(offset, pageSize, accountIDs)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -162,32 +174,69 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	// Also clear any "backfill exhausted" markers: those were recorded against the old
 	// cache, which is gone, so they'd otherwise wrongly block backfill forever even
 	// though the freshly-rebuilt cache has plenty more history to pull.
-	if offset == 0 && len(mails) == 0 {
+	// Skipped while a filter is active — an empty page there just means "this account
+	// has no mail," not "the cache is broken," and resyncing every account regardless
+	// of the filter would be pointless work.
+	if offset == 0 && len(mails) == 0 && len(accountIDs) == 0 {
 		if _, err := s.db.Exec("UPDATE accounts SET oldest_synced_uid = NULL"); err != nil {
 			log.Printf("reset backfill progress: %v", err)
 		}
 		if err := s.syncAllAccounts(); err != nil {
 			log.Printf("auto-sync: %v", err)
-		} else if refreshed, err := s.list(offset, pageSize); err == nil {
+		} else if refreshed, err := s.list(offset, pageSize, accountIDs); err == nil {
 			mails = refreshed
 		}
 	}
 	if len(mails) < pageSize {
-		// scrolled past what's cached locally; pull another batch of older mail before answering
+		// scrolled past what's cached locally; pull another batch of older mail before
+		// answering. Backfills every account regardless of the active filter — harmless,
+		// and avoids a filter switch immediately looking under-backfilled.
 		if _, err := s.backfillAllAccounts(pageSize); err != nil {
 			log.Printf("backfill: %v", err)
-		} else if refreshed, err := s.list(offset, pageSize); err == nil {
+		} else if refreshed, err := s.list(offset, pageSize, accountIDs); err == nil {
 			mails = refreshed
 		}
 	}
 	writeJSON(w, mails)
 }
 
-func (s *Store) list(offset, limit int) ([]Mail, error) {
-	rows, err := s.db.Query(
-		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE folder = 'INBOX' ORDER BY id DESC LIMIT $1 OFFSET $2",
-		limit, offset,
+// handleGetMail returns one mail's metadata by id — used to deep-link a push
+// notification straight to the mail it's about, since that mail may not be on the
+// currently-loaded page (or may not even be in the inbox view at all).
+func (s *Store) handleGetMail(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var m Mail
+	var sentAt sql.NullTime
+	row := s.db.QueryRow(
+		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE id = $1",
+		id,
 	)
+	if err := row.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt); err != nil {
+		if err == sql.ErrNoRows {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if sentAt.Valid {
+		m.Date = sentAt.Time.Format(time.RFC3339)
+	}
+	writeJSON(w, m)
+}
+
+// list returns inbox mail, optionally restricted to accountIDs (empty/nil means all).
+func (s *Store) list(offset, limit int, accountIDs []string) ([]Mail, error) {
+	query := "SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE folder = 'INBOX'"
+	args := []any{}
+	if len(accountIDs) > 0 {
+		query += " AND account_id = ANY($1)"
+		args = append(args, accountIDs)
+	}
+	query += fmt.Sprintf(" ORDER BY id DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +272,7 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	mails, err := s.list(0, pageSize)
+	mails, err := s.list(0, pageSize, accountFilter(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
