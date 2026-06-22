@@ -207,13 +207,42 @@ func (s *Store) idleOnce(ctx context.Context, accountID string) error {
 	}
 
 	log.Printf("idle %s: new mail signal, syncing", accountID)
-	mails, err := s.syncAccount(accountID)
-	if err != nil {
+	// syncAccount itself now sends the push (off the genuinely-new subset, not
+	// whatever the full resync happens to return) — IDLE's "mailbox changed" signal
+	// fires on mail leaving the mailbox too (e.g. auto-move), not just mail arriving,
+	// so doing it here off the raw resync used to mean a push about old mail every
+	// time auto-move took something out of the inbox.
+	if _, err := s.syncAccount(accountID); err != nil {
 		return fmt.Errorf("sync after idle: %w", err)
 	}
 	s.broadcaster.publish("mail")
-	s.notifyNewMail(accountID, mails)
 	return nil
+}
+
+// allTagsMuted reports whether a mail has at least one tag and every one of them has
+// notifications off. A mail with no tags at all is never muted by this — it's purely
+// about tags the user explicitly silenced, not a default-quiet state.
+func (s *Store) allTagsMuted(messageID string) bool {
+	if messageID == "" {
+		return false
+	}
+	rows, err := s.db.Query(
+		"SELECT t.notify FROM message_tags mt JOIN tags t ON t.id = mt.tag_id WHERE mt.message_id = $1",
+		messageID,
+	)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	any := false
+	for rows.Next() {
+		any = true
+		var notify bool
+		if rows.Scan(&notify) == nil && notify {
+			return false // at least one tag still wants to alert
+		}
+	}
+	return any
 }
 
 // notifyNewMail sends a browser push naming the mail that just arrived. mails is
@@ -226,11 +255,26 @@ func (s *Store) notifyNewMail(accountID string, mails []Mail) {
 	if len(mails) == 0 {
 		return
 	}
+	if s.recentlySelfMovedIntoInbox(accountID) {
+		// A move we ourselves just made into INBOX (Restore from Trash, or a manual
+		// Move) assigns a brand-new UID on the server — indistinguishable from
+		// genuinely new mail by UID alone, which is what made every restore fire a
+		// push as if it were a fresh arrival.
+		return
+	}
 	newest := mails[0]
 	for _, m := range mails[1:] {
 		if m.UID > newest.UID {
 			newest = m
 		}
+	}
+
+	if s.allTagsMuted(newest.MessageID) {
+		// A tag the user trusts enough to auto-sort mail into (newsletters, receipts,
+		// anything they've turned notifications off for) is exactly the mail a push
+		// would otherwise be noise for — only suppressed if every tag on this mail is
+		// muted, so one quiet tag can't override another tag that still wants to alert.
+		return
 	}
 
 	var owner string

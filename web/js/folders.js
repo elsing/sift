@@ -1,5 +1,6 @@
 import { dryRunHeaders } from './util.js';
-import { removeMailById, openFolder } from './inbox.js';
+import { removeMailById, openFolder, beginRowAnimation, endRowAnimation, render } from './inbox.js';
+import { confirmModal, promptModal } from './confirmModal.js';
 
 // Folder lists rarely change, so every sheet open here uses cache-then-network:
 // show the last-known tree instantly (no spinner, no flash) while quietly refetching
@@ -16,6 +17,41 @@ export async function fetchFolders(accountId) {
 
 export function cachedFolders(accountId) {
   return folderCache.get(accountId);
+}
+
+// parentPath is "" for a root-level folder. The server joins parentPath+name using
+// the account's real hierarchy delimiter — the client never has a reliable way to
+// know what that delimiter is itself.
+export async function createFolder(accountId, parentPath, name) {
+  const res = await fetch(`/api/accounts/${accountId}/folders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentPath, name }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  folderCache.delete(accountId);
+}
+
+// Renames in place (same parent, new leaf name only) — moving to a different parent
+// isn't exposed here.
+export async function renameFolder(accountId, path, newName) {
+  const res = await fetch(`/api/accounts/${accountId}/folders`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, newName }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  folderCache.delete(accountId);
+}
+
+export async function deleteFolderOnServer(accountId, path) {
+  const res = await fetch(`/api/accounts/${accountId}/folders`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  folderCache.delete(accountId);
 }
 
 // A skeleton at roughly the height of a real folder tree, not "Loading…" text —
@@ -62,7 +98,7 @@ function closeOnBackdropTap(modal, close) {
 //   specific set of folders (e.g. the search filter's folder picker). checkSet holds
 //   the currently-checked paths; checking a branch does not cascade to its children.
 export function renderFolderTree(nodes, opts = {}) {
-  const { onSelect, onNavigate, checkSet, onCheck, expandedSet, onToggle } = opts;
+  const { onSelect, onNavigate, checkSet, onCheck, expandedSet, onToggle, manageActions } = opts;
   const ul = document.createElement('ul');
   for (const node of nodes) {
     const hasChildren = node.children && node.children.length > 0;
@@ -129,6 +165,35 @@ export function renderFolderTree(nodes, opts = {}) {
       });
     }
 
+    // manageActions: { onCreateChild, onRename, onDelete } — the "Manage folders"
+    // settings panel's mode, distinct from every other use of this tree (pick a
+    // destination, browse, multi-select) which never need to mutate the folder
+    // structure itself.
+    if (manageActions) {
+      const actions = document.createElement('span');
+      actions.className = 'folder-manage-actions';
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'folder-manage-btn';
+      addBtn.textContent = '+';
+      addBtn.title = 'New subfolder';
+      addBtn.addEventListener('click', (e) => { e.stopPropagation(); manageActions.onCreateChild(node.path); });
+      const renameBtn = document.createElement('button');
+      renameBtn.type = 'button';
+      renameBtn.className = 'folder-manage-btn';
+      renameBtn.textContent = '✎';
+      renameBtn.title = 'Rename';
+      renameBtn.addEventListener('click', (e) => { e.stopPropagation(); manageActions.onRename(node.path, node.name); });
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'folder-manage-btn folder-manage-delete';
+      deleteBtn.textContent = '🗑';
+      deleteBtn.title = 'Delete';
+      deleteBtn.addEventListener('click', (e) => { e.stopPropagation(); manageActions.onDelete(node.path, node.name); });
+      actions.append(addBtn, renameBtn, deleteBtn);
+      row.appendChild(actions);
+    }
+
     li.appendChild(row);
     if (childrenEl) li.appendChild(childrenEl);
     ul.appendChild(li);
@@ -136,7 +201,7 @@ export function renderFolderTree(nodes, opts = {}) {
   return ul;
 }
 
-let sheetModal, sheetBody, sheetError, sheetTitle, sheetSearch;
+let sheetModal, sheetBody, sheetError, sheetTitle, sheetSearch, sheetConfirm;
 
 export function setupFolderSheet() {
   sheetModal = document.getElementById('folderSheetModal');
@@ -144,6 +209,7 @@ export function setupFolderSheet() {
   sheetError = document.getElementById('folderSheetError');
   sheetTitle = document.getElementById('folderSheetTitle');
   sheetSearch = document.getElementById('folderSheetSearch');
+  sheetConfirm = document.getElementById('folderSheetConfirm');
   document.getElementById('folderSheetClose').addEventListener('click', closeFolderSheet);
   closeOnBackdropTap(sheetModal, closeFolderSheet);
   sheetSearch.addEventListener('input', () => renderCurrentTree());
@@ -154,6 +220,8 @@ function closeFolderSheet() {
   sheetBody.innerHTML = '';
   sheetError.textContent = '';
   sheetSearch.value = '';
+  sheetConfirm.classList.add('hidden');
+  sheetConfirm.onclick = null;
 }
 
 // Keeps only nodes whose name matches (case-insensitive substring), plus any ancestor
@@ -199,12 +267,25 @@ function renderCurrentTree() {
 }
 
 // Shows one account's folder tree in the shared sheet, cache-then-network. treeOpts is
-// passed straight to renderFolderTree (onSelect, or onNavigate+expandedSet+onToggle).
-function showFolderSheet(accountId, title, treeOpts) {
+// passed straight to renderFolderTree (onSelect, or onNavigate+expandedSet+onToggle, or
+// checkSet+onCheck for multi-select). confirm, if given, shows a footer button — used by
+// checkSet mode, where there's no per-row action to close the sheet on.
+function showFolderSheet(accountId, title, treeOpts, confirm) {
   sheetModal.classList.remove('hidden');
   sheetTitle.textContent = title;
   sheetError.textContent = '';
   sheetSearch.value = '';
+  if (confirm) {
+    sheetConfirm.textContent = confirm.label;
+    sheetConfirm.classList.remove('hidden');
+    sheetConfirm.onclick = () => {
+      confirm.onConfirm();
+      closeFolderSheet();
+    };
+  } else {
+    sheetConfirm.classList.add('hidden');
+    sheetConfirm.onclick = null;
+  }
 
   const render = (folders) => {
     lastFolders = folders;
@@ -291,7 +372,12 @@ export async function openMoveModalForMail(accountId, mailId, onMoved) {
         if (!res.ok) throw new Error(await res.text());
         onMoved();
       } catch (err) {
+        // The sheet's already closed by this point and onMoved() (which would
+        // otherwise close the reader as its own success signal) never runs — without
+        // this, a failed move here looked exactly like a successful one, nothing on
+        // screen ever said otherwise.
         console.error(err);
+        alert(`Couldn't move that mail: ${err.message}`);
       }
     },
     onToggle: (path, isExpanded) => {
@@ -302,12 +388,136 @@ export async function openMoveModalForMail(accountId, mailId, onMoved) {
   });
 }
 
-function moveRowToFolder(row, path) {
+// Generic "pick a folder" — account selection first if there's more than one, then the
+// usual folder tree, calling onSelect(accountId, path). Used by anything that needs a
+// destination folder but isn't moving a specific mail (e.g. assigning a tag a folder
+// to auto-move into, from the tag's own side rather than the folder banner).
+export async function pickFolder(title, onSelect) {
+  sheetModal.classList.remove('hidden');
+  sheetTitle.textContent = title;
+  sheetError.textContent = '';
+  setLoading(sheetBody, true);
+
+  const res = await fetch('/api/accounts');
+  if (!res.ok) {
+    sheetBody.textContent = '';
+    sheetError.textContent = await res.text();
+    return;
+  }
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    sheetBody.textContent = '';
+    sheetError.textContent = 'Add an account first (Settings > Accounts).';
+    return;
+  }
+
+  const showPicker = async (accountId) => {
+    const expandedSet = await loadExpandedFolders(accountId);
+    showFolderSheet(accountId, title, {
+      expandedSet,
+      onSelect: (path) => {
+        closeFolderSheet();
+        onSelect(accountId, path);
+      },
+      onToggle: (path, isExpanded) => {
+        if (isExpanded) expandedSet.add(path);
+        else expandedSet.delete(path);
+        persistExpandedFolders(accountId, expandedSet);
+      },
+    });
+  };
+
+  if (accounts.length === 1) {
+    showPicker(accounts[0].id);
+    return;
+  }
+  sheetBody.classList.remove('dot-loader');
+  sheetBody.innerHTML = '';
+  for (const a of accounts) {
+    const btn = document.createElement('button');
+    btn.className = 'settings-row-btn';
+    btn.textContent = a.email;
+    btn.addEventListener('click', () => showPicker(a.id));
+    sheetBody.appendChild(btn);
+  }
+}
+
+// Like pickFolder, but multi-select via checkboxes instead of "tap one row and close
+// immediately" — account selection first if there's more than one, then a folder tree
+// with checkboxes and a "Done" button. checkSet is mutated directly as boxes are
+// (un)checked; onConfirm(accountId) fires when "Done" is pressed.
+export async function pickFolders(title, checkSet, onConfirm) {
+  sheetModal.classList.remove('hidden');
+  sheetTitle.textContent = title;
+  sheetError.textContent = '';
+  setLoading(sheetBody, true);
+
+  const res = await fetch('/api/accounts');
+  if (!res.ok) {
+    sheetBody.textContent = '';
+    sheetError.textContent = await res.text();
+    return;
+  }
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    sheetBody.textContent = '';
+    sheetError.textContent = 'Add an account first (Settings > Accounts).';
+    return;
+  }
+
+  const showPicker = async (accountId) => {
+    const expandedSet = await loadExpandedFolders(accountId);
+    showFolderSheet(accountId, title, {
+      checkSet,
+      expandedSet,
+      onToggle: (path, isExpanded) => {
+        if (isExpanded) expandedSet.add(path);
+        else expandedSet.delete(path);
+        persistExpandedFolders(accountId, expandedSet);
+      },
+    }, { label: 'Done', onConfirm: () => onConfirm(accountId) });
+  };
+
+  if (accounts.length === 1) {
+    showPicker(accounts[0].id);
+    return;
+  }
+  sheetBody.classList.remove('dot-loader');
+  sheetBody.innerHTML = '';
+  for (const a of accounts) {
+    const btn = document.createElement('button');
+    btn.className = 'settings-row-btn';
+    btn.textContent = a.email;
+    btn.addEventListener('click', () => showPicker(a.id));
+    sheetBody.appendChild(btn);
+  }
+}
+
+// Exported for the Trash folder's "Restore" button (folders.js's own row decoration
+// in inbox.js) — same animate-then-move-then-remove path the folder-picker uses,
+// just invoked directly with a known destination instead of via the picker.
+export function moveRowToFolder(row, path) {
   closeFolderSheet();
+  beginRowAnimation(); // held until this finishes — see its own comment in inbox.js
   row.classList.add('removing');
   const content = row.querySelector('.row-content');
-  content.style.transition = 'transform 0.28s cubic-bezier(.34,1.56,.64,1)';
+  // Both transform and opacity, not transform alone — overriding `transition` with
+  // just one silently drops the other (inline style replaces the whole property), and
+  // .removing's own opacity fade is what was missing, same issue commit() in inbox.js
+  // had: content vanishing instantly then sliding away already invisible.
+  content.style.transition = 'transform 0.28s cubic-bezier(.34,1.56,.64,1), opacity 0.28s ease';
   content.style.transform = `translateX(${row.dataset.moveDirection === 'right' ? '100%' : '-100%'})`;
+  // Removal timer runs on its own fixed schedule, not nested inside the fetch's
+  // .then() — otherwise the row's actual disappearance happens after (network
+  // latency + 280ms), not just 280ms, leaving it visibly stuck mid-animation on a
+  // slow connection. See the matching comment on commit() in inbox.js.
+  let settled = false;
+  setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    row.remove();
+    endRowAnimation();
+  }, 280);
   fetch(`/api/mails/${row.dataset.id}/move`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...dryRunHeaders() },
@@ -315,16 +525,18 @@ function moveRowToFolder(row, path) {
   })
     .then((res) => {
       if (!res.ok) return res.text().then((msg) => Promise.reject(new Error(msg || 'move failed')));
-      setTimeout(() => {
-        removeMailById(row.dataset.id);
-        row.remove();
-      }, 280);
+      removeMailById(row.dataset.id);
     })
     .catch((err) => {
       console.error(err);
+      if (settled) {
+        render(); // already removed from the DOM; data model still has it, so this restores it correctly
+        return;
+      }
+      settled = true;
       row.classList.remove('removing');
       content.style.transform = 'translateX(0)';
-      setTimeout(() => { content.style.transition = ''; }, 280);
+      setTimeout(() => { content.style.transition = ''; endRowAnimation(); }, 280);
     });
 }
 
@@ -382,5 +594,132 @@ function showAccountFolders(account) {
         body: JSON.stringify({ paths: Array.from(expandedSet) }),
       });
     },
+  });
+}
+
+// Settings > Manage folders: real IMAP folder create/rename/delete, not just
+// browsing — the Folder Browser and every picker elsewhere in the app only ever read
+// the folder list, this is the one place that can actually change it.
+let folderManagerAccountId = null;
+
+export function setupFolderManager() {
+  const panel = document.getElementById('folderManagerPanel');
+  const accountPicker = document.getElementById('folderManagerAccountPicker');
+  const newRootBtn = document.getElementById('folderManagerNewRootBtn');
+  const tree = document.getElementById('folderManagerTree');
+  const errorEl = document.getElementById('folderManagerError');
+
+  const render = async () => {
+    errorEl.textContent = '';
+    if (!folderManagerAccountId) return;
+    setLoading(tree, true);
+    try {
+      const folders = await fetchFolders(folderManagerAccountId);
+      // INBOX always exists and can't be renamed/deleted on any IMAP server worth
+      // talking to — offering rename/delete buttons for it here would just be a
+      // guaranteed-to-fail action sitting in the list for no reason.
+      const manageable = folders.filter((f) => f.path !== 'INBOX');
+      tree.innerHTML = '';
+      tree.appendChild(renderFolderTree(manageable, {
+        manageActions: {
+          onCreateChild: async (parentPath) => {
+            const name = await promptModal('New subfolder name:');
+            if (!name) return;
+            errorEl.textContent = '';
+            try {
+              await createFolder(folderManagerAccountId, parentPath, name);
+              render();
+            } catch (err) {
+              errorEl.textContent = err.message;
+            }
+          },
+          onRename: async (path, currentName) => {
+            const newName = await promptModal(`Rename "${currentName}" to:`, { defaultValue: currentName });
+            if (!newName || newName === currentName) return;
+            errorEl.textContent = '';
+            try {
+              await renameFolder(folderManagerAccountId, path, newName);
+              render();
+            } catch (err) {
+              errorEl.textContent = err.message;
+            }
+          },
+          onDelete: async (path, name) => {
+            const ok = await confirmModal(
+              `Delete "${name}"? This removes it (and everything in it) from the server.`,
+              { confirmLabel: 'Delete it', danger: true },
+            );
+            if (!ok) return;
+            errorEl.textContent = '';
+            try {
+              await deleteFolderOnServer(folderManagerAccountId, path);
+              render();
+            } catch (err) {
+              errorEl.textContent = err.message;
+            }
+          },
+        },
+      }));
+    } catch (err) {
+      tree.innerHTML = '';
+      errorEl.textContent = err.message;
+    }
+  };
+
+  newRootBtn.addEventListener('click', async () => {
+    const name = await promptModal('New folder name:');
+    if (!name) return;
+    errorEl.textContent = '';
+    try {
+      await createFolder(folderManagerAccountId, '', name);
+      render();
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
+  const closePanel = () => {
+    panel.classList.add('hidden');
+    document.getElementById('settingsPanel').classList.remove('hidden');
+  };
+  document.getElementById('closeFolderManagerBtn').addEventListener('click', closePanel);
+  document.getElementById('closeFolderManagerTopBtn').addEventListener('click', closePanel);
+
+  document.getElementById('openFolderManagerBtn').addEventListener('click', async () => {
+    document.getElementById('settingsPanel').classList.add('hidden');
+    panel.classList.remove('hidden');
+    accountPicker.innerHTML = '';
+    newRootBtn.classList.add('hidden');
+    errorEl.textContent = '';
+    // Nothing shown at all between opening the panel and the accounts fetch
+    // resolving (and then, for one account, the folders fetch after that) — both
+    // network round trips, both with a real gap a skeleton should fill.
+    setLoading(tree, true);
+
+    const res = await fetch('/api/accounts');
+    if (!res.ok) { errorEl.textContent = await res.text(); return; }
+    const accounts = await res.json();
+    if (accounts.length === 0) {
+      tree.innerHTML = '';
+      errorEl.textContent = 'Add an account first (Settings > Accounts).';
+      return;
+    }
+    newRootBtn.classList.remove('hidden');
+    if (accounts.length === 1) {
+      folderManagerAccountId = accounts[0].id;
+      render();
+      return;
+    }
+    tree.innerHTML = ''; // waiting on an account pick now, not actively loading anything
+    for (const a of accounts) {
+      const btn = document.createElement('button');
+      btn.className = 'settings-row-btn';
+      btn.textContent = a.email;
+      btn.addEventListener('click', () => {
+        folderManagerAccountId = a.id;
+        render();
+      });
+      accountPicker.appendChild(btn);
+    }
   });
 }

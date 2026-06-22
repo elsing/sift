@@ -1,5 +1,7 @@
-import { fetchMails, render, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setupTagGroupBanner, setHandlers, setupLiveUpdates, setupOverlayScrollLock, setupTapTopToScroll } from './inbox.js';
-import { setupFolderSheet, openMoveModal, openFolderBrowser } from './folders.js';
+import { fetchMails, render, renderLoadingSkeleton, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setupTagGroupBanner, setHandlers, setupLiveUpdates, setupOverlayScrollLock, setupTapTopToScroll } from './inbox.js';
+import { setupFolderSheet, openMoveModal, openFolderBrowser, setupFolderManager } from './folders.js';
+import { setupConfirmModal } from './confirmModal.js';
+import { setupAutoTagActivity } from './autoTagActivity.js';
 import { setupMailReader, setupTagSheet, openMailReader, openMailReaderById, openTagSheetForRow } from './reader.js';
 import { setupAccountsPanel } from './accounts.js';
 import { setupThemeOptions, setupDryRunToggle, setupPaletteSwatches, setupSettingsPanel, setupSwipeOptions, setupTagManager } from './settings.js';
@@ -9,7 +11,9 @@ import { setupSearch } from './search.js';
 import { setupSmartTaggingPanel } from './smarttags.js';
 
 setHandlers({ onMove: openMoveModal, onTap: openMailReader, onTag: openTagSheetForRow });
+setupConfirmModal();
 
+renderLoadingSkeleton();
 fetchMails().then(render);
 setupPullToRefresh();
 setupInfiniteScroll();
@@ -32,6 +36,8 @@ setupPushNotifications();
 setupAccountFilter();
 setupSearch();
 setupSmartTaggingPanel();
+setupFolderManager();
+setupAutoTagActivity();
 
 document.getElementById('foldersBtn').addEventListener('click', openFolderBrowser);
 

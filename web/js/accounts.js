@@ -1,4 +1,5 @@
-import { dryRunHeaders } from './util.js';
+import { dryRunHeaders, withBusyButton } from './util.js';
+import { confirmModal } from './confirmModal.js';
 import { renderFolderTree, fetchFolders, cachedFolders, setLoading } from './folders.js';
 import { openFolder, fetchMails, render } from './inbox.js';
 import { refreshAccountFilter } from './accountFilter.js';
@@ -10,12 +11,21 @@ export function setupAccountsPanel() {
   const errorEl = document.getElementById('addAccountError');
 
   async function loadAccounts() {
-    const res = await fetch('/api/accounts');
-    const accounts = await res.json();
-    console.log('loadAccounts:', accounts); // temporary — diagnosing an empty-list report
+    // A failed fetch/parse here used to throw with nothing catching it — the list
+    // just silently stayed however it was (often empty, on the very first open of a
+    // session), which read as "my account isn't showing" with zero indication
+    // anything had actually gone wrong.
+    let accounts;
+    try {
+      const res = await fetch('/api/accounts');
+      if (!res.ok) throw new Error(await res.text());
+      accounts = await res.json();
+    } catch (err) {
+      list.innerHTML = `<li class="folder-empty-status">Couldn't load accounts: ${err.message}</li>`;
+      return;
+    }
     list.innerHTML = '';
     for (const a of accounts) {
-      try {
       const li = document.createElement('li');
       const row = document.createElement('div');
       row.className = 'account-row';
@@ -26,7 +36,14 @@ export function setupAccountsPanel() {
       const removeBtn = document.createElement('button');
       removeBtn.textContent = 'Remove';
       removeBtn.addEventListener('click', async () => {
-        await fetch(`/api/accounts/${a.id}`, { method: 'DELETE', headers: dryRunHeaders() });
+        const ok = await confirmModal(
+          `Remove ${a.email}? This deletes its cached mail and settings from Sift — your real mailbox on the server is untouched, but you'll need to re-add it (and re-enter its password) to use it here again.`,
+          { confirmLabel: 'Remove it', danger: true },
+        );
+        if (!ok) return;
+        await withBusyButton(removeBtn, 'Removing…', () =>
+          fetch(`/api/accounts/${a.id}`, { method: 'DELETE', headers: dryRunHeaders() })
+        );
         loadAccounts();
         refreshAccountFilter();
       });
@@ -86,9 +103,6 @@ export function setupAccountsPanel() {
         }
       });
       list.appendChild(li);
-      } catch (err) {
-        console.error('render account row failed:', a, err); // temporary
-      }
     }
   }
 
@@ -99,7 +113,8 @@ export function setupAccountsPanel() {
   });
   document.getElementById('closeAccountsBtn').addEventListener('click', () => {
     panel.classList.add('hidden');
-    fetchMails().then(render); // pick up anything a sync brought in
+    document.getElementById('settingsPanel').classList.remove('hidden');
+    fetchMails().then(render); // pick up anything a sync brought in, even though the inbox isn't what's showing right now
   });
 
   document.getElementById('showAddAccountBtn').addEventListener('click', () => {

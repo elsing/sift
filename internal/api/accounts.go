@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
@@ -28,6 +29,7 @@ type accountOut struct {
 	Port            int      `json:"port"`
 	LastSyncError   string   `json:"lastSyncError,omitempty"`
 	ExpandedFolders []string `json:"expandedFolders"`
+	TrashFolder     string   `json:"trashFolder,omitempty"` // best-effort, cached only — lets the client offer "Restore" when browsing Trash
 }
 
 type addAccountReq struct {
@@ -50,6 +52,9 @@ func (s *Store) AccountsRoutes(mux *http.ServeMux, ownerSubject func(*http.Reque
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/sync", s.handleSyncAccount)
 	mux.HandleFunc("GET /api/accounts/{id}/folders", s.handleListFolders)
+	mux.HandleFunc("POST /api/accounts/{id}/folders", s.handleCreateFolder)
+	mux.HandleFunc("PATCH /api/accounts/{id}/folders", s.handleRenameFolder)
+	mux.HandleFunc("DELETE /api/accounts/{id}/folders", s.handleDeleteFolder)
 	mux.HandleFunc("GET /api/accounts/{id}/folder-mails", s.handleFolderMails)
 	mux.HandleFunc("PUT /api/accounts/{id}/expanded-folders", s.handleSetExpandedFolders)
 }
@@ -78,7 +83,7 @@ func (s *Store) loadAccountCreds(id string) (dbAccount, string, error) {
 
 func (s *Store) handleListAccounts(w http.ResponseWriter, r *http.Request, owner string) {
 	rows, err := s.db.Query(
-		"SELECT id, email, host, port, coalesce(last_sync_error, ''), expanded_folders FROM accounts WHERE owner_subject = $1 ORDER BY created_at",
+		"SELECT id, email, host, port, coalesce(last_sync_error, ''), expanded_folders, coalesce(trash_folder, '') FROM accounts WHERE owner_subject = $1 ORDER BY created_at",
 		owner,
 	)
 	if err != nil {
@@ -91,7 +96,7 @@ func (s *Store) handleListAccounts(w http.ResponseWriter, r *http.Request, owner
 	for rows.Next() {
 		var a accountOut
 		var expandedJSON string
-		if err := rows.Scan(&a.ID, &a.Email, &a.Host, &a.Port, &a.LastSyncError, &expandedJSON); err != nil {
+		if err := rows.Scan(&a.ID, &a.Email, &a.Host, &a.Port, &a.LastSyncError, &expandedJSON, &a.TrashFolder); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -163,6 +168,12 @@ func (s *Store) handleAddAccount(w http.ResponseWriter, r *http.Request, owner s
 		log.Printf("add account %s: initial sync failed: %v", req.Email, err)
 		out.LastSyncError = err.Error()
 	}
+	// Best-effort, right away rather than waiting for whatever else happens to need it
+	// first (an archive/delete) — without this, "Restore" in Trash wouldn't show up
+	// until something else had already triggered this same lookup.
+	if _, trash, err := s.resolveFolders(id); err == nil {
+		out.TrashFolder = trash
+	}
 	s.watchAccount(id)
 	writeJSON(w, out)
 }
@@ -196,6 +207,106 @@ func (s *Store) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, buildFolderTree(names, delim))
+}
+
+func (s *Store) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// Parent + name, not a pre-joined path — the client has no reliable way to know
+	// this account's hierarchy delimiter (it only ever sees paths the server already
+	// joined), so joining happens here instead of guessing "/" client-side.
+	var req struct{ ParentPath, Name string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	acct, password, err := s.loadAccountCreds(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	sep := string(delim)
+	if sep == "" {
+		sep = "/"
+	}
+	path := req.Name
+	if req.ParentPath != "" {
+		path = req.ParentPath + sep + req.Name
+	}
+	if err := createFolder(acct.Host, acct.Port, acct.Username, password, path); err != nil {
+		log.Printf("create folder %s/%s: %v", acct.Email, path, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleRenameFolder(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// Path + new leaf name, not two full paths — renaming only ever changes this
+	// folder's own name in place here (moving to a different parent isn't exposed),
+	// and computing the new full path needs the account's actual delimiter rather
+	// than the client guessing one.
+	var req struct{ Path, NewName string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" || req.NewName == "" {
+		http.Error(w, "path and newName are required", http.StatusBadRequest)
+		return
+	}
+	acct, password, err := s.loadAccountCreds(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	sep := string(delim)
+	if sep == "" {
+		sep = "/"
+	}
+	to := req.NewName
+	if i := strings.LastIndex(req.Path, sep); i >= 0 {
+		to = req.Path[:i] + sep + req.NewName
+	}
+	if err := renameFolder(acct.Host, acct.Port, acct.Username, password, req.Path, to); err != nil {
+		log.Printf("rename folder %s/%s->%s: %v", acct.Email, req.Path, to, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	// Best-effort: a folder this app already knew about (a tag-destination rule, mail
+	// cached under its old path) shouldn't silently keep pointing at a name that no
+	// longer exists just because the rename itself succeeded.
+	s.db.Exec("UPDATE folder_tag_rules SET folder = $1 WHERE account_id = $2 AND folder = $3", to, id, req.Path)
+	s.db.Exec("UPDATE mails SET folder = $1 WHERE account_id = $2 AND folder = $3", to, id, req.Path)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct{ Path string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	acct, password, err := s.loadAccountCreds(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if err := deleteFolder(acct.Host, acct.Port, acct.Username, password, req.Path); err != nil {
+		log.Printf("delete folder %s/%s: %v", acct.Email, req.Path, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.db.Exec("DELETE FROM folder_tag_rules WHERE account_id = $1 AND folder = $2", id, req.Path)
+	s.db.Exec("DELETE FROM mails WHERE account_id = $1 AND folder = $2", id, req.Path)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
@@ -235,6 +346,9 @@ func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 	// when this endpoint was first written, so tag chips silently never showed here.
 	if err := s.attachTags(mails); err != nil {
 		log.Printf("attach tags %s/%s: %v", acct.Email, folder, err)
+	}
+	if mails == nil {
+		mails = []Mail{} // an empty folder's nil slice would otherwise encode as JSON null, not []
 	}
 	writeJSON(w, mails)
 }
@@ -313,6 +427,13 @@ func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 	// moment an account is added.
 	if lastSeenUID != nil && len(newMails) > 0 {
 		s.evaluateNewMailForSmartTags(accountID, newMails)
+		// Was notifying off the full inbox re-fetch instead of just newMails — any IDLE
+		// wake re-syncs and notified about "highest UID in the mailbox" regardless of
+		// why the wake happened. Moving mail OUT of inbox (e.g. auto-move) triggers the
+		// same IDLE "mailbox changed" signal as new mail arriving, which meant every
+		// auto-moved mail was good for a spurious push about old, already-seen mail
+		// that happened to still be sitting at the top of the inbox.
+		s.notifyNewMail(accountID, newMails)
 	}
 	// Not gated on new mail — this is about time elapsed since tagging, not what just
 	// arrived, so it should run every sync regardless.
@@ -337,13 +458,14 @@ func (s *Store) upsertMails(accountID string, mails []Mail) error {
 	for _, m := range mails {
 		sentAt, _ := time.Parse(time.RFC3339, m.Date)
 		_, err := tx.Exec(`
-			INSERT INTO mails (id, account_id, sender, sender_email, subject, snippet, time, unread, uid, folder, sent_at, message_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			INSERT INTO mails (id, account_id, sender, sender_email, subject, snippet, time, unread, uid, folder, sent_at, message_id, has_attachments)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (id) DO UPDATE SET
 				sender = excluded.sender, sender_email = excluded.sender_email, subject = excluded.subject,
 				snippet = excluded.snippet, time = excluded.time, unread = excluded.unread,
-				uid = excluded.uid, folder = excluded.folder, sent_at = excluded.sent_at, message_id = excluded.message_id`,
-			m.ID, accountID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, m.UID, m.Folder, sentAt, m.MessageID,
+				uid = excluded.uid, folder = excluded.folder, sent_at = excluded.sent_at, message_id = excluded.message_id,
+				has_attachments = excluded.has_attachments`,
+			m.ID, accountID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, m.UID, m.Folder, sentAt, m.MessageID, m.HasAttachments,
 		)
 		if err != nil {
 			return err
@@ -394,6 +516,17 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if accountID == nil || uid == nil {
 		return fmt.Errorf("mock mail has no real mailbox to move it in")
 	}
+	if sourceFolder == destFolder {
+		// IMAP has no real notion of "move to the same mailbox" — issuing one anyway
+		// copies the message to a new UID in the same folder and expunges the old one,
+		// which looks like a no-op but actually duplicates the message every single
+		// time it runs. A bogus folder_tag_rule mapping a tag back to its own source
+		// folder (e.g. an inbox-scoped tag rule) made this fire repeatedly via the
+		// opportunistic auto-move path, producing several real, separate copies of the
+		// same mail on the server. Guard here so nothing can do this again, regardless
+		// of which caller or which bad rule tries.
+		return nil
+	}
 	acct, password, err := s.loadAccountCreds(*accountID)
 	if err != nil {
 		return err
@@ -401,8 +534,27 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if err := moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), sourceFolder, destFolder); err != nil {
 		return err
 	}
+	if destFolder == "INBOX" {
+		s.markSelfMovedIntoInbox(*accountID)
+	}
 	s.applyFolderTagRule(*accountID, destFolder, messageID)
 	return nil
+}
+
+// markSelfMovedIntoInbox/recentlySelfMovedIntoInbox — see selfMovedIntoInboxAt's own
+// comment on Store. The window just needs to comfortably outlast "the IDLE wake this
+// move itself triggers, plus the sync it causes" — a few seconds, not a real session.
+func (s *Store) markSelfMovedIntoInbox(accountID string) {
+	s.selfMovedIntoInboxMu.Lock()
+	defer s.selfMovedIntoInboxMu.Unlock()
+	s.selfMovedIntoInboxAt[accountID] = time.Now()
+}
+
+func (s *Store) recentlySelfMovedIntoInbox(accountID string) bool {
+	s.selfMovedIntoInboxMu.Lock()
+	defer s.selfMovedIntoInboxMu.Unlock()
+	t, ok := s.selfMovedIntoInboxAt[accountID]
+	return ok && time.Since(t) < 30*time.Second
 }
 
 // archiveOrDeleteOnServer moves a mail to the account's Archive/Trash folder for the

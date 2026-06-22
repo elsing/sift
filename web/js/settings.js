@@ -1,4 +1,8 @@
-import { fetchTags, createTag, updateTag, deleteTag } from './tags.js';
+import { fetchTags, createTag, updateTag, deleteTag, fetchTagDestinations, setTagDestination, deleteTagDestination } from './tags.js';
+import { pickFolder } from './folders.js';
+import { withBusyButton } from './util.js';
+import { confirmModal } from './confirmModal.js';
+import { render as renderInbox } from './inbox.js';
 
 // Same palette the server cycles through for newly-created tags (tagPalette in
 // internal/api/tags.go) — kept in sync manually since there's no endpoint for "list
@@ -90,6 +94,15 @@ const SWIPE_ACTIONS = {
 export function setupSwipeOptions() {
   setupSwipeSide('swipeLeftOptions', 'swipeLeft', 'delete');
   setupSwipeSide('swipeRightOptions', 'swipeRight', 'move');
+  setupFunDeleteToggle();
+}
+
+function setupFunDeleteToggle() {
+  const toggle = document.getElementById('funDeleteToggle');
+  toggle.checked = localStorage.getItem('funDeleteAnimation') !== 'off'; // on by default
+  toggle.addEventListener('change', () => {
+    localStorage.setItem('funDeleteAnimation', toggle.checked ? 'on' : 'off');
+  });
 }
 
 function setupSwipeSide(containerId, storageKey, fallback) {
@@ -109,6 +122,10 @@ function setupSwipeSide(containerId, storageKey, fallback) {
     btn.addEventListener('click', () => {
       localStorage.setItem(storageKey, id);
       apply(id);
+      // Each row's swipe label/color was baked in at render time — stayed wrong until
+      // the next unrelated re-render (or a full reload) happened to rebuild it, even
+      // though the swipe gesture itself already used the new setting immediately.
+      renderInbox();
     });
     container.appendChild(btn);
   }
@@ -130,6 +147,10 @@ export function setupSettingsPanel() {
     document.getElementById('personalisationPanel').classList.remove('hidden');
   });
   document.getElementById('closePersonalisationBtn').addEventListener('click', () => {
+    // Closing a settings sub-panel should land back on Settings, not skip all the way
+    // out to the inbox underneath — every "open" handler hides Settings to show the
+    // sub-panel, so "close" needs to be the exact reverse, not just hide itself.
+    panel.classList.remove('hidden');
     document.getElementById('personalisationPanel').classList.add('hidden');
   });
 }
@@ -141,14 +162,21 @@ export function setupTagManager() {
   const errorEl = document.getElementById('tagManagerError');
 
   async function render() {
-    const tags = await fetchTags(true);
+    const [tags, destinations, accountsRes] = await Promise.all([
+      fetchTags(true),
+      fetchTagDestinations().catch(() => []),
+      fetch('/api/accounts').then((r) => (r.ok ? r.json() : [])).catch(() => []),
+    ]);
+    const accountCount = accountsRes.length;
     list.innerHTML = '';
     if (tags.length === 0) {
       list.innerHTML = '<li class="folder-empty-status">No tags yet — add one below.</li>';
       return;
     }
     for (const tag of tags) {
+      const tagDestinations = destinations.filter((d) => d.tagId === tag.id);
       const li = document.createElement('li');
+      li.className = 'tag-manager-card';
       const row = document.createElement('div');
       row.className = 'account-row';
 
@@ -166,19 +194,34 @@ export function setupTagManager() {
         const name = nameInput.value.trim();
         if (!name || name === tag.name) { nameInput.value = tag.name; return; }
         errorEl.textContent = '';
+        nameInput.disabled = true;
         try {
           await updateTag(tag.id, { name });
           render();
         } catch (err) {
           errorEl.textContent = err.message;
           nameInput.value = tag.name;
+          nameInput.disabled = false;
         }
       });
 
       const removeBtn = document.createElement('button');
       removeBtn.textContent = 'Delete';
       removeBtn.addEventListener('click', async () => {
-        await deleteTag(tag.id);
+        const ok = await confirmModal(
+          `Delete the "${tag.name}" tag? This removes it from every email it's on — the emails themselves are untouched.`,
+          { confirmLabel: 'Delete it', danger: true },
+        );
+        if (!ok) return;
+        errorEl.textContent = '';
+        try {
+          await withBusyButton(removeBtn, 'Deleting…', () => deleteTag(tag.id));
+        } catch (err) {
+          // Surface the failure instead of silently leaving the (still-present) tag
+          // looking deleted until the panel was closed and reopened — render() below
+          // always re-syncs with the server's actual state either way.
+          errorEl.textContent = err.message;
+        }
         render();
       });
       row.append(dot, nameInput, removeBtn);
@@ -186,18 +229,146 @@ export function setupTagManager() {
 
       const swatches = document.createElement('div');
       swatches.className = 'tag-manager-swatches';
+      // Sharing the swatches row instead of its own full-width row — a checkbox +
+      // short label doesn't need a row to itself, and it cut one of several already
+      // stacked rows per tag that were making this panel feel cluttered.
+      const notifyWrap = document.createElement('label');
+      notifyWrap.className = 'tag-manager-notify';
+      const notifyToggle = document.createElement('input');
+      notifyToggle.type = 'checkbox';
+      notifyToggle.checked = tag.notify;
+      notifyToggle.title = 'Notify on new mail with this tag';
+      notifyToggle.addEventListener('change', async () => {
+        const notify = notifyToggle.checked;
+        notifyToggle.disabled = true;
+        try {
+          await updateTag(tag.id, { notify });
+        } catch (err) {
+          errorEl.textContent = err.message;
+          notifyToggle.checked = !notify;
+        }
+        notifyToggle.disabled = false;
+      });
+      notifyWrap.append(notifyToggle, document.createTextNode(' Notify'));
+      swatches.appendChild(notifyWrap);
+
+      // Off by default — the global auto-move delay (Smart tagging settings) governs
+      // every tag unless this is explicitly turned on, for the rare tag (receipts,
+      // say) you always want filed away right now instead of waiting like everything else.
+      const instantWrap = document.createElement('label');
+      instantWrap.className = 'tag-manager-notify';
+      const instantToggle = document.createElement('input');
+      instantToggle.type = 'checkbox';
+      instantToggle.checked = tag.instantMove;
+      instantToggle.title = 'Skip the auto-move delay for this tag — move it the moment it\'s tagged';
+      instantToggle.addEventListener('change', async () => {
+        const instantMove = instantToggle.checked;
+        instantToggle.disabled = true;
+        try {
+          await updateTag(tag.id, { instantMove });
+        } catch (err) {
+          errorEl.textContent = err.message;
+          instantToggle.checked = !instantMove;
+        }
+        instantToggle.disabled = false;
+      });
+      instantWrap.append(instantToggle, document.createTextNode(' Move instantly'));
+      swatches.appendChild(instantWrap);
       for (const color of TAG_COLORS) {
         const sw = document.createElement('button');
         sw.type = 'button';
         sw.className = 'tag-manager-swatch' + (color === tag.color ? ' selected' : '');
         sw.style.background = color;
         sw.addEventListener('click', async () => {
-          await updateTag(tag.id, { color });
-          render();
+          // No text-swap here (a colored circle has no room for a label) — disabling
+          // the whole row is enough; render() rebuilds everything fresh on success and
+          // a failure needs every swatch re-enabled, not just the one tapped.
+          for (const el of swatches.children) el.disabled = true;
+          try {
+            await updateTag(tag.id, { color });
+            render();
+          } catch (err) {
+            errorEl.textContent = err.message;
+            for (const el of swatches.children) el.disabled = false;
+          }
         });
         swatches.appendChild(sw);
       }
       li.appendChild(swatches);
+
+      // Tag -> folder: where mail carrying this tag should auto-move to once it's
+      // old enough (Smart tagging settings controls the delay). Same folder_tag_rules
+      // row the folder banner's "auto-tag" dropdown writes, just assigned from here
+      // instead of needing to go browse to that folder first. A tag can have a
+      // separate destination per account — this used to only ever show/edit
+      // whichever destination happened to come back first, silently hiding (and
+      // making unclearable from here) any other account's mapping for the same tag.
+      // The account is always named, even with just one — "Move to: Folder" alone
+      // read as if no account were involved at all.
+      for (const destination of tagDestinations) {
+        const destRow = document.createElement('div');
+        destRow.className = 'account-row';
+        const destLabel = document.createElement('span');
+        destLabel.className = 'tag-manager-destination-label';
+        destLabel.textContent = `Move to: ${destination.folder} (${destination.accountEmail})`;
+        const destBtn = document.createElement('button');
+        destBtn.className = 'tag-manager-dest-btn';
+        destBtn.textContent = 'Change';
+        destBtn.addEventListener('click', () => {
+          pickFolder(`Move "${tag.name}" mail to… (${destination.accountEmail})`, async (accountId, path) => {
+            errorEl.textContent = '';
+            try {
+              await setTagDestination(accountId, tag.id, path);
+              render();
+            } catch (err) {
+              errorEl.textContent = err.message;
+            }
+          });
+        });
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'tag-manager-clear-destination';
+        clearBtn.textContent = 'Clear';
+        clearBtn.addEventListener('click', async () => {
+          const ok = await confirmModal(`Stop auto-moving "${tag.name}" mail to "${destination.folder}" (${destination.accountEmail})?`);
+          if (!ok) return;
+          errorEl.textContent = '';
+          try {
+            await withBusyButton(clearBtn, 'Clearing…', () => deleteTagDestination(destination.accountId, tag.id));
+            render();
+          } catch (err) {
+            errorEl.textContent = err.message;
+          }
+        });
+        destRow.append(destLabel, destBtn, clearBtn);
+        li.appendChild(destRow);
+      }
+
+      // A second (or third...) destination only makes sense with a second account to
+      // assign it to — with just one account, "Set destination" above already covers
+      // the only mapping that could ever exist, so offering "add another" was a dead
+      // end that just added clutter.
+      if (accountCount < 2 && tagDestinations.length > 0) {
+        list.appendChild(li);
+        continue;
+      }
+      const addRow = document.createElement('div');
+      addRow.className = 'account-row';
+      const addBtn = document.createElement('button');
+      addBtn.className = 'tag-manager-dest-btn';
+      addBtn.textContent = tagDestinations.length === 0 ? 'Set destination' : 'Add destination for another account';
+      addBtn.addEventListener('click', () => {
+        pickFolder(`Move "${tag.name}" mail to…`, async (accountId, path) => {
+          errorEl.textContent = '';
+          try {
+            await setTagDestination(accountId, tag.id, path);
+            render();
+          } catch (err) {
+            errorEl.textContent = err.message;
+          }
+        });
+      });
+      addRow.appendChild(addBtn);
+      li.appendChild(addRow);
 
       list.appendChild(li);
     }
@@ -222,9 +393,12 @@ export function setupTagManager() {
     document.getElementById('tagsPanel').classList.remove('hidden');
     render();
   });
-  document.getElementById('closeTagsBtn').addEventListener('click', () => {
+  const closeTagsPanel = () => {
     document.getElementById('tagsPanel').classList.add('hidden');
-  });
+    document.getElementById('settingsPanel').classList.remove('hidden');
+  };
+  document.getElementById('closeTagsBtn').addEventListener('click', closeTagsPanel);
+  document.getElementById('closeTagsTopBtn').addEventListener('click', closeTagsPanel);
 }
 
 export function setupDryRunToggle() {

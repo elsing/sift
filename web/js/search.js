@@ -89,9 +89,11 @@ export function setupSearch() {
   beforeInput.addEventListener('change', onFilterInput);
 }
 
-// A search needs free text, a sender filter, a date range, or some mix — not all of them.
+// A search needs free text, a sender filter, a date range, or a tag — not all of them.
+// A tag alone is enough: it's local data, not an IMAP query, so it doesn't need pairing
+// with text to be a real search.
 function hasQuery() {
-  return input.value.trim() !== '' || fromInput.value.trim() !== '' || sinceInput.value !== '' || beforeInput.value !== '';
+  return input.value.trim() !== '' || fromInput.value.trim() !== '' || sinceInput.value !== '' || beforeInput.value !== '' || chosenTags.size > 0;
 }
 
 // Folder picker only really makes sense scoped to one account (folder names are
@@ -274,13 +276,24 @@ function startSearch(mode, resumeToken) {
   const source = new EventSource(`/api/search?${params}`);
   currentSource = source;
 
+  // stopSearch() closes the previous EventSource before this one is created, but
+  // close() doesn't retroactively cancel an event that's already been queued as a
+  // task by the time it's called — typing fast enough to start a new search while an
+  // old one's "complete" event is already in flight could let that stale event fire
+  // anyway, briefly stomping fresh results with the old (often-empty) search's
+  // verdict right after they'd just rendered. Every handler below checks it's still
+  // the current search before acting, the same guard inbox.js's fetchGeneration uses.
+  const isStale = () => source !== currentSource;
+
   source.addEventListener('progress', (e) => {
+    if (isStale()) return;
     const { done, total } = JSON.parse(e.data);
     progressFill.style.width = (total ? Math.round((done / total) * 100) : 100) + '%';
     progressText.textContent = `Searched ${done} of ${total} folders · ${matches.length} match${matches.length === 1 ? '' : 'es'}`;
   });
 
   source.addEventListener('match', (e) => {
+    if (isStale()) return;
     matches.push(...JSON.parse(e.data));
     // results stream in whatever order each folder's IMAP round trip happens to
     // finish in — not date order — so re-sort before every render, not just at the end
@@ -289,6 +302,7 @@ function startSearch(mode, resumeToken) {
   });
 
   source.addEventListener('complete', (e) => {
+    if (isStale()) return;
     const { done, total, timedOut, resume } = JSON.parse(e.data);
     if (matches.length === 0) {
       results.innerHTML = '<li class="folder-empty-status">No matches.</li>';
@@ -305,7 +319,15 @@ function startSearch(mode, resumeToken) {
         continueBtn.classList.remove('hidden');
       }
     } else {
-      progressWrap.classList.add('hidden');
+      // The very last "progress" event (done === total) and this "complete" event
+      // arrive close enough together that the bar jumped straight from e.g. "41 of
+      // 42" to hidden — the 100%/"42 of 42" frame got superseded before it ever
+      // painted, which read as "it always stops one short of the max" even though
+      // every folder genuinely was searched. Show the finished state explicitly,
+      // then hide it a beat later instead of immediately.
+      progressFill.style.width = '100%';
+      progressText.textContent = `Searched ${total} of ${total} folder${total === 1 ? '' : 's'} · ${matches.length} match${matches.length === 1 ? '' : 'es'}`;
+      setTimeout(() => progressWrap.classList.add('hidden'), 500);
     }
     // a quick header-only search came up short (or you just want to be thorough) —
     // offer the slower full-body search as a deliberate next step, not automatic
@@ -314,6 +336,7 @@ function startSearch(mode, resumeToken) {
   });
 
   source.onerror = () => {
+    if (isStale()) return;
     if (matches.length === 0) errorEl.textContent = "Couldn't complete the search.";
     stopSearch();
     progressWrap.classList.add('hidden');
@@ -333,7 +356,7 @@ function renderResults(mails) {
           <div class="subject">${mail.subject}</div>
           <div class="snippet">${mail.folder || ''}</div>
         </div>
-        <div class="timestamp">${mail.time}</div>
+        <div class="timestamp">${mail.hasAttachments ? '<span class="attachment-clip" title="Has attachments">📎</span>' : ''}${mail.time}</div>
       </div>
     `;
     li.addEventListener('click', () => {

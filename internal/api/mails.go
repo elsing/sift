@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,25 +20,28 @@ import (
 const pageSize = 30
 
 type Mail struct {
-	ID          string `json:"id"`
-	Sender      string `json:"sender"`
-	SenderEmail string `json:"senderEmail,omitempty"` // the actual address; Sender may be a display name instead
-	Subject     string `json:"subject"`
-	Snippet     string `json:"snippet"`
-	Time        string `json:"time"` // pre-formatted for display (today's time, or a date for older mail)
-	Date        string `json:"date"` // RFC3339; the client groups by this (Today/This Week/Last Week/Older)
-	Unread      bool   `json:"unread"`
-	AccountID   string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
-	UID         uint32 `json:"uid,omitempty"`       // IMAP UID within Folder; zero for mock mail. Exposed so the client can page a folder view by "older than this UID" — not sensitive, just a mailbox-relative sequence number.
-	Folder      string `json:"folder,omitempty"`    // IMAP mailbox this UID belongs to; shown for search results spanning folders
-	MessageID   string `json:"-"`                   // RFC 5322 Message-ID — stable across moves/re-syncs, unlike ID; tags are keyed on this
-	Tags        []Tag  `json:"tags,omitempty"`
+	ID             string `json:"id"`
+	Sender         string `json:"sender"`
+	SenderEmail    string `json:"senderEmail,omitempty"` // the actual address; Sender may be a display name instead
+	Subject        string `json:"subject"`
+	Snippet        string `json:"snippet"`
+	Time           string `json:"time"` // pre-formatted for display (today's time, or a date for older mail)
+	Date           string `json:"date"` // RFC3339; the client groups by this (Today/This Week/Last Week/Older)
+	Unread         bool   `json:"unread"`
+	AccountID      string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
+	UID            uint32 `json:"uid,omitempty"`       // IMAP UID within Folder; zero for mock mail. Exposed so the client can page a folder view by "older than this UID" — not sensitive, just a mailbox-relative sequence number.
+	Folder         string `json:"folder,omitempty"`    // IMAP mailbox this UID belongs to; shown for search results spanning folders
+	MessageID      string `json:"-"`                   // RFC 5322 Message-ID — stable across moves/re-syncs, unlike ID; tags are keyed on this
+	Tags           []Tag  `json:"tags,omitempty"`
+	HasAttachments bool   `json:"hasAttachments,omitempty"` // from BODYSTRUCTURE at sync time — cheap (no body fetch), shown as a paperclip in the list
 }
 
 type Tag struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Color string `json:"color"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Notify      bool   `json:"notify"`
+	InstantMove bool   `json:"instantMove"` // skip the global auto-move delay entirely for this tag
 }
 
 var senders = []string{"Alex Chen", "Notion", "Sarah Park", "GitHub", "Mom", "Stripe", "Figma", "Delta", "Sam Lee", "Linear"}
@@ -63,6 +67,24 @@ type Store struct {
 	watchCtx     context.Context
 	watchMu      sync.Mutex
 	watchCancels map[string]context.CancelFunc
+
+	// autoMoveMu serializes autoMoveTaggedMail — it's called opportunistically from
+	// several places (every sync, accepting a suggestion, manual tagging, the manual
+	// "Move tagged mail now" button), with no locking on which mail rows it's about to
+	// move. Two overlapping calls could both select the same candidate; whichever
+	// loses the race finds the mail already gone by the time it tries to move it,
+	// silently undercounting — which is exactly what made the manual button report
+	// "nothing to move" while a concurrent background sync was moving things at the
+	// same moment.
+	autoMoveMu sync.Mutex
+
+	// selfMovedIntoInboxMu/At guards against notifying about mail we moved into INBOX
+	// ourselves (Restore from Trash, or a manual "Move" into the inbox) — IMAP assigns
+	// a brand-new UID on a move, which looks identical to genuinely new mail to the
+	// UID-watermark check, so without this every restore fired a push as if it were a
+	// new arrival.
+	selfMovedIntoInboxMu sync.Mutex
+	selfMovedIntoInboxAt map[string]time.Time
 }
 
 // NewStore assumes db.Migrate has already been run by the caller.
@@ -71,7 +93,11 @@ func NewStore(db *sql.DB) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, crypto: crypto, broadcaster: newBroadcaster(), watchCancels: make(map[string]context.CancelFunc)}
+	s := &Store{
+		db: db, crypto: crypto, broadcaster: newBroadcaster(),
+		watchCancels:         make(map[string]context.CancelFunc),
+		selfMovedIntoInboxAt: make(map[string]time.Time),
+	}
 
 	hasAccounts, err := s.hasAccounts()
 	if err != nil {
@@ -155,6 +181,7 @@ func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/mails/{id}/read", s.handleToggleRead)
 	mux.HandleFunc("POST /api/mails/{id}/move", s.handleMove)
 	mux.HandleFunc("GET /api/mails/{id}/body", s.handleMailBody)
+	mux.HandleFunc("GET /api/mails/{id}/attachments/{index}", s.handleMailAttachment)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 }
 
@@ -223,10 +250,10 @@ func (s *Store) handleGetMail(w http.ResponseWriter, r *http.Request) {
 	var m Mail
 	var sentAt sql.NullTime
 	row := s.db.QueryRow(
-		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, '') FROM mails WHERE id = $1",
+		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, ''), has_attachments FROM mails WHERE id = $1",
 		id,
 	)
-	if err := row.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID); err != nil {
+	if err := row.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID, &m.HasAttachments); err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
 			return
@@ -250,7 +277,7 @@ func (s *Store) handleGetMail(w http.ResponseWriter, r *http.Request) {
 // the first page). sent_at can be null (e.g. mock mail) — coalesced to -infinity
 // consistently in both the cursor comparison and the ORDER BY, so the two stay in sync.
 func (s *Store) list(limit int, accountIDs []string, before, beforeID string) ([]Mail, error) {
-	query := "SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, '') FROM mails WHERE folder = 'INBOX'"
+	query := "SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, ''), has_attachments FROM mails WHERE folder = 'INBOX'"
 	args := []any{}
 	if len(accountIDs) > 0 {
 		args = append(args, accountIDs)
@@ -282,7 +309,7 @@ func (s *Store) list(limit int, accountIDs []string, before, beforeID string) ([
 	for rows.Next() {
 		var m Mail
 		var sentAt sql.NullTime
-		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID); err != nil {
+		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID, &m.HasAttachments); err != nil {
 			return nil, err
 		}
 		if sentAt.Valid {
@@ -473,7 +500,57 @@ func (s *Store) handleMailBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+
+	// Remote images (most commonly tracking pixels) load over the network the moment
+	// an HTML body renders — the client blocks them by default unless the sender's
+	// been explicitly trusted, which this tells it.
+	var ownerSubject, senderEmail string
+	s.db.QueryRow("SELECT a.owner_subject, coalesce(m.sender_email, '') FROM mails m JOIN accounts a ON a.id = m.account_id WHERE m.id = $1", id).Scan(&ownerSubject, &senderEmail)
+	body.SenderEmail = senderEmail
+	if ownerSubject != "" && senderEmail != "" {
+		s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM trusted_senders WHERE owner_subject = $1 AND sender_email = $2)", ownerSubject, senderEmail).Scan(&body.TrustedSender)
+	}
 	writeJSON(w, body)
+}
+
+func (s *Store) handleMailAttachment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || index < 0 {
+		http.Error(w, "bad attachment index", http.StatusBadRequest)
+		return
+	}
+	var accountID *string
+	var uid *int64
+	var folder string
+	if err := s.db.QueryRow("SELECT account_id, uid, folder FROM mails WHERE id = $1", id).Scan(&accountID, &uid, &folder); err != nil {
+		if err == sql.ErrNoRows {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if accountID == nil || uid == nil {
+		http.NotFound(w, r)
+		return
+	}
+	acct, password, err := s.loadAccountCreds(*accountID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	att, raw, err := fetchMailAttachment(acct, password, folder, uint32(*uid), index)
+	if err != nil {
+		log.Printf("fetch attachment %s/%d: %v", id, index, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if att.ContentType != "" {
+		w.Header().Set("Content-Type", att.ContentType)
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", att.Filename))
+	w.Write(raw)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

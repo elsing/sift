@@ -75,6 +75,18 @@ func main() {
 		w.Header().Set("Cache-Control", "no-cache")
 		static.ServeHTTP(w, r)
 	}))
+	// iOS's "Add to Home Screen" fetches the manifest and touch-icon outside the
+	// normal page-load context — that fetch doesn't reliably carry the session
+	// cookie, so gating these behind login meant it got a redirect-to-login HTML page
+	// instead of an image, and silently fell back to a blank/generic icon. None of
+	// these are sensitive (just branding assets), so they're served unauthenticated,
+	// registered directly on the outer mux ahead of the "/" catch-all.
+	for _, path := range []string{"/icon.svg", "/icon-180.png", "/icon-512.png", "/manifest.json"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-cache")
+			static.ServeHTTP(w, r)
+		})
+	}
 	mux.Handle("/", a.Require(protected))
 
 	store.StartWatching(ctx)

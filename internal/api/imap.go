@@ -62,9 +62,10 @@ func syncIMAP(acct dbAccount, password string) ([]Mail, imap.UID, error) {
 	seqSet.AddRange(start, mbox.NumMessages)
 
 	fetchCmd := c.Fetch(seqSet, &imap.FetchOptions{
-		Envelope: true,
-		Flags:    true,
-		UID:      true,
+		Envelope:      true,
+		Flags:         true,
+		UID:           true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
 	})
 	defer fetchCmd.Close()
 
@@ -114,9 +115,10 @@ func backfillIMAP(acct dbAccount, password string, beforeUID imap.UID, batchSize
 	}
 
 	fetchCmd := c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{
-		Envelope: true,
-		Flags:    true,
-		UID:      true,
+		Envelope:      true,
+		Flags:         true,
+		UID:           true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
 	})
 	defer fetchCmd.Close()
 
@@ -127,6 +129,24 @@ func backfillIMAP(acct dbAccount, password string, beforeUID imap.UID, batchSize
 
 	mails, oldestUID := mailsFromFetch(acct.ID, "INBOX", msgs)
 	return mails, oldestUID, nil
+}
+
+// hasAttachments walks a BODYSTRUCTURE looking for any part whose disposition is
+// "attachment" — cheap, since BODYSTRUCTURE is metadata IMAP servers already track,
+// not a fetch of the message content itself.
+func hasAttachments(bs imap.BodyStructure) bool {
+	if bs == nil {
+		return false
+	}
+	found := false
+	bs.Walk(func(path []int, part imap.BodyStructure) bool {
+		if d := part.Disposition(); d != nil && strings.EqualFold(d.Value, "attachment") {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
 }
 
 // mailsFromFetch converts fetched IMAP messages to Mails. folder is baked into the ID
@@ -145,17 +165,18 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 			// matching, so even percent-encoding the slash client-side can't fix this,
 			// it has to never be a literal "/" in the first place. The ID is otherwise
 			// opaque (nothing parses it back apart elsewhere), so this is safe.
-			ID:          fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
-			Sender:      envelopeSender(m.Envelope),
-			SenderEmail: envelopeSenderEmail(m.Envelope),
-			Subject:     m.Envelope.Subject,
-			Snippet:     "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
-			Time:        formatMailTime(m.Envelope.Date),
-			Date:        m.Envelope.Date.Format(time.RFC3339),
-			Unread:      !slices.Contains(m.Flags, imap.FlagSeen),
-			UID:         uint32(m.UID),
-			Folder:      folder,
-			MessageID:   m.Envelope.MessageID,
+			ID:             fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
+			Sender:         envelopeSender(m.Envelope),
+			SenderEmail:    envelopeSenderEmail(m.Envelope),
+			Subject:        m.Envelope.Subject,
+			Snippet:        "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
+			Time:           formatMailTime(m.Envelope.Date),
+			Date:           m.Envelope.Date.Format(time.RFC3339),
+			Unread:         !slices.Contains(m.Flags, imap.FlagSeen),
+			UID:            uint32(m.UID),
+			Folder:         folder,
+			MessageID:      m.Envelope.MessageID,
+			HasAttachments: hasAttachments(m.BodyStructure),
 		})
 	}
 	return mails, oldestUID
@@ -251,7 +272,7 @@ func fetchFolderMailPage(c *imapclient.Client, accountID string, mbox *imap.Sele
 		fetchTarget = imap.UIDSetNum(uids...)
 	}
 
-	fetchCmd := c.Fetch(fetchTarget, &imap.FetchOptions{Envelope: true, Flags: true, UID: true})
+	fetchCmd := c.Fetch(fetchTarget, &imap.FetchOptions{Envelope: true, Flags: true, UID: true, BodyStructure: &imap.FetchItemBodyStructure{Extended: true}})
 	defer fetchCmd.Close()
 	msgs, err := fetchCmd.Collect()
 	if err != nil {
@@ -440,11 +461,78 @@ func moveMail(host string, port int, username, password string, uid uint32, sour
 	return nil
 }
 
+// createFolder makes a new IMAP mailbox. path is the full path (e.g.
+// "Archives/Newsletters/New Folder") — the caller is responsible for using the
+// account's own hierarchy delimiter when building nested paths.
+func createFolder(host string, port int, username, password, path string) error {
+	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(username, password).Wait(); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	if err := c.Create(path, nil).Wait(); err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	return nil
+}
+
+// renameFolder renames (or moves, since IMAP rename can change the parent too) an
+// existing mailbox. Subfolders move with it automatically — that's IMAP RENAME's own
+// behavior, not something this has to do manually.
+func renameFolder(host string, port int, username, password, from, to string) error {
+	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(username, password).Wait(); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	if err := c.Rename(from, to, nil).Wait(); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", from, to, err)
+	}
+	return nil
+}
+
+// deleteFolder removes a mailbox. A folder containing subfolders or mail is the
+// server's own call to allow or reject — this doesn't pre-check either, the same way
+// the rest of this app lets IMAP itself be the source of truth rather than guessing.
+func deleteFolder(host string, port int, username, password, path string) error {
+	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(username, password).Wait(); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	if err := c.Delete(path).Wait(); err != nil {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	return nil
+}
+
 // MailBody holds whichever parts of a message we could extract. The client renders
 // HTML (sandboxed, scripts disabled) when present, falling back to plain text.
+// ponytail: attachments are listed and downloadable but not resolved inline into the
+// HTML body — a cid: reference (an image embedded inline rather than attached) will
+// still show as broken. Add a cid:->data-URI rewrite pass if that's needed.
 type MailBody struct {
-	Text string `json:"text,omitempty"`
-	HTML string `json:"html,omitempty"`
+	Text          string       `json:"text,omitempty"`
+	HTML          string       `json:"html,omitempty"`
+	SenderEmail   string       `json:"senderEmail,omitempty"`
+	TrustedSender bool         `json:"trustedSender"`
+	Attachments   []Attachment `json:"attachments,omitempty"`
+}
+
+type Attachment struct {
+	Index       int    `json:"index"`
+	Filename    string `json:"filename"`
+	Size        int    `json:"size"`
+	ContentType string `json:"contentType"`
 }
 
 // fetchMailBody fetches the raw message and extracts its text/plain and text/html
@@ -482,6 +570,7 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 	}
 
 	var body MailBody
+	attachmentIndex := 0
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -490,8 +579,25 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 		if err != nil {
 			break // best-effort: stop at the first unparseable part rather than failing the whole body
 		}
+		if attHeader, ok := part.Header.(*mail.AttachmentHeader); ok {
+			// Metadata only here, not the bytes — the body response is fetched on
+			// every mail open and shouldn't balloon with every attachment's full
+			// content. fetchMailAttachment re-fetches and walks parts again on demand,
+			// addressed by this same index.
+			filename, _ := attHeader.Filename()
+			if filename == "" {
+				filename = "attachment"
+			}
+			contentType, _, _ := attHeader.ContentType()
+			raw, _ := io.ReadAll(part.Body)
+			body.Attachments = append(body.Attachments, Attachment{
+				Index: attachmentIndex, Filename: filename, Size: len(raw), ContentType: contentType,
+			})
+			attachmentIndex++
+			continue
+		}
 		if _, ok := part.Header.(*mail.InlineHeader); !ok {
-			continue // skip attachments
+			continue
 		}
 		contentType, _, _ := part.Header.(*mail.InlineHeader).ContentType()
 		raw, _ := io.ReadAll(part.Body)
@@ -506,6 +612,70 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 		body.Text = "(no readable body)"
 	}
 	return body, nil
+}
+
+// fetchMailAttachment re-fetches the message and walks its parts again, returning the
+// raw bytes of the attachment at the given index (same numbering fetchMailBody
+// assigned). A second IMAP round trip per download rather than caching every
+// attachment's bytes from the original body fetch, which most opens never need.
+func fetchMailAttachment(acct dbAccount, password, folder string, uid uint32, index int) (Attachment, []byte, error) {
+	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	if err != nil {
+		return Attachment{}, nil, fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(acct.Username, password).Wait(); err != nil {
+		return Attachment{}, nil, fmt.Errorf("login: %w", err)
+	}
+	if _, err := c.Select(folder, nil).Wait(); err != nil {
+		return Attachment{}, nil, fmt.Errorf("select %s: %w", folder, err)
+	}
+
+	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{{}},
+	})
+	defer fetchCmd.Close()
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		return Attachment{}, nil, fmt.Errorf("fetch: %w", err)
+	}
+	if len(msgs) == 0 || len(msgs[0].BodySection) == 0 {
+		return Attachment{}, nil, fmt.Errorf("message not found")
+	}
+
+	mr, err := mail.CreateReader(bytes.NewReader(msgs[0].BodySection[0].Bytes))
+	if mr == nil {
+		return Attachment{}, nil, fmt.Errorf("parse message: %w", err)
+	}
+	i := 0
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		attHeader, ok := part.Header.(*mail.AttachmentHeader)
+		if !ok {
+			continue
+		}
+		if i != index {
+			i++
+			continue
+		}
+		filename, _ := attHeader.Filename()
+		if filename == "" {
+			filename = "attachment"
+		}
+		contentType, _, _ := attHeader.ContentType()
+		raw, err := io.ReadAll(part.Body)
+		if err != nil {
+			return Attachment{}, nil, fmt.Errorf("read attachment: %w", err)
+		}
+		return Attachment{Index: index, Filename: filename, Size: len(raw), ContentType: contentType}, raw, nil
+	}
+	return Attachment{}, nil, fmt.Errorf("attachment not found")
 }
 
 var (

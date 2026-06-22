@@ -26,6 +26,41 @@ func (s *Store) TagsRoutes(mux *http.ServeMux, ownerSubject func(*http.Request) 
 	mux.HandleFunc("GET /api/accounts/{id}/folder-tag-rules", s.handleListFolderTagRules)
 	mux.HandleFunc("PUT /api/accounts/{id}/folder-tag-rules", s.handleSetFolderTagRule)
 	mux.HandleFunc("DELETE /api/accounts/{id}/folder-tag-rules", s.handleDeleteFolderTagRule)
+
+	// The same folder_tag_rules table, but assigned tag-first instead of folder-first —
+	// "this tag goes to that folder" rather than "mail moved into this folder gets that
+	// tag". Lets a tag be given a destination without first navigating to the folder
+	// itself, and is what autoMoveTaggedMail (smarttags.go) reads to know where a
+	// tagged mail belongs once it's old enough to move automatically.
+	mux.HandleFunc("GET /api/tag-destinations", func(w http.ResponseWriter, r *http.Request) {
+		s.handleListTagDestinations(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("PUT /api/accounts/{id}/tag-destination", s.handleSetTagDestination)
+	mux.HandleFunc("DELETE /api/accounts/{id}/tag-destination", s.handleDeleteTagDestination)
+
+	// Trusting a sender lets remote images in their HTML mail load automatically going
+	// forward — see handleMailBody (mails.go) for the default-blocked side of this.
+	mux.HandleFunc("POST /api/trusted-senders", func(w http.ResponseWriter, r *http.Request) {
+		s.handleTrustSender(w, r, ownerSubject(r))
+	})
+}
+
+func (s *Store) handleTrustSender(w http.ResponseWriter, r *http.Request, owner string) {
+	var req struct {
+		SenderEmail string `json:"senderEmail"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SenderEmail == "" {
+		http.Error(w, "senderEmail is required", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.db.Exec(
+		"INSERT INTO trusted_senders (owner_subject, sender_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+		owner, req.SenderEmail,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // A handful of pleasant, distinct colors, cycled deterministically by name so the
@@ -39,7 +74,7 @@ func colorForName(name string) string {
 }
 
 func (s *Store) handleListTags(w http.ResponseWriter, r *http.Request, owner string) {
-	rows, err := s.db.Query("SELECT id, name, color FROM tags WHERE owner_subject = $1 ORDER BY name", owner)
+	rows, err := s.db.Query("SELECT id, name, color, notify, instant_move FROM tags WHERE owner_subject = $1 ORDER BY name", owner)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -49,7 +84,7 @@ func (s *Store) handleListTags(w http.ResponseWriter, r *http.Request, owner str
 	tags := []Tag{}
 	for rows.Next() {
 		var t Tag
-		if err := rows.Scan(&t.ID, &t.Name, &t.Color); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Color, &t.Notify, &t.InstantMove); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -77,11 +112,11 @@ func (s *Store) handleCreateTag(w http.ResponseWriter, r *http.Request, owner st
 	row := s.db.QueryRow(`
 		INSERT INTO tags (id, owner_subject, name, color) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (owner_subject, name) DO UPDATE SET name = excluded.name
-		RETURNING id, name, color`,
+		RETURNING id, name, color, notify, instant_move`,
 		id, owner, name, color,
 	)
 	var t Tag
-	if err := row.Scan(&t.ID, &t.Name, &t.Color); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &t.Color, &t.Notify, &t.InstantMove); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -93,8 +128,10 @@ func (s *Store) handleCreateTag(w http.ResponseWriter, r *http.Request, owner st
 func (s *Store) handleUpdateTag(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		Name  *string `json:"name"`
-		Color *string `json:"color"`
+		Name        *string `json:"name"`
+		Color       *string `json:"color"`
+		Notify      *bool   `json:"notify"`
+		InstantMove *bool   `json:"instantMove"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
@@ -117,8 +154,20 @@ func (s *Store) handleUpdateTag(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Notify != nil {
+		if _, err := s.db.Exec("UPDATE tags SET notify = $1 WHERE id = $2", *req.Notify, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.InstantMove != nil {
+		if _, err := s.db.Exec("UPDATE tags SET instant_move = $1 WHERE id = $2", *req.InstantMove, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	var t Tag
-	if err := s.db.QueryRow("SELECT id, name, color FROM tags WHERE id = $1", id).Scan(&t.ID, &t.Name, &t.Color); err != nil {
+	if err := s.db.QueryRow("SELECT id, name, color, notify, instant_move FROM tags WHERE id = $1", id).Scan(&t.ID, &t.Name, &t.Color, &t.Notify, &t.InstantMove); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -277,10 +326,19 @@ func (s *Store) recordManualTagChange(messageID string, before []Tag, afterIDs [
 		afterSet[id] = true
 	}
 
+	addedAny := false
 	for _, tagID := range afterIDs {
 		if !beforeIDs[tagID] {
 			s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "manual", "applied", nil)
+			addedAny = true
 		}
+	}
+	if addedAny {
+		// Same immediate check as accepting a suggestion does — still goes through the
+		// normal delay+inbox rule, not around it: only moves now if this mail/tag
+		// combination already qualifies (e.g. an older tag_history row), otherwise it
+		// just waits for the delay like normal.
+		s.autoMoveTaggedMail(ownerSubject)
 	}
 	for tagID := range beforeIDs {
 		if afterSet[tagID] {
@@ -354,6 +412,98 @@ func (s *Store) handleDeleteFolderTagRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if _, err := s.db.Exec("DELETE FROM folder_tag_rules WHERE account_id = $1 AND folder = $2", accountID, folder); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListTagDestinations lists every tag->folder assignment across every account
+// the owner has — pooled the same way tag scoring already is (owner_subject, not a
+// single account_id), so the Tags settings panel can show "this tag goes to X" without
+// the caller needing to already know which account that folder lives on.
+func (s *Store) handleListTagDestinations(w http.ResponseWriter, r *http.Request, owner string) {
+	rows, err := s.db.Query(`
+		SELECT ftr.account_id, a.email, ftr.folder, ftr.tag_id
+		FROM folder_tag_rules ftr
+		JOIN accounts a ON a.id = ftr.account_id
+		WHERE a.owner_subject = $1`, owner)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type destination struct {
+		AccountID    string `json:"accountId"`
+		AccountEmail string `json:"accountEmail"`
+		Folder       string `json:"folder"`
+		TagID        string `json:"tagId"`
+	}
+	destinations := []destination{}
+	for rows.Next() {
+		var d destination
+		if err := rows.Scan(&d.AccountID, &d.AccountEmail, &d.Folder, &d.TagID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		destinations = append(destinations, d)
+	}
+	writeJSON(w, destinations)
+}
+
+// handleSetTagDestination assigns a tag to a folder it should move to — the same
+// folder_tag_rules row the folder banner's "auto-tag" dropdown writes, just reached
+// from the tag's side instead of the folder's. Clears any other folder this tag was
+// previously pointed to on this account first: autoMoveTaggedMail deliberately
+// refuses to guess when a tag maps to more than one folder, so this keeps that always
+// true going forward rather than letting stale assignments accumulate.
+func (s *Store) handleSetTagDestination(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	var req struct {
+		Folder string `json:"folder"`
+		TagID  string `json:"tagId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Folder == "" || req.TagID == "" {
+		http.Error(w, "folder and tagId are required", http.StatusBadRequest)
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		"DELETE FROM folder_tag_rules WHERE account_id = $1 AND tag_id = $2 AND folder != $3",
+		accountID, req.TagID, req.Folder,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO folder_tag_rules (account_id, folder, tag_id) VALUES ($1, $2, $3)
+		ON CONFLICT (account_id, folder) DO UPDATE SET tag_id = excluded.tag_id`,
+		accountID, req.Folder, req.TagID,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleDeleteTagDestination(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	tagID := r.URL.Query().Get("tagId")
+	if tagID == "" {
+		http.Error(w, "tagId is required", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.db.Exec("DELETE FROM folder_tag_rules WHERE account_id = $1 AND tag_id = $2", accountID, tagID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

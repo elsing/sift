@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,50 @@ func (s *Store) SearchRoutes(mux *http.ServeMux, ownerSubject func(*http.Request
 	})
 }
 
+// searchByTagsOnly returns cached mail across the given accounts carrying any of the
+// given tags — no IMAP search, just the local cache, since that's the only place
+// tag data exists. Results are limited to whatever's currently cached: a tagged mail
+// evicted from the cache (archived/moved long ago) won't show up here.
+func (s *Store) searchByTagsOnly(accountIDs, tagIDs []string) ([]Mail, error) {
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`
+		SELECT DISTINCT m.id, m.sender, m.sender_email, m.subject, m.snippet, m.time, m.unread,
+		       coalesce(m.account_id, ''), m.sent_at, coalesce(m.message_id, ''), coalesce(m.folder, ''), coalesce(m.uid, 0), m.has_attachments
+		FROM mails m
+		JOIN message_tags mt ON mt.message_id = m.message_id
+		WHERE m.account_id = ANY($1) AND mt.tag_id = ANY($2) AND m.message_id != ''
+		ORDER BY coalesce(m.sent_at, '-infinity'::timestamptz) DESC
+		LIMIT $3`,
+		accountIDs, tagIDs, searchResultLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mails := []Mail{}
+	for rows.Next() {
+		var m Mail
+		var sentAt sql.NullTime
+		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID, &m.Folder, &m.UID, &m.HasAttachments); err != nil {
+			return nil, err
+		}
+		if sentAt.Valid {
+			m.Date = sentAt.Time.Format(time.RFC3339)
+		}
+		mails = append(mails, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.attachTags(mails); err != nil {
+		return nil, err
+	}
+	return mails, nil
+}
+
 type searchJob struct {
 	acct     dbAccount
 	password string
@@ -62,13 +107,13 @@ func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request, owner strin
 		http.Error(w, "since/before must be YYYY-MM-DD", http.StatusBadRequest)
 		return
 	}
-	if query == "" && from == "" && since.IsZero() && before.IsZero() {
-		http.Error(w, "q, from, or a date range is required", http.StatusBadRequest)
-		return
-	}
 	folder := r.URL.Query().Get("folder") // optional: restrict to exactly one folder
 	folders := r.URL.Query()["folders"]   // optional: restrict to a specific chosen set (repeated param)
 	tagIDs := r.URL.Query()["tags"]       // optional: narrow results to mail tagged with any of these
+	if query == "" && from == "" && since.IsZero() && before.IsZero() && len(tagIDs) == 0 {
+		http.Error(w, "q, from, a date range, or a tag is required", http.StatusBadRequest)
+		return
+	}
 	deep := r.URL.Query().Get("mode") == "deep"
 	timeout := lightSearchTimeout
 	if deep {
@@ -96,6 +141,22 @@ func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request, owner strin
 		b, _ := json.Marshal(data)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		flusher.Flush()
+	}
+
+	// Tag-only search ("just show me everything tagged X") needs no IMAP round trip at
+	// all — tags are local data, so this is a single query against the local cache
+	// instead of fanning out across every folder with no real search criteria.
+	if query == "" && from == "" && since.IsZero() && before.IsZero() && len(tagIDs) > 0 {
+		mails, err := s.searchByTagsOnly(ids, tagIDs)
+		if err != nil {
+			log.Printf("tag-only search: %v", err)
+		}
+		sendEvent("progress", map[string]int{"done": 1, "total": 1})
+		if len(mails) > 0 {
+			sendEvent("match", mails)
+		}
+		sendEvent("complete", map[string]int{"matches": len(mails)})
+		return
 	}
 
 	// A "Continue" request names exactly which (account, folder) pairs a previous,
@@ -306,6 +367,8 @@ func listFoldersForSearch(acct dbAccount, password string) ([]string, error) {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	defer c.Close()
+	watchdog := time.AfterFunc(perFolderSearchTimeout, func() { c.Close() })
+	defer watchdog.Stop()
 	if err := c.Login(acct.Username, password).Wait(); err != nil {
 		return nil, fmt.Errorf("login: %w", err)
 	}
@@ -334,12 +397,28 @@ func parseSearchDate(s string) (time.Time, error) {
 	return time.Parse("2006-01-02", s)
 }
 
+// perFolderSearchTimeout bounds a single folder's entire IMAP round trip (connect,
+// login, select, search, fetch). None of imapclient's commands carry a deadline of
+// their own — a single unresponsive folder (a server hiccup, a stalled connection
+// with no proper TCP reset) could block forever, occupying one of
+// maxConcurrentFolderSearches' slots indefinitely. Every other folder still finishes,
+// but the *search as a whole* never reaches 100% — it just sits one short of the
+// total until handleSearch's own global deadline finally gives up and reports a
+// timeout, which looks like (but isn't) the same kind of timeout a server that's
+// genuinely just slow on everything would cause. Closing the connection from another
+// goroutine after this elapses is the standard way to forcibly unblock a Go I/O call
+// that has no deadline of its own — any in-flight Read/Write returns an error
+// immediately instead of hanging.
+const perFolderSearchTimeout = 12 * time.Second
+
 func searchFolder(acct dbAccount, password, folder, query, from string, deep bool, since, before time.Time) ([]Mail, error) {
 	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	defer c.Close()
+	watchdog := time.AfterFunc(perFolderSearchTimeout, func() { c.Close() })
+	defer watchdog.Stop()
 	if err := c.Login(acct.Username, password).Wait(); err != nil {
 		return nil, fmt.Errorf("login: %w", err)
 	}
@@ -380,7 +459,7 @@ func searchFolder(acct dbAccount, password, folder, query, from string, deep boo
 		uids = uids[len(uids)-searchResultLimit:] // newest UIDs are highest
 	}
 
-	fetchCmd := c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{Envelope: true, Flags: true, UID: true})
+	fetchCmd := c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{Envelope: true, Flags: true, UID: true, BodyStructure: &imap.FetchItemBodyStructure{Extended: true}})
 	msgs, err := fetchCmd.Collect()
 	if err != nil {
 		return nil, err

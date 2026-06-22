@@ -1,5 +1,8 @@
 // Tags are global to the account (owner), not per-mail-account or per-folder — a
 // short, flat list the user builds up over time, applied to individual messages.
+import { dryRunHeaders, withBusyButton } from './util.js';
+import { confirmModal } from './confirmModal.js';
+
 let cachedTags = null;
 
 export async function fetchTags(force) {
@@ -18,6 +21,8 @@ export async function createTag(name) {
   });
   if (!res.ok) throw new Error(await res.text());
   cachedTags = null; // invalidate — next fetchTags() picks up the new one
+  refreshFolderAutoTagSelect(); // the folder banner's auto-tag dropdown is built once
+  // per folder visit and otherwise has no reason to know a brand-new tag just showed up
   return res.json();
 }
 
@@ -69,6 +74,29 @@ export async function setFolderTagRule(accountId, folder, tagId) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+// Tag->folder, the other direction of the same folder_tag_rules table — "this tag
+// goes to that folder" rather than "mail moved here gets that tag". Pooled across all
+// the owner's accounts, like tag scoring already is.
+export async function fetchTagDestinations() {
+  const res = await fetch('/api/tag-destinations');
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function setTagDestination(accountId, tagId, folder) {
+  const res = await fetch(`/api/accounts/${accountId}/tag-destination`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder, tagId }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function deleteTagDestination(accountId, tagId) {
+  const res = await fetch(`/api/accounts/${accountId}/tag-destination?tagId=${encodeURIComponent(tagId)}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 async function deleteFolderTagRule(accountId, folder) {
   const res = await fetch(`/api/accounts/${accountId}/folder-tag-rules?folder=${encodeURIComponent(folder)}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(await res.text());
@@ -101,7 +129,19 @@ function applyTagToFolder(accountId, folder, tagId, onProgress) {
 // companion "Apply to all" button: the rule above only ever applies going forward, to
 // mail moved in after it's set — this is the retroactive version, for everything
 // already sitting in the folder.
+// Tracks the most recently set-up folder auto-tag select so a brand-new tag (created
+// from anywhere — Tags settings, the reader, a scan candidate) can refresh it without
+// needing to know about the folder banner directly.
+let activeFolderAutoTag = null;
+
+export function refreshFolderAutoTagSelect() {
+  if (!activeFolderAutoTag) return;
+  const { selectEl, applyBtn, accountId, folder } = activeFolderAutoTag;
+  setupFolderAutoTagSelect(selectEl, applyBtn, accountId, folder);
+}
+
 export async function setupFolderAutoTagSelect(selectEl, applyBtn, accountId, folder) {
+  activeFolderAutoTag = { selectEl, applyBtn, accountId, folder };
   selectEl.innerHTML = '<option value="">Auto-tag: none</option>';
   selectEl.onchange = null;
   applyBtn.classList.add('hidden');
@@ -125,7 +165,7 @@ export async function setupFolderAutoTagSelect(selectEl, applyBtn, accountId, fo
     applyBtn.onclick = async () => {
       if (!selectEl.value) return;
       const tagName = selectEl.selectedOptions[0].textContent.replace('Auto-tag: ', '');
-      if (!confirm(`Apply "${tagName}" to every email already in this folder?`)) return;
+      if (!(await confirmModal(`Apply "${tagName}" to every email already in this folder?`))) return;
       applyBtn.disabled = true;
       applyBtn.textContent = 'Applying…';
       try {
@@ -162,13 +202,21 @@ export function renderTagChips(tags) {
 // Smart-tagging: suggestions are a distinct concept from applied tags (nothing's been
 // committed to message_tags yet), so they get their own chip style — dashed outline,
 // with accept/dismiss baked right into the chip instead of a static label.
-export async function fetchTagHistory(status, mailId) {
+export async function fetchTagHistory(status, mailId, source) {
   const params = new URLSearchParams();
   if (status) params.set('status', status);
   if (mailId) params.set('mailId', mailId);
+  if (source) params.set('source', source);
   const res = await fetch(`/api/tag-history?${params}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+// The undo half of full-auto mode — reverses an already-applied auto-tag and teaches
+// the scorer not to repeat it (same effect as a manual dismiss, see the server side).
+export async function undoTagHistory(id) {
+  const res = await fetch(`/api/tag-history/${id}/undo`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 export async function acceptSuggestion(id) {
@@ -178,6 +226,14 @@ export async function acceptSuggestion(id) {
 
 export async function dismissSuggestion(id) {
   const res = await fetch(`/api/tag-history/${id}/dismiss`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+// The broader, explicit-opt-in sibling of dismiss — "stop suggesting this tag for this
+// sender at all", not just "wrong for this one email". A separate user choice, not
+// something a plain dismiss should imply on its own.
+export async function blockSenderForSuggestion(id) {
+  const res = await fetch(`/api/tag-history/${id}/block-sender`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
 }
 
@@ -201,19 +257,52 @@ export function renderSuggestionChips(suggestions, onResolved) {
     accept.textContent = '✓';
     accept.title = `Accept "${sug.tagName}"`;
     accept.addEventListener('click', async () => {
-      await acceptSuggestion(sug.id);
-      onResolved();
+      dismiss.disabled = true; // same row's pair — neither should be tappable mid-request
+      try {
+        await withBusyButton(accept, '…', () => acceptSuggestion(sug.id)); // compact glyph-sized chip, no room for a full "Accepting…"
+        onResolved();
+      } catch (err) {
+        console.error(err);
+      } finally {
+        dismiss.disabled = false;
+      }
     });
     const dismiss = document.createElement('button');
     dismiss.type = 'button';
     dismiss.textContent = '✕';
     dismiss.title = `Dismiss "${sug.tagName}"`;
     dismiss.addEventListener('click', async () => {
-      await dismissSuggestion(sug.id);
-      onResolved();
+      accept.disabled = true;
+      try {
+        await withBusyButton(dismiss, '…', () => dismissSuggestion(sug.id));
+        onResolved();
+      } catch (err) {
+        console.error(err);
+      } finally {
+        accept.disabled = false;
+      }
     });
     chip.append(label, accept, dismiss);
     wrap.appendChild(chip);
   }
   return wrap;
+}
+
+// Mail that's tagged with something that has a folder destination assigned, but isn't
+// actually sitting there — autoMoveTaggedMail only ever moves mail *out of inbox*, on
+// a delay, so a message that's already filed somewhere (just the wrong somewhere) was
+// never touched no matter how clearly a tag said otherwise.
+export async function fetchMisplacedMail() {
+  const res = await fetch('/api/misplaced-mail');
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function moveMail(mailId, folder) {
+  const res = await fetch(`/api/mails/${mailId}/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...dryRunHeaders() },
+    body: JSON.stringify({ folder }),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }

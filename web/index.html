@@ -26,7 +26,10 @@
 <body>
   <div class="sticky-header">
     <header class="topbar">
-      Sift
+      <span class="topbar-brand">
+        <img src="icon.svg" alt="" class="topbar-logo">
+        Sift
+      </span>
       <span>
         <button id="searchBtn" class="icon-btn" title="Search">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -115,16 +118,18 @@
 
   <div id="settingsPanel" class="accounts-panel hidden">
     <h2>Settings</h2>
-    <button id="openPersonalisationBtn" class="settings-row-btn">Personalisation</button>
-    <button id="openTagsBtn" class="settings-row-btn">Tags</button>
-    <button id="openSmartTaggingBtn" class="settings-row-btn">Smart tagging</button>
+    <button id="openPersonalisationBtn" class="settings-row-btn">🎨 Personalisation</button>
+    <button id="openTagsBtn" class="settings-row-btn">🏷️ Tags</button>
+    <button id="openSmartTaggingBtn" class="settings-row-btn">✨ Smart tagging</button>
+    <button id="openFolderManagerBtn" class="settings-row-btn">📁 Manage folders</button>
+    <button id="openAutoTagActivityBtn" class="settings-row-btn">🪄 Auto-tag activity</button>
     <h3 class="settings-subhead">Account</h3>
-    <button id="accountsBtn" class="settings-row-btn">Accounts</button>
+    <button id="accountsBtn" class="settings-row-btn">👤 Accounts</button>
     <h3 class="settings-subhead">Notifications</h3>
-    <button id="enablePushBtn" class="settings-row-btn">Enable notifications</button>
+    <button id="enablePushBtn" class="settings-row-btn">🔔 Enable notifications</button>
     <p id="pushError" class="form-error"></p>
     <h3 class="settings-subhead">Advanced</h3>
-    <button id="dryRunBtn" class="settings-row-btn">Dry run mode</button>
+    <button id="dryRunBtn" class="settings-row-btn">🧪 Dry run mode</button>
     <button id="logoutBtn" class="settings-row-btn logout-row">Log out</button>
     <button id="closeSettingsBtn" class="close-panel-btn">Close</button>
   </div>
@@ -139,11 +144,41 @@
     <div id="swipeLeftOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Swipe right</h3>
     <div id="swipeRightOptions" class="theme-options"></div>
+    <h3 class="settings-subhead">Delete animation</h3>
+    <label class="tag-manager-notify" style="font-size:14px; padding: 4px 0 12px;">
+      <input type="checkbox" id="funDeleteToggle"> Fun delete animation (off = plain slide)
+    </label>
     <button id="closePersonalisationBtn" class="close-panel-btn">Close</button>
   </div>
 
+  <div id="autoTagActivityPanel" class="accounts-panel hidden">
+    <div class="panel-header-row">
+      <h2>Auto-tag activity</h2>
+      <button id="closeAutoTagActivityTopBtn" type="button" class="icon-btn" title="Close">✕</button>
+    </div>
+    <p class="smart-history-meta">Every tag full-auto mode applied on its own, most recent first. Wrong call? Undo it — that also teaches it not to repeat the mistake.</p>
+    <p id="autoTagActivityError" class="form-error"></p>
+    <ul id="autoTagActivityList" class="accounts-list"></ul>
+    <button id="closeAutoTagActivityBtn" class="close-panel-btn">Close</button>
+  </div>
+
+  <div id="folderManagerPanel" class="accounts-panel hidden">
+    <div class="panel-header-row">
+      <h2>Manage folders</h2>
+      <button id="closeFolderManagerTopBtn" type="button" class="icon-btn" title="Close">✕</button>
+    </div>
+    <div id="folderManagerAccountPicker"></div>
+    <button id="folderManagerNewRootBtn" type="button" class="settings-row-btn hidden">New folder</button>
+    <p id="folderManagerError" class="form-error"></p>
+    <div id="folderManagerTree" class="folder-tree"></div>
+    <button id="closeFolderManagerBtn" class="close-panel-btn">Close</button>
+  </div>
+
   <div id="tagsPanel" class="accounts-panel hidden">
-    <h2>Tags</h2>
+    <div class="panel-header-row">
+      <h2>Tags</h2>
+      <button id="closeTagsTopBtn" type="button" class="icon-btn" title="Close">✕</button>
+    </div>
     <ul id="tagManagerList" class="accounts-list"></ul>
     <form id="tagManagerForm" class="search-form">
       <input id="tagManagerInput" type="text" placeholder="New tag name…" autocomplete="off">
@@ -158,22 +193,38 @@
       <button id="closeSmartTaggingTopBtn" type="button" class="icon-btn" title="Close">✕</button>
     </div>
     <h3 class="settings-subhead">Mode</h3>
+    <p class="smart-history-meta">
+      <strong>Review</strong>: every match is just a suggestion — nothing gets tagged until you accept it, no matter how confident the match is.
+      <strong>Full-auto</strong>: matches confident enough (built up from your own tagging history over time) apply immediately; anything less certain still only suggests, same as Review.
+    </p>
     <div id="autoTagModeOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Auto-move tagged mail after</h3>
     <div class="auto-move-delay-row">
       <input id="autoMoveDelayInput" type="number" min="0" step="1">
       <span>days</span>
     </div>
+    <button id="runAutoMoveBtn" class="settings-row-btn">Move tagged mail now</button>
+    <ul id="autoMoveResults"></ul>
     <p id="smartTaggingSettingsError" class="form-error"></p>
     <h3 class="settings-subhead">Bootstrap from existing mail</h3>
+    <div id="scanScopeOptions" class="theme-options"></div>
     <button id="scanForTagsBtn" class="settings-row-btn">Scan for tags</button>
     <div id="scanAccountPicker"></div>
     <div id="scanProgress" class="search-progress hidden">
       <div class="search-progress-bar"><div id="scanProgressFill" class="search-progress-fill"></div></div>
       <p id="scanProgressText" class="search-progress-text"></p>
+      <button id="cancelScanBtn" type="button" class="settings-row-btn">Cancel scan</button>
     </div>
     <div id="scanResults"></div>
+    <h3 class="settings-subhead">Misplaced mail</h3>
+    <p class="smart-history-meta">Tagged, but not sitting in that tag's folder — auto-move only ever clears mail out of inbox, so anything already filed elsewhere stays as-is until you fix it here.</p>
+    <button id="relocateAllBtn" type="button" class="settings-row-btn hidden">Move all</button>
+    <ul id="misplacedMailList" class="accounts-list"></ul>
     <h3 class="settings-subhead">Pending suggestions</h3>
+    <div class="suggestion-bulk-actions">
+      <button id="acceptAllSuggestionsBtn" type="button" class="settings-row-btn hidden">Accept all</button>
+      <button id="dismissAllSuggestionsBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
+    </div>
     <ul id="smartTaggingSuggestions" class="accounts-list"></ul>
     <button id="historyToggleBtn" type="button" class="search-advanced-toggle">History ▾</button>
     <div id="historySection" class="hidden">
@@ -196,6 +247,19 @@
       <p id="folderSheetError" class="form-error"></p>
       <input id="folderSheetSearch" type="search" placeholder="Filter folders…" autocomplete="off" class="folder-sheet-search">
       <div id="folderSheetBody" class="folder-tree move-folder-tree"></div>
+      <button id="folderSheetConfirm" type="button" class="settings-row-btn hidden">Done</button>
+    </div>
+  </div>
+
+  <div id="confirmModal" class="confirm-modal hidden">
+    <div class="confirm-modal-content">
+      <div id="confirmModalIcon" class="confirm-modal-icon">🤔</div>
+      <p id="confirmModalMessage" class="confirm-modal-message"></p>
+      <input id="confirmModalInput" type="text" class="confirm-modal-input hidden">
+      <div class="confirm-modal-actions">
+        <button id="confirmModalCancel" type="button" class="confirm-modal-cancel">Cancel</button>
+        <button id="confirmModalConfirm" type="button" class="confirm-modal-confirm">Yes</button>
+      </div>
     </div>
   </div>
 
@@ -206,7 +270,7 @@
         <button id="tagSheetClose">✕</button>
       </div>
       <form id="tagCreateForm" class="search-form">
-        <input id="tagNameInput" type="text" placeholder="New tag name…" autocomplete="off">
+        <input id="tagNameInput" type="text" placeholder="Search or create a tag…" autocomplete="off">
       </form>
       <p id="tagSheetError" class="form-error"></p>
       <ul id="tagSheetList" class="tag-sheet-list"></ul>
@@ -257,9 +321,15 @@
         <p class="mail-loading-quip" id="mailReaderLoadingQuip"></p>
       </div>
       <pre class="mail-reader-body" id="mailReaderBody"></pre>
+      <div class="images-blocked-banner hidden" id="imagesBlockedBanner">
+        <span>Images blocked for your privacy</span>
+        <button id="showImagesBtn" type="button" class="settings-row-btn">Show images</button>
+        <button id="trustSenderBtn" type="button" class="settings-row-btn">Trust sender</button>
+      </div>
       <div class="mail-reader-html-wrap hidden" id="mailReaderHtmlWrap">
         <iframe class="mail-reader-html" id="mailReaderHtml" sandbox="allow-same-origin allow-popups"></iframe>
       </div>
+      <ul id="mailReaderAttachments" class="mail-reader-attachments"></ul>
     </div>
   </div>
 

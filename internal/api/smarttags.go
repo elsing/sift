@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap/v2/imapclient"
 )
@@ -20,7 +22,6 @@ const (
 	autoApplyScore         = 0.75
 	suggestScore           = 0.4
 	maxSuggestionsPerMail  = 3
-	dismissSuppressCount   = 2 // dismissals for the same (sender, tag) pair before we stop re-suggesting it
 )
 
 // recordTagHistory is the single insert path for every tag decision — manual tagging,
@@ -179,14 +180,17 @@ func (s *Store) subjectRatio(ownerSubject string, tokens []string, tagID string)
 	return ratio(applied, dismissed)
 }
 
-// suppressedTags returns tag IDs that shouldn't be re-suggested for this sender —
-// dismissed too many times already for that exact (sender, tag) pair. Unbounded/
-// permanent, not time-windowed: "this sender doesn't get this tag" is meant to stick.
-func (s *Store) suppressedTags(ownerSubject, senderEmail string) map[string]bool {
+// suppressedTags returns tag IDs that shouldn't be re-suggested for this exact mail —
+// dismissing is purely "this tag is wrong for this email", not a verdict on the sender
+// (broader, sender-wide suppression turned out to silence legitimate matches too
+// readily, and wasn't actually what dismiss was meant to mean — see blockedSenderTags
+// for the separate, explicit, opt-in version of that). Unbounded/permanent, not
+// time-windowed: redismissing the same mail/tag pairing isn't expected to happen.
+func (s *Store) suppressedTags(ownerSubject, messageID string) map[string]bool {
 	suppressed := map[string]bool{}
 	rows, err := s.db.Query(
-		"SELECT tag_id FROM tag_history WHERE owner_subject = $1 AND sender_email = $2 AND status = 'dismissed' GROUP BY tag_id HAVING count(*) >= $3",
-		ownerSubject, senderEmail, dismissSuppressCount,
+		"SELECT tag_id FROM tag_history WHERE owner_subject = $1 AND message_id = $2 AND status = 'dismissed'",
+		ownerSubject, messageID,
 	)
 	if err != nil {
 		return suppressed
@@ -201,9 +205,32 @@ func (s *Store) suppressedTags(ownerSubject, senderEmail string) map[string]bool
 	return suppressed
 }
 
+// blockedSenderTags returns tag IDs explicitly blocked for this sender via the
+// separate, opt-in "don't suggest this from this sender again" action — the user's
+// deliberate choice to go broader than one email, not an automatic side effect of
+// dismissing (see suppressedTags).
+func (s *Store) blockedSenderTags(ownerSubject, senderEmail string) map[string]bool {
+	blocked := map[string]bool{}
+	rows, err := s.db.Query(
+		"SELECT tag_id FROM tag_sender_blocks WHERE owner_subject = $1 AND sender_email = $2",
+		ownerSubject, senderEmail,
+	)
+	if err != nil {
+		return blocked
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tagID string
+		if rows.Scan(&tagID) == nil {
+			blocked[tagID] = true
+		}
+	}
+	return blocked
+}
+
 // scoreTagsForMail returns every tag scoring >= suggestScore for this sender/subject,
 // sorted descending, capped at maxSuggestionsPerMail.
-func (s *Store) scoreTagsForMail(ownerSubject, senderEmail, subject string) []tagScore {
+func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject string) []tagScore {
 	if senderEmail == "" {
 		return nil
 	}
@@ -240,12 +267,13 @@ func (s *Store) scoreTagsForMail(ownerSubject, senderEmail, subject string) []ta
 		return nil
 	}
 
-	suppressed := s.suppressedTags(ownerSubject, senderEmail)
+	suppressed := s.suppressedTags(ownerSubject, messageID)
+	blocked := s.blockedSenderTags(ownerSubject, senderEmail)
 	tokens := tokenizeSubject(subject)
 
 	var results []tagScore
 	for _, tagID := range tagIDs {
-		if suppressed[tagID] {
+		if suppressed[tagID] || blocked[tagID] {
 			continue
 		}
 		senderScore := s.senderRatio(ownerSubject, senderEmail, tagID)
@@ -276,6 +304,26 @@ func (s *Store) ownerAutoTagMode(ownerSubject string) string {
 	return mode
 }
 
+// existingTagIDs returns the tags a message already has — both the live evaluator and
+// the scan need this so they never suggest/auto-apply a tag that's already been
+// applied (a real complaint: the scan was re-suggesting tags on mail that was already
+// tagged, inbox included).
+func (s *Store) existingTagIDs(messageID string) map[string]bool {
+	existing := map[string]bool{}
+	rows, err := s.db.Query("SELECT tag_id FROM message_tags WHERE message_id = $1", messageID)
+	if err != nil {
+		return existing
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tagID string
+		if rows.Scan(&tagID) == nil {
+			existing[tagID] = true
+		}
+	}
+	return existing
+}
+
 // evaluateNewMailForSmartTags scores each newly-synced mail and, per the owner's
 // auto_tag_mode, either auto-applies a confident match (full_auto only, score >=
 // autoApplyScore) or queues it for review. Best-effort throughout: a failure scoring
@@ -292,7 +340,11 @@ func (s *Store) evaluateNewMailForSmartTags(accountID string, mails []Mail) {
 		if m.MessageID == "" || m.SenderEmail == "" {
 			continue
 		}
-		for _, c := range s.scoreTagsForMail(ownerSubject, m.SenderEmail, m.Subject) {
+		existing := s.existingTagIDs(m.MessageID)
+		for _, c := range s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject) {
+			if existing[c.TagID] {
+				continue // already has this tag — nothing to suggest or apply
+			}
 			score := c.Score
 			if mode == "full_auto" && score >= autoApplyScore {
 				s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
@@ -310,11 +362,23 @@ func (s *Store) TagHistoryRoutes(mux *http.ServeMux, ownerSubject func(*http.Req
 	mux.HandleFunc("GET /api/tag-history", func(w http.ResponseWriter, r *http.Request) {
 		s.handleListTagHistory(w, r, ownerSubject(r))
 	})
+	mux.HandleFunc("GET /api/misplaced-mail", func(w http.ResponseWriter, r *http.Request) {
+		s.handleListMisplacedMail(w, r, ownerSubject(r))
+	})
 	mux.HandleFunc("POST /api/tag-history/{id}/accept", func(w http.ResponseWriter, r *http.Request) {
 		s.handleAcceptTagHistory(w, r, ownerSubject(r))
 	})
 	mux.HandleFunc("POST /api/tag-history/{id}/dismiss", func(w http.ResponseWriter, r *http.Request) {
 		s.handleDismissTagHistory(w, r, ownerSubject(r))
+	})
+	// The undo half of full-auto mode — see Auto-tag activity in settings.
+	mux.HandleFunc("POST /api/tag-history/{id}/undo", func(w http.ResponseWriter, r *http.Request) {
+		s.handleUndoTagHistory(w, r, ownerSubject(r))
+	})
+	// Separate from plain dismiss — the user's explicit choice to also stop this tag
+	// being suggested for this sender at all, not something dismiss implies on its own.
+	mux.HandleFunc("POST /api/tag-history/{id}/block-sender", func(w http.ResponseWriter, r *http.Request) {
+		s.handleBlockSenderTagHistory(w, r, ownerSubject(r))
 	})
 	mux.HandleFunc("GET /api/owner-settings", func(w http.ResponseWriter, r *http.Request) {
 		s.handleGetOwnerSettings(w, r, ownerSubject(r))
@@ -327,6 +391,9 @@ func (s *Store) TagHistoryRoutes(mux *http.ServeMux, ownerSubject func(*http.Req
 	mux.HandleFunc("GET /api/accounts/{id}/scan-tags", s.handleScanTags)
 	// GET, not POST — same EventSource constraint as scan-tags above.
 	mux.HandleFunc("GET /api/accounts/{id}/folders/apply-tag", s.handleApplyTagToFolder)
+	mux.HandleFunc("POST /api/auto-move/run", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRunAutoMove(w, r, ownerSubject(r))
+	})
 }
 
 type TagHistoryEntry struct {
@@ -345,12 +412,73 @@ type TagHistoryEntry struct {
 	CreatedAt   string   `json:"createdAt"`
 }
 
+type MisplacedMail struct {
+	MailID            string `json:"mailId"`
+	Sender            string `json:"sender"`
+	Subject           string `json:"subject"`
+	CurrentFolder     string `json:"currentFolder"`
+	DestinationFolder string `json:"destinationFolder"`
+	TagID             string `json:"tagId"`
+	TagName           string `json:"tagName"`
+	TagColor          string `json:"tagColor"`
+}
+
+// handleListMisplacedMail finds cached mail that's tagged with something that has a
+// folder destination assigned (folder_tag_rules, tag-first — see handleSetTagDestination),
+// but isn't actually sitting in that folder. autoMoveTaggedMail already owns moving
+// mail *out of inbox* on the same delay, so this deliberately excludes inbox mail —
+// it's not a second path to the same outcome, just the rest of the mailbox that
+// function never looks at: mail that's already filed somewhere, just not the
+// somewhere a tag says it belongs. Same delay applies here too (a mail tagged minutes
+// ago isn't "misplaced" yet, it just hasn't had a chance to be moved). Purely DB-side
+// against whatever's currently cached (no fresh IMAP listing) — same cache the scan
+// and regular sync already populate, so coverage improves the more those run.
+func (s *Store) handleListMisplacedMail(w http.ResponseWriter, r *http.Request, owner string) {
+	// No age delay here, deliberately — that's specific to autoMoveTaggedMail's "give
+	// inbox mail a grace period before whisking it away" rationale, which doesn't
+	// apply to mail that's already filed somewhere else. A mail sitting in the wrong
+	// non-inbox folder is just wrong, regardless of how recently it was tagged —
+	// there's no equivalent reason to wait.
+	rows, err := s.db.Query(`
+		SELECT m.id, m.sender, m.subject, m.folder, dest.folder, t.id, t.name, t.color
+		FROM mails m
+		JOIN accounts a ON a.id = m.account_id
+		JOIN message_tags mt ON mt.message_id = m.message_id
+		JOIN tags t ON t.id = mt.tag_id
+		JOIN folder_tag_rules dest ON dest.tag_id = t.id AND dest.account_id = m.account_id
+		WHERE a.owner_subject = $1
+		  AND m.folder != dest.folder
+		  AND m.folder != 'INBOX'
+		  AND (SELECT count(*) FROM folder_tag_rules f2 WHERE f2.tag_id = t.id AND f2.account_id = m.account_id) = 1
+		ORDER BY m.sent_at DESC
+		LIMIT 200`,
+		owner,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	misplaced := []MisplacedMail{}
+	for rows.Next() {
+		var m MisplacedMail
+		if err := rows.Scan(&m.MailID, &m.Sender, &m.Subject, &m.CurrentFolder, &m.DestinationFolder, &m.TagID, &m.TagName, &m.TagColor); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		misplaced = append(misplaced, m)
+	}
+	writeJSON(w, misplaced)
+}
+
 // handleListTagHistory serves both the pending-suggestions list (status=suggested,
 // optionally scoped to one mail via messageId) and the audit/history view (no status
 // filter — every source/status, most recent first). Pending suggestions are bounded to
 // the last 30 days so old ones don't pile up forever without a cron-based expiry.
 func (s *Store) handleListTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
 	status := r.URL.Query().Get("status")
+	source := r.URL.Query().Get("source") // e.g. "smart_auto" for the Auto-tag activity panel
 	// The client only ever knows a mail's ephemeral cache id, not its stable
 	// Message-ID — resolve the same way handleGetMailTags does, rather than exposing
 	// MessageID (deliberately hidden, json:"-") just for this one lookup.
@@ -378,6 +506,10 @@ func (s *Store) handleListTagHistory(w http.ResponseWriter, r *http.Request, own
 	if messageID != "" {
 		args = append(args, messageID)
 		query += fmt.Sprintf(" AND th.message_id = $%d", len(args))
+	}
+	if source != "" {
+		args = append(args, source)
+		query += fmt.Sprintf(" AND th.source = $%d", len(args))
 	}
 	if status == "suggested" {
 		query += " AND th.created_at > now() - interval '30 days'"
@@ -421,11 +553,49 @@ func (s *Store) handleAcceptTagHistory(w http.ResponseWriter, r *http.Request, o
 		return
 	}
 	s.db.Exec("UPDATE tag_history SET status = 'applied', resolved_at = now() WHERE id = $1", id)
+	// Check for an immediate move rather than waiting for the next opportunistic
+	// sync — but this still goes through the normal rule, not around it: a suggestion
+	// that's sat unaccepted for longer than the delay already qualifies and moves
+	// right now, but one accepted the same day it was suggested is still "younger
+	// than N days" by autoMoveTaggedMail's own check and stays put until it isn't.
+	s.autoMoveTaggedMail(owner)
+	// Without this, the tag chip (and any grouping it forms) didn't show up in the
+	// inbox until something else happened to trigger a refresh — accepting looked
+	// like it silently did nothing client-side even though the tag really had been
+	// applied server-side.
+	s.broadcaster.publish("mail")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleUndoTagHistory reverses an already-applied auto-tag (full_auto mode's whole
+// premise is that confident matches apply immediately with no review step — this is
+// the "easily corrected" half of that bargain). Removes the real tag from the mail
+// and marks the history row dismissed, the same status a manual dismiss would leave —
+// which means it also feeds suppressedTags, so undoing a wrong auto-tag actually
+// teaches the scorer not to repeat it, not just a one-time fix.
+func (s *Store) handleUndoTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	id := r.PathValue("id")
+	var messageID, tagID string
+	if err := s.db.QueryRow(
+		"SELECT message_id, tag_id FROM tag_history WHERE id = $1 AND owner_subject = $2 AND status = 'applied'",
+		id, owner,
+	).Scan(&messageID, &tagID); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.db.Exec("DELETE FROM message_tags WHERE message_id = $1 AND tag_id = $2", messageID, tagID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.db.Exec("UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1", id)
+	s.broadcaster.publish("mail")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleDismissTagHistory marks a pending suggestion dismissed — feeds suppressedTags
-// so the same (sender, tag) pairing stops being re-suggested after enough dismissals.
+// so this exact mail stops being re-suggested this tag. Purely a verdict on this one
+// email, not its sender; see handleBlockSenderTagHistory for the broader, explicit
+// opt-in version of that.
 func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
 	id := r.PathValue("id")
 	res, err := s.db.Exec(
@@ -440,6 +610,41 @@ func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, 
 		http.NotFound(w, r)
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBlockSenderTagHistory is the broader, explicit-opt-in sibling of dismiss: not
+// just "wrong for this email" but "stop suggesting this tag for this sender, period."
+// Dismisses the suggestion too (a block implies the immediate one was also wrong).
+func (s *Store) handleBlockSenderTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	id := r.PathValue("id")
+	var tagID, senderEmail string
+	if err := s.db.QueryRow(
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1 AND owner_subject = $2 AND status = 'suggested' RETURNING tag_id, sender_email",
+		id, owner,
+	).Scan(&tagID, &senderEmail); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if senderEmail == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if _, err := s.db.Exec(
+		"INSERT INTO tag_sender_blocks (owner_subject, sender_email, tag_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+		owner, senderEmail, tagID,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Blocking the sender means every other still-pending suggestion of this exact tag
+	// from this exact sender is now moot too — without this they'd keep sitting in the
+	// review queue even though they'll never be acted on, which read as "I blocked this
+	// but it's still showing me more of the same".
+	s.db.Exec(
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE owner_subject = $1 AND tag_id = $2 AND sender_email = $3 AND status = 'suggested'",
+		owner, tagID, senderEmail,
+	)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -509,7 +714,12 @@ type newTagCandidate struct {
 // Signal C: for senders with no tag history at all (Signal A found nothing) who are
 // heavily concentrated in one ruleless folder, surface "create a tag for this?" — never
 // persisted/auto-applied, since naming a brand-new tag needs the user.
-func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total int)) (scanSummary, error) {
+// scope == "inbox" scans just INBOX instead of every folder — the full scan can take
+// a while on a large, many-folder mailbox, and not everyone wants to wait through that
+// just to bootstrap scoring from their inbox specifically. folders, when non-empty,
+// takes precedence over scope entirely — an explicit, user-picked set of folders to
+// scan instead of either "everything" or "just inbox".
+func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string, folders []string, onProgress func(done, total int)) (scanSummary, error) {
 	summary := scanSummary{}
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
@@ -521,9 +731,45 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 	}
 	mode := s.ownerAutoTagMode(ownerSubject)
 
-	names, _, err := listFolders(acct.Host, acct.Port, acct.Username, password)
-	if err != nil {
-		return summary, err
+	// Clear out this scan's own previous suggestions before generating fresh ones —
+	// without this, re-running a scan just kept piling up duplicate "suggested" rows
+	// for the exact same (mail, tag) pair every time, rather than replacing last
+	// time's findings with this time's. Only ever touches scan_inferred/suggested —
+	// never anything already accepted/dismissed, never the live evaluator's own
+	// smart_suggested rows, which aren't this scan's to clear.
+	if _, err := s.db.Exec(
+		"DELETE FROM tag_history WHERE owner_subject = $1 AND source = 'scan_inferred' AND status = 'suggested'",
+		ownerSubject,
+	); err != nil {
+		log.Printf("clear stale scan suggestions: %v", err)
+	}
+
+	// Resolved once up front and reused below — both for excluding Trash from "all
+	// folders" scans, and for the new-tag-candidate guard further down.
+	_, trashFolder, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password)
+
+	var names []string
+	if len(folders) > 0 {
+		names = folders // an explicit folder pick is the user's own call — Trash included, if that's what they chose
+	} else if scope == "inbox" {
+		names = []string{"INBOX"}
+	} else {
+		names, _, err = listFolders(acct.Host, acct.Port, acct.Username, password)
+		if err != nil {
+			return summary, err
+		}
+		// "All folders" shouldn't mean Trash too — it's mostly junk/old test mail by
+		// nature, and scoring against it polluted suggestions with patterns nobody
+		// actually wants learned (a sender's one-off mistake, deleted spam, etc.).
+		if trashFolder != "" {
+			filtered := names[:0]
+			for _, n := range names {
+				if n != trashFolder {
+					filtered = append(filtered, n)
+				}
+			}
+			names = filtered
+		}
 	}
 
 	rules := map[string]string{} // folder -> tag id
@@ -554,6 +800,9 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 	}
 	var all []mailInFolder
 	for i, folder := range names {
+		if ctx.Err() != nil {
+			return summary, ctx.Err() // client closed the connection (e.g. tapped Cancel) — stop burning IMAP round trips on a scan nobody's waiting for
+		}
 		mails, err := fetchFolderMail(acct, password, folder, scanFolderLimit, 0)
 		if err == nil {
 			// Without this, scanned mail was never cached locally at all — there was no
@@ -575,26 +824,43 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 		}
 	}
 
-	senderFolderCount := map[string]map[string]int{}
-	senderTotal := map[string]int{}
-	for _, mf := range all {
-		if mf.mail.SenderEmail == "" {
-			continue
-		}
-		if senderFolderCount[mf.mail.SenderEmail] == nil {
-			senderFolderCount[mf.mail.SenderEmail] = map[string]int{}
-		}
-		senderFolderCount[mf.mail.SenderEmail][mf.folder]++
-		senderTotal[mf.mail.SenderEmail]++
+	// Every folder's been fetched, but scoring every mail against tag history (several
+	// DB round trips each) for a large mailbox can itself take a noticeable while —
+	// without telling the client, the progress bar just sits at "100%" looking stuck
+	// for that whole stretch. done = -1 is the client's signal to switch to this phase.
+	if onProgress != nil {
+		onProgress(-1, len(all))
 	}
 
-	candidates := map[string]newTagCandidate{} // keyed by "sender|folder", dedupes across mail
+	// New-tag candidates (Signal C) are about where to file mail going forward — a
+	// sender concentrated in one folder years ago isn't a useful predictor of where
+	// their mail belongs today, and surfacing it just adds noise to the review queue.
+	// Doesn't affect Signal A/B, which score against tags that already exist.
+	const newTagCandidateMaxAge = 2 * 365 * 24 * time.Hour
+	cutoff := time.Now().Add(-newTagCandidateMaxAge)
+
+	signalCByFolder := map[string][]Mail{} // folder -> ruleless-folder mail with no tag/history match, eligible for "create a tag for this?"
+	seenMessageIDs := map[string]bool{}    // a duplicated message (same Message-ID, multiple physical
+	// copies across folders/UIDs — see the duplicate-mail incident) should only ever be evaluated
+	// once per scan; without this, each extra copy logged its own redundant suggestion for the
+	// identical (message, tag) pair, which is what made a single dismissed/blocked suggestion look
+	// like it kept "coming back" on the next scan — it wasn't coming back, a sibling copy was scoring fresh.
 	for _, mf := range all {
 		m, folder := mf.mail, mf.folder
 		if m.MessageID == "" {
 			continue
 		}
+		if seenMessageIDs[m.MessageID] {
+			continue
+		}
+		seenMessageIDs[m.MessageID] = true
 		if tagID, ok := rules[folder]; ok {
+			// recordTagHistory only logs the audit row — it never touches message_tags,
+			// the table that actually drives the visible tag chip. Without this insert,
+			// mail sitting in a folder with a rule got logged as "applied" (correctly
+			// feeding future scoring density) but never genuinely tagged, which read as
+			// "the scan found it but didn't actually tag it."
+			s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, tagID)
 			s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil)
 			summary.Applied++
 			continue
@@ -602,7 +868,18 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 		if m.SenderEmail == "" {
 			continue
 		}
-		if scored := s.scoreTagsForMail(ownerSubject, m.SenderEmail, m.Subject); len(scored) > 0 {
+		existing := s.existingTagIDs(m.MessageID)
+		if len(existing) > 0 {
+			// Already tagged (manually, by a folder rule elsewhere, or a previous scan)
+			// — re-running the full scorer here only ever costs time without fixing
+			// anything: the scan never removes a tag it thinks is wrong, so a second
+			// opinion on already-settled mail isn't worth several DB round trips per
+			// mail on every single scan. Multi-tag mail that could've picked up one
+			// more suggestion is the accepted tradeoff for not re-scoring everything
+			// that's already sorted.
+			continue
+		}
+		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject); len(scored) > 0 {
 			for _, c := range scored {
 				score := c.Score
 				if mode == "full_auto" && score >= autoApplyScore {
@@ -614,19 +891,50 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 					summary.Suggested++
 				}
 			}
+			// Scored against existing history at all (even if every match turned out
+			// already-applied) still means this sender's "handled" — not eligible for
+			// the Signal C new-tag-candidate path below.
 			continue
 		}
 		if knownSenders[m.SenderEmail] {
 			continue
 		}
-		total := senderTotal[m.SenderEmail]
-		count := senderFolderCount[m.SenderEmail][folder]
-		if total >= 3 && float64(count)/float64(total) >= 0.7 {
-			candidates[m.SenderEmail+"|"+folder] = newTagCandidate{SenderOrDomain: m.SenderEmail, Folder: folder, Count: count}
+		// INBOX is never a sensible new-tag candidate — "this mail is in my inbox" is
+		// structural, not a sorting pattern the user created, and accepting one created
+		// a tag literally named "INBOX" with a rule mapping INBOX back to itself, which
+		// went on to cause real damage (see autoMoveTaggedMail and moveMailToFolder's
+		// same-folder guards). Trash is excluded from "all folders" scans entirely
+		// above, but this also covers an explicitly-chosen scan that includes it.
+		if folder == "INBOX" || (trashFolder != "" && folder == trashFolder) {
+			continue
 		}
+		if t, err := time.Parse(time.RFC3339, m.Date); err == nil && t.Before(cutoff) {
+			continue // see newTagCandidateMaxAge above
+		}
+		signalCByFolder[folder] = append(signalCByFolder[folder], m)
 	}
-	for _, c := range candidates {
-		summary.NewTagCandidates = append(summary.NewTagCandidates, c)
+
+	// One candidate per folder, not per sender — a folder is almost always a single
+	// sorting decision regardless of who sent any given mail inside it (that's the
+	// whole premise of filing things into folders), so "12 from sender A, 8 from
+	// sender B, 4 from sender C, all in Volunteering" is one real signal ("this folder
+	// means something"), not three separate near-duplicate suggestions that just
+	// fragment the same finding by source address.
+	for folder, mails := range signalCByFolder {
+		if len(mails) < 3 {
+			continue
+		}
+		senders := map[string]bool{}
+		for _, m := range mails {
+			senders[m.SenderEmail] = true
+		}
+		label := fmt.Sprintf("%d different senders", len(senders))
+		if len(senders) == 1 {
+			for sender := range senders {
+				label = sender
+			}
+		}
+		summary.NewTagCandidates = append(summary.NewTagCandidates, newTagCandidate{SenderOrDomain: label, Folder: folder, Count: len(mails)})
 	}
 	return summary, nil
 }
@@ -637,6 +945,8 @@ func (s *Store) scanAccountForTags(accountID string, onProgress func(done, total
 // was adopted there.
 func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
 	accountID := r.PathValue("id")
+	scope := r.URL.Query().Get("scope") // "inbox" or "" (all folders) — ignored if folders is set
+	folders := r.URL.Query()["folders"] // optional: scan exactly these folders instead of scope
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -650,12 +960,18 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	summary, err := s.scanAccountForTags(accountID, func(done, total int) {
+	summary, err := s.scanAccountForTags(r.Context(), accountID, scope, folders, func(done, total int) {
 		sendEvent("progress", map[string]int{"done": done, "total": total})
 	})
 	if err != nil {
 		sendEvent("error", map[string]string{"message": err.Error()})
 		return
+	}
+	if summary.Applied > 0 {
+		// full_auto mode can apply tags directly during a scan — same gap as accept:
+		// without this, those wouldn't show up in the inbox until something else
+		// happened to trigger a refresh.
+		s.broadcaster.publish("mail")
 	}
 	sendEvent("complete", summary)
 }
@@ -669,66 +985,119 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
 // already doing work (a sync), so this fires the next time something happens for an
 // account after the delay elapses, not exactly at the delay's edge. That's an accepted
 // tradeoff, documented in docs/smart-tagging.md.
-func (s *Store) autoMoveTaggedMail(ownerSubject string) {
+func (s *Store) ownerAutoMoveDelayDays(ownerSubject string) int {
 	var delayDays int
 	if err := s.db.QueryRow(
 		"SELECT auto_move_delay_days FROM owner_settings WHERE owner_subject = $1", ownerSubject,
 	).Scan(&delayDays); err != nil {
-		delayDays = 3 // no settings row yet — same default the column itself has
+		return 3 // no settings row yet — same default the column itself has
 	}
+	return delayDays
+}
 
+// movedMailDetail names one piece of mail autoMoveTaggedMail actually moved — kept
+// around only so the manual "Move tagged mail now" trigger can show *what* happened
+// instead of just a bare count.
+type movedMailDetail struct {
+	Sender  string `json:"sender"`
+	Subject string `json:"subject"`
+	Tag     string `json:"tag"`
+	Folder  string `json:"folder"`
+}
+
+func (s *Store) autoMoveTaggedMail(ownerSubject string) (int, []movedMailDetail) {
+	// See autoMoveMu's own comment — this function is called opportunistically from
+	// several uncoordinated places, and two overlapping runs racing for the same
+	// candidate mail is exactly what made the manual trigger undercount.
+	s.autoMoveMu.Lock()
+	defer s.autoMoveMu.Unlock()
+
+	delayDays := s.ownerAutoMoveDelayDays(ownerSubject)
+
+	// The delay is meant to be "how long this mail has sat in the inbox", not "how
+	// long ago it got tagged" — those are very different clocks for mail tagged well
+	// after it arrived (a bulk scan/accept over a backlog tags everything at once,
+	// today, regardless of how old the mail itself is). Joining against mails.sent_at
+	// here, not tag_history.created_at, is what actually answers "has this mail been
+	// sitting here long enough", and incidentally folds in the INBOX-only filter that
+	// used to be a separate per-row lookup below.
+	// instant_move tags (e.g. "Receipts" — always file it right now, no waiting) skip
+	// the global delay entirely rather than just using a smaller number — off by
+	// default per-tag, so this only ever kicks in where explicitly turned on.
 	rows, err := s.db.Query(`
-		SELECT DISTINCT message_id, tag_id FROM tag_history
-		WHERE owner_subject = $1 AND status = 'applied'
-		  AND created_at < now() - ($2 || ' days')::interval
+		SELECT DISTINCT th.message_id, th.tag_id, m.id, coalesce(m.account_id, ''), m.sender, m.subject
+		FROM tag_history th
+		JOIN mails m ON m.message_id = th.message_id AND m.folder = 'INBOX'
+		JOIN tags t ON t.id = th.tag_id
+		WHERE th.owner_subject = $1 AND th.status = 'applied'
+		  AND coalesce(m.sent_at, th.created_at) < now() - ((CASE WHEN t.instant_move THEN 0 ELSE $2 END) * interval '1 day')
 		LIMIT 50`,
 		ownerSubject, delayDays,
 	)
 	if err != nil {
-		return
+		// Was silently swallowed before — a query bug here (the $2*interval encoding
+		// issue this comment used to be a `||` concat that broke parameter type
+		// inference) meant auto-move quietly did nothing at all, with no sign anything
+		// was wrong short of an unrelated caller surfacing the same query's error.
+		log.Printf("auto-move tagged mail: %v", err)
+		return 0, nil
 	}
-	type pair struct{ messageID, tagID string }
+	type pair struct{ messageID, tagID, mailID, accountID, sender, subject string }
 	var pairs []pair
 	for rows.Next() {
 		var p pair
-		if rows.Scan(&p.messageID, &p.tagID) == nil {
+		if rows.Scan(&p.messageID, &p.tagID, &p.mailID, &p.accountID, &p.sender, &p.subject) == nil && p.accountID != "" {
 			pairs = append(pairs, p)
 		}
 	}
 	rows.Close()
 
+	moved := 0
+	var details []movedMailDetail
 	for _, p := range pairs {
-		var mailID, accountID string
-		// Only mail still sitting in INBOX is a candidate — already moved, archived, or
-		// deleted means there's nothing left to do, and that's the normal/common case
-		// for most of these rows, not an error.
-		if err := s.db.QueryRow(
-			"SELECT id, coalesce(account_id, '') FROM mails WHERE message_id = $1 AND folder = 'INBOX'", p.messageID,
-		).Scan(&mailID, &accountID); err != nil || accountID == "" {
+		mailID, accountID := p.mailID, p.accountID
+
+		var folder, tagName string
+		if fRows, err := s.db.Query(
+			"SELECT f.folder, t.name FROM folder_tag_rules f JOIN tags t ON t.id = f.tag_id WHERE f.account_id = $1 AND f.tag_id = $2", accountID, p.tagID,
+		); err == nil {
+			count := 0
+			for fRows.Next() {
+				count++
+				fRows.Scan(&folder, &tagName)
+			}
+			fRows.Close()
+			if count != 1 || folder == "INBOX" {
+				// no rule, ambiguous (mapped to more than one folder), or — the case that
+				// actually bit a real mailbox — a rule mapping a tag back to INBOX itself.
+				// This function exists specifically to move mail *out* of inbox; a rule
+				// whose destination is INBOX is nonsensical for it and, worse, used to
+				// cause a same-folder "move" that silently duplicated the message instead
+				// of being a no-op (see moveMailToFolder's own guard for the IMAP-level fix).
+				continue
+			}
+		} else {
 			continue
 		}
 
-		var folders []string
-		if fRows, err := s.db.Query(
-			"SELECT folder FROM folder_tag_rules WHERE account_id = $1 AND tag_id = $2", accountID, p.tagID,
-		); err == nil {
-			for fRows.Next() {
-				var f string
-				if fRows.Scan(&f) == nil {
-					folders = append(folders, f)
-				}
-			}
-			fRows.Close()
-		}
-		if len(folders) != 1 {
-			continue // no rule, or ambiguous (mapped to more than one folder) — don't guess
-		}
-
-		if err := s.moveMailToFolder(mailID, folders[0]); err != nil {
+		if err := s.moveMailToFolder(mailID, folder); err != nil {
 			continue
 		}
 		s.db.Exec("DELETE FROM mails WHERE id = $1", mailID) // matches handleMove's own cleanup after a successful move
+		moved++
+		details = append(details, movedMailDetail{Sender: p.sender, Subject: p.subject, Tag: tagName, Folder: folder})
 	}
+	return moved, details
+}
+
+// handleRunAutoMove triggers autoMoveTaggedMail on demand — it normally only runs
+// opportunistically (piggybacking on a sync), so without this there was no way to see
+// it actually do anything without waiting for new mail to trigger a sync first. Still
+// respects auto_move_delay_days; this doesn't move anything that isn't already old
+// enough, it just doesn't wait for the next sync to check.
+func (s *Store) handleRunAutoMove(w http.ResponseWriter, r *http.Request, owner string) {
+	moved, details := s.autoMoveTaggedMail(owner)
+	writeJSON(w, map[string]any{"moved": moved, "details": details})
 }
 
 // handleApplyTagToFolder backfills a tag onto every mail already sitting in a folder —
