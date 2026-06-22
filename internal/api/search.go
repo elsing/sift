@@ -56,12 +56,19 @@ type searchJob struct {
 func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request, owner string) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	from := strings.TrimSpace(r.URL.Query().Get("from"))
-	if query == "" && from == "" {
-		http.Error(w, "q or from is required", http.StatusBadRequest)
+	since, sinceErr := parseSearchDate(r.URL.Query().Get("since"))
+	before, beforeErr := parseSearchDate(r.URL.Query().Get("before"))
+	if sinceErr != nil || beforeErr != nil {
+		http.Error(w, "since/before must be YYYY-MM-DD", http.StatusBadRequest)
+		return
+	}
+	if query == "" && from == "" && since.IsZero() && before.IsZero() {
+		http.Error(w, "q, from, or a date range is required", http.StatusBadRequest)
 		return
 	}
 	folder := r.URL.Query().Get("folder") // optional: restrict to exactly one folder
 	folders := r.URL.Query()["folders"]   // optional: restrict to a specific chosen set (repeated param)
+	tagIDs := r.URL.Query()["tags"]       // optional: narrow results to mail tagged with any of these
 	deep := r.URL.Query().Get("mode") == "deep"
 	timeout := lightSearchTimeout
 	if deep {
@@ -159,9 +166,14 @@ func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request, owner strin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			mails, err := searchFolder(j.acct, j.password, j.folder, query, from, deep)
+			mails, err := searchFolder(j.acct, j.password, j.folder, query, from, deep, since, before)
 			if err != nil {
 				log.Printf("search %s/%s: %v", j.acct.Email, j.folder, err)
+			}
+			if len(tagIDs) > 0 {
+				// Tags are local-only data IMAP knows nothing about, so this can only ever
+				// narrow an existing text/sender search — not search by tag alone.
+				mails = s.filterByTags(mails, tagIDs)
 			}
 			// Persist every match as soon as it's found, not just whatever survives the
 			// final sort+cap below — mailsFromFetch never sets Mail.AccountID (it's an
@@ -313,7 +325,16 @@ func listFoldersForSearch(acct dbAccount, password string) ([]string, error) {
 // (HEADER, cheap); deep=true searches the full message TEXT (headers + body). from,
 // if set, is ANDed on top as its own From: filter — independent of query, so you can
 // filter by sender alone, or narrow a text search down to one sender.
-func searchFolder(acct dbAccount, password, folder, query, from string, deep bool) ([]Mail, error) {
+// parseSearchDate parses a YYYY-MM-DD date filter, returning a zero time.Time (which
+// the caller treats as "no filter") for an empty string.
+func parseSearchDate(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse("2006-01-02", s)
+}
+
+func searchFolder(acct dbAccount, password, folder, query, from string, deep bool, since, before time.Time) ([]Mail, error) {
 	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
@@ -339,6 +360,12 @@ func searchFolder(acct dbAccount, password, folder, query, from string, deep boo
 	}
 	if from != "" {
 		criteria.Header = append(criteria.Header, imap.SearchCriteriaHeaderField{Key: "From", Value: from})
+	}
+	if !since.IsZero() {
+		criteria.SentSince = since
+	}
+	if !before.IsZero() {
+		criteria.SentBefore = before.AddDate(0, 0, 1) // BEFORE is exclusive — push to end of the chosen day
 	}
 
 	data, err := c.UIDSearch(criteria, nil).Wait()

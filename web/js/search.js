@@ -2,10 +2,11 @@ import { currentFolder, openFolder } from './inbox.js';
 import { getSelectedAccountIds } from './accountFilter.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
 import { renderFolderTree, fetchFolders, cachedFolders, setLoading } from './folders.js';
+import { fetchTags } from './tags.js';
 
 let panel, input, scopeBtn, accountScopeEl, errorEl, results;
 let progressWrap, progressFill, progressText, deepBtn, continueBtn;
-let advancedToggle, advancedPanel, fromInput, folderPickerToggle, folderPicker;
+let advancedToggle, advancedPanel, fromInput, sinceInput, beforeInput, folderPickerToggle, folderPicker, tagFilterEl;
 let searchAllFolders = true; // toggled off via scopeBtn to restrict to the folder you opened search from
 let currentSource = null;
 let matches = [];
@@ -15,6 +16,12 @@ let lastMode = 'light'; // so "Continue" resumes in the same mode the timed-out 
 // the normal all-folders/this-folder-only scope" (the picker is an override, not a
 // second independent scope control).
 const chosenFolders = new Set();
+
+// Tags are local-only data IMAP can't search by — chosen here, they narrow whatever
+// the text/sender search already found, rather than being a standalone "search by
+// tag" (that would mean scanning the whole mailbox with no real query, which doesn't
+// scale any better than the "deep, all folders" case already doesn't).
+const chosenTags = new Set();
 
 export function setupSearch() {
   panel = document.getElementById('searchPanel');
@@ -31,8 +38,11 @@ export function setupSearch() {
   advancedToggle = document.getElementById('advancedSearchToggle');
   advancedPanel = document.getElementById('advancedSearchPanel');
   fromInput = document.getElementById('searchFromInput');
+  sinceInput = document.getElementById('searchSinceInput');
+  beforeInput = document.getElementById('searchBeforeInput');
   folderPickerToggle = document.getElementById('searchFolderPickerToggle');
   folderPicker = document.getElementById('searchFolderPicker');
+  tagFilterEl = document.getElementById('searchTagFilter');
 
   document.getElementById('searchBtn').addEventListener('click', openSearch);
   document.getElementById('closeSearchBtn').addEventListener('click', closeSearch);
@@ -52,6 +62,7 @@ export function setupSearch() {
   advancedToggle.addEventListener('click', () => {
     const showing = advancedPanel.classList.toggle('hidden') === false;
     advancedToggle.textContent = showing ? 'Advanced filters ▴' : 'Advanced filters ▾';
+    if (showing) renderTagFilter();
   });
 
   folderPickerToggle.addEventListener('click', () => openFolderPicker());
@@ -74,11 +85,13 @@ export function setupSearch() {
   };
   input.addEventListener('input', onFilterInput);
   fromInput.addEventListener('input', onFilterInput);
+  sinceInput.addEventListener('change', onFilterInput);
+  beforeInput.addEventListener('change', onFilterInput);
 }
 
-// A search needs free text, a sender filter, or both — not necessarily both.
+// A search needs free text, a sender filter, a date range, or some mix — not all of them.
 function hasQuery() {
-  return input.value.trim() !== '' || fromInput.value.trim() !== '';
+  return input.value.trim() !== '' || fromInput.value.trim() !== '' || sinceInput.value !== '' || beforeInput.value !== '';
 }
 
 // Folder picker only really makes sense scoped to one account (folder names are
@@ -122,8 +135,34 @@ async function openFolderPicker() {
   }
 }
 
+async function renderTagFilter() {
+  let tags;
+  try {
+    tags = await fetchTags();
+  } catch {
+    return;
+  }
+  tagFilterEl.innerHTML = '';
+  if (tags.length === 0) return;
+  for (const tag of tags) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'account-chip' + (chosenTags.has(tag.id) ? ' active' : '');
+    chip.style.borderColor = tag.color;
+    if (chosenTags.has(tag.id)) chip.style.background = tag.color;
+    chip.textContent = tag.name;
+    chip.addEventListener('click', () => {
+      if (chosenTags.has(tag.id)) chosenTags.delete(tag.id);
+      else chosenTags.add(tag.id);
+      renderTagFilter();
+    });
+    tagFilterEl.appendChild(chip);
+  }
+}
+
 function openSearch() {
   panel.classList.remove('hidden');
+  chosenTags.clear();
   // default to "this folder" if search was opened while browsing one — almost always
   // what you mean by searching from there, with the all-folders toggle one tap away
   searchAllFolders = !currentFolder;
@@ -135,6 +174,8 @@ function openSearch() {
   }
   input.value = '';
   fromInput.value = '';
+  sinceInput.value = '';
+  beforeInput.value = '';
   chosenFolders.clear();
   advancedPanel.classList.add('hidden');
   advancedToggle.textContent = 'Advanced filters ▾';
@@ -195,7 +236,9 @@ async function updateAccountScopeLabel() {
 function startSearch(mode, resumeToken) {
   const q = input.value.trim();
   const from = fromInput.value.trim();
-  if (!q && !from) return;
+  const since = sinceInput.value;
+  const before = beforeInput.value;
+  if (!q && !from && !since && !before) return;
   stopSearch();
   lastMode = mode;
   errorEl.textContent = '';
@@ -214,6 +257,8 @@ function startSearch(mode, resumeToken) {
   const params = new URLSearchParams({ mode });
   if (q) params.set('q', q);
   if (from) params.set('from', from);
+  if (since) params.set('since', since);
+  if (before) params.set('before', before);
   const accountIds = getSelectedAccountIds();
   if (accountIds) params.set('accounts', accountIds.join(','));
   // an explicit folder picker selection overrides the simpler all-folders/this-folder
@@ -223,6 +268,7 @@ function startSearch(mode, resumeToken) {
   } else if (!searchAllFolders && currentFolder) {
     params.set('folder', currentFolder.path);
   }
+  for (const tagId of chosenTags) params.append('tags', tagId);
   if (resumeToken) params.set('resume', resumeToken);
 
   const source = new EventSource(`/api/search?${params}`);

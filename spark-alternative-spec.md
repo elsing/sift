@@ -38,3 +38,6 @@ Explicitly **out of scope** for this phase: auth, real IMAP/Gmail sync, search, 
 
 ## Success criteria for this phase
 Elliot can add it to his iOS home screen, swipe through ~15-20 mock emails, and have a clear gut feeling on whether the gesture/haptic gap vs native is a dealbreaker or acceptable — informing whether to continue with PWA or pivot to native (SwiftUI).
+
+## Later additions
+This file is frozen at Phase 1. Built since: full manual + smart auto-tagging — see [docs/smart-tagging.md](docs/smart-tagging.md).

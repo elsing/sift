@@ -238,5 +238,19 @@ func (s *Store) notifyNewMail(accountID string, mails []Mail) {
 		log.Printf("notify new mail %s: %v", accountID, err)
 		return
 	}
-	s.notifyOwner(owner, newest.Sender, newest.Subject, newest.ID)
+
+	// The notification's collapsed view shows just the first line regardless, but
+	// long-pressing/expanding it had nothing more to show than the subject already
+	// visible — fetch a short body preview so there's actually something to "pull".
+	// Best-effort: a slow/failed fetch here just means a plainer notification, not a
+	// missed one.
+	body := newest.Subject
+	if acct, password, err := s.loadAccountCreds(accountID); err == nil {
+		if mb, err := fetchMailBody(acct, password, newest.Folder, newest.UID); err == nil {
+			if preview := snippetFromBody(mb, 200); preview != "" {
+				body = newest.Subject + "\n" + preview
+			}
+		}
+	}
+	s.notifyOwner(owner, newest.Sender, body, newest.ID)
 }

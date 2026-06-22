@@ -1,29 +1,37 @@
-import { fetchMails, render, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setHandlers, setupLiveUpdates } from './inbox.js';
+import { fetchMails, render, setupPullToRefresh, setupInfiniteScroll, setupFolderBanner, setupTagGroupBanner, setHandlers, setupLiveUpdates, setupOverlayScrollLock, setupTapTopToScroll } from './inbox.js';
 import { setupFolderSheet, openMoveModal, openFolderBrowser } from './folders.js';
-import { setupMailReader, openMailReader, openMailReaderById } from './reader.js';
+import { setupMailReader, setupTagSheet, openMailReader, openMailReaderById, openTagSheetForRow } from './reader.js';
 import { setupAccountsPanel } from './accounts.js';
-import { setupThemeOptions, setupDryRunToggle, setupPaletteSwatches, setupSettingsPanel } from './settings.js';
+import { setupThemeOptions, setupDryRunToggle, setupPaletteSwatches, setupSettingsPanel, setupSwipeOptions, setupTagManager } from './settings.js';
 import { setupPushNotifications } from './push.js';
 import { setupAccountFilter } from './accountFilter.js';
 import { setupSearch } from './search.js';
+import { setupSmartTaggingPanel } from './smarttags.js';
 
-setHandlers({ onMove: openMoveModal, onTap: openMailReader });
+setHandlers({ onMove: openMoveModal, onTap: openMailReader, onTag: openTagSheetForRow });
 
 fetchMails().then(render);
 setupPullToRefresh();
 setupInfiniteScroll();
 setupFolderSheet();
 setupFolderBanner();
+setupTagGroupBanner();
+setupOverlayScrollLock();
+setupTapTopToScroll();
 setupMailReader();
+setupTagSheet();
 setupThemeOptions();
 setupPaletteSwatches();
 setupSettingsPanel();
+setupSwipeOptions();
+setupTagManager();
 setupDryRunToggle();
 setupAccountsPanel();
 setupLiveUpdates();
 setupPushNotifications();
 setupAccountFilter();
 setupSearch();
+setupSmartTaggingPanel();
 
 document.getElementById('foldersBtn').addEventListener('click', openFolderBrowser);
 

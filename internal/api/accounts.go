@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
@@ -209,16 +210,31 @@ func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	mails, err := fetchFolderMail(acct, password, folder, pageSize)
+	beforeUID, _ := strconv.ParseUint(r.URL.Query().Get("beforeUid"), 10, 32)
+	mails, err := fetchFolderMail(acct, password, folder, pageSize, uint32(beforeUID))
 	if err != nil {
 		log.Printf("folder mails %s/%s: %v", acct.Email, folder, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// mailsFromFetch never sets AccountID on the Mail structs it builds (every other
+	// caller tracks it separately and feeds it to upsertMails as its own parameter) —
+	// but the client needs it on the mail object itself to know which account's
+	// folders to offer for Move. Without this, currentMail.accountId was always empty
+	// for anything opened from a folder view, and the reader's Move button silently
+	// did nothing.
+	for i := range mails {
+		mails[i].AccountID = id
+	}
 	// persist so archive/delete/move/read endpoints (which look mail up by id) work
 	// the same inside a folder view as they do in the inbox.
 	if err := s.upsertMails(id, mails); err != nil {
 		log.Printf("cache folder mails %s/%s: %v", acct.Email, folder, err)
+	}
+	// the inbox list path (list()) does this too — folder mail just never picked it up
+	// when this endpoint was first written, so tag chips silently never showed here.
+	if err := s.attachTags(mails); err != nil {
+		log.Printf("attach tags %s/%s: %v", acct.Email, folder, err)
 	}
 	writeJSON(w, mails)
 }
@@ -229,7 +245,7 @@ func (s *Store) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	mails, err := s.list(0, pageSize, nil)
+	mails, err := s.list(pageSize, nil, "", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -253,6 +269,25 @@ func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 		return nil, syncErr
 	}
 
+	// Smart-tagging needs to know which of these are genuinely new, not just a resync
+	// of mail already seen — upsertMails' ON CONFLICT DO UPDATE can't tell new from
+	// re-synced on its own. UIDs only increase within a mailbox (the same invariant
+	// notifyNewMail already relies on), so anything above the watermark from last time
+	// is new. Read it before upserting, evaluate after, so a slow scorer never delays
+	// the mail actually showing up.
+	var lastSeenUID *int64
+	s.db.QueryRow("SELECT last_seen_uid FROM accounts WHERE id = $1", accountID).Scan(&lastSeenUID)
+	var newMails []Mail
+	var maxUID uint32
+	for _, m := range mails {
+		if lastSeenUID == nil || int64(m.UID) > *lastSeenUID {
+			newMails = append(newMails, m)
+		}
+		if m.UID > maxUID {
+			maxUID = m.UID
+		}
+	}
+
 	if err := s.upsertMails(accountID, mails); err != nil {
 		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), accountID)
 		return nil, err
@@ -266,6 +301,24 @@ func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 		)
 	} else {
 		s.db.Exec("UPDATE accounts SET last_sync_error = NULL WHERE id = $1", accountID)
+	}
+	if maxUID > 0 {
+		s.db.Exec(
+			"UPDATE accounts SET last_seen_uid = GREATEST(coalesce(last_seen_uid, 0), $1) WHERE id = $2",
+			int64(maxUID), accountID,
+		)
+	}
+	// On an account's first-ever sync lastSeenUID is nil, so nothing counts as "new" —
+	// deliberately avoids flooding suggestions against the whole pre-existing inbox the
+	// moment an account is added.
+	if lastSeenUID != nil && len(newMails) > 0 {
+		s.evaluateNewMailForSmartTags(accountID, newMails)
+	}
+	// Not gated on new mail — this is about time elapsed since tagging, not what just
+	// arrived, so it should run every sync regardless.
+	var ownerSubject string
+	if s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&ownerSubject) == nil {
+		s.autoMoveTaggedMail(ownerSubject)
 	}
 	return mails, nil
 }
@@ -284,13 +337,13 @@ func (s *Store) upsertMails(accountID string, mails []Mail) error {
 	for _, m := range mails {
 		sentAt, _ := time.Parse(time.RFC3339, m.Date)
 		_, err := tx.Exec(`
-			INSERT INTO mails (id, account_id, sender, sender_email, subject, snippet, time, unread, uid, folder, sent_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			INSERT INTO mails (id, account_id, sender, sender_email, subject, snippet, time, unread, uid, folder, sent_at, message_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (id) DO UPDATE SET
 				sender = excluded.sender, sender_email = excluded.sender_email, subject = excluded.subject,
 				snippet = excluded.snippet, time = excluded.time, unread = excluded.unread,
-				uid = excluded.uid, folder = excluded.folder, sent_at = excluded.sent_at`,
-			m.ID, accountID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, m.UID, m.Folder, sentAt,
+				uid = excluded.uid, folder = excluded.folder, sent_at = excluded.sent_at, message_id = excluded.message_id`,
+			m.ID, accountID, m.Sender, m.SenderEmail, m.Subject, m.Snippet, m.Time, m.Unread, m.UID, m.Folder, sentAt, m.MessageID,
 		)
 		if err != nil {
 			return err
@@ -331,8 +384,10 @@ func (s *Store) resolveFolders(accountID string) (archive, trash string, err err
 func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	var accountID *string
 	var uid *int64
-	var sourceFolder string
-	err := s.db.QueryRow("SELECT account_id, uid, folder FROM mails WHERE id = $1", mailID).Scan(&accountID, &uid, &sourceFolder)
+	var sourceFolder, messageID string
+	err := s.db.QueryRow(
+		"SELECT account_id, uid, folder, coalesce(message_id, '') FROM mails WHERE id = $1", mailID,
+	).Scan(&accountID, &uid, &sourceFolder, &messageID)
 	if err != nil {
 		return err
 	}
@@ -343,7 +398,11 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if err != nil {
 		return err
 	}
-	return moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), sourceFolder, destFolder)
+	if err := moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), sourceFolder, destFolder); err != nil {
+		return err
+	}
+	s.applyFolderTagRule(*accountID, destFolder, messageID)
+	return nil
 }
 
 // archiveOrDeleteOnServer moves a mail to the account's Archive/Trash folder for the

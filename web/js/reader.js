@@ -1,17 +1,42 @@
 import { dryRunHeaders } from './util.js';
-import { getMailById } from './inbox.js';
+import { getMailById, updateMailTags, removeMailById, render } from './inbox.js';
+import { fetchTags, createTag, getMailTags, setMailTags, renderTagChips, fetchTagHistory, renderSuggestionChips } from './tags.js';
+import { openMoveModalForMail } from './folders.js';
 
-let mailReaderPanel, mailReaderBody, mailReaderHtml, mailReaderSubject, mailReaderSender, mailReaderTime;
+let mailReaderPanel, mailReaderScroll, mailReaderBody, mailReaderHtml, mailReaderHtmlWrap, mailReaderLoading, mailReaderLoadingQuip, mailReaderSubject, mailReaderSender, mailReaderTime, mailReaderTags;
 
-// Real email HTML routinely has fixed-pixel-width tables/layouts (the classic 600px
-// newsletter table) built for desktop, with no idea it'll ever render in a narrow
-// iframe — without this, that forces horizontal scroll on a phone. Prepended ahead of
-// whatever the message contains; later, more specific author CSS in the message can
-// still override anything here that isn't !important.
-const RESPONSIVE_RESET = `<style>
+// Shown while a mail's body is loading — every single email open hits this, however
+// briefly, so it's worth being a bit more fun than a bare spinner.
+const LOADING_QUIPS = [
+  'Decrypting secrets…', 'Untangling the HTML…', 'Waking up the hamsters…',
+  'Politely knocking on the mail server…', 'Summoning pixels…', 'Reticulating splines…',
+  'Bribing the inbox gremlins…', 'Unfolding the paper airplane…',
+];
+let currentMailId = null;
+// Full mail data for whatever's currently open — not just relying on inbox.js's
+// mails array, since this can be opened from search/a deep link, where the mail was
+// never in that array at all. Needed for the action buttons (Move needs accountId).
+let currentMail = null;
+
+// Real email HTML routinely has fixed-pixel-width layouts (the classic 600px
+// newsletter table, but plenty of newer templates use fixed-width divs instead of
+// tables) built for desktop, with no idea it'll ever render in a narrow iframe —
+// without this, that forces horizontal scroll on a phone. Clamping every element
+// rather than just table/img, since a fixed-width div is just as common a culprit.
+// Prepended ahead of whatever the message contains; later, more specific author CSS
+// in the message can still override anything here that isn't !important.
+// <base target="_blank"> is plain HTML, no script needed — without it, tapping a link
+// navigates the iframe itself away from the email to whatever site it points at. Most
+// of the time that just looks broken; sites that refuse to be framed (e.g. Medium sets
+// frame-ancestors) actively block it, leaving Chrome's blank error page sitting where
+// the email used to be. Sandbox needs allow-popups too, or this has nothing to open
+// into — see the sandbox attribute on the iframe itself.
+const RESPONSIVE_RESET = `<base target="_blank"><style>
   html, body { max-width: 100%; overflow-x: hidden; word-wrap: break-word; }
-  img, table { max-width: 100% !important; height: auto !important; }
-  table { width: auto !important; }
+  * { max-width: 100% !important; box-sizing: border-box !important; }
+  img, table { height: auto !important; }
+  table { table-layout: auto !important; }
+  td, th { white-space: normal !important; }
 </style>`;
 
 // One-shot hook for "where did opening this mail come from". Defaults to nothing extra
@@ -25,18 +50,79 @@ export function setReaderBack(fn) {
 
 export function setupMailReader() {
   mailReaderPanel = document.getElementById('mailReaderPanel');
+  mailReaderScroll = document.getElementById('mailReaderScroll');
   mailReaderBody = document.getElementById('mailReaderBody');
   mailReaderHtml = document.getElementById('mailReaderHtml');
+  mailReaderHtmlWrap = document.getElementById('mailReaderHtmlWrap');
+  mailReaderLoading = document.getElementById('mailReaderLoading');
+  mailReaderLoadingQuip = document.getElementById('mailReaderLoadingQuip');
   mailReaderSubject = document.getElementById('mailReaderSubject');
   mailReaderSender = document.getElementById('mailReaderSender');
   mailReaderTime = document.getElementById('mailReaderTime');
-  document.getElementById('mailReaderBack').addEventListener('click', () => {
-    mailReaderPanel.classList.add('hidden');
-    mailReaderHtml.removeAttribute('srcdoc'); // stop any media/connections the message kicked off
-    const cb = onBack;
-    onBack = null;
-    if (cb) cb();
+  mailReaderTags = document.getElementById('mailReaderTags');
+  document.getElementById('mailReaderTagsBtn').addEventListener('click', () => openTagSheet(currentMailId));
+  document.getElementById('mailReaderBack').addEventListener('click', () => closeReaderPanel());
+
+  document.getElementById('mailReaderArchiveBtn').addEventListener('click', () => performReaderAction('archive'));
+  document.getElementById('mailReaderDeleteBtn').addEventListener('click', () => performReaderAction('delete'));
+  document.getElementById('mailReaderUnreadBtn').addEventListener('click', async () => {
+    const id = currentMailId;
+    // opening always marks read first, so this button only ever means "flip it back
+    // to unread" — the endpoint itself is a toggle, but that's the only direction it
+    // can realistically go from here
+    await fetch(`/api/mails/${id}/read`, { method: 'POST', headers: dryRunHeaders() });
+    const mail = getMailById(id);
+    if (mail) mail.unread = true;
+    render();
+    closeReaderPanel();
   });
+  document.getElementById('mailReaderMoveBtn').addEventListener('click', () => {
+    if (!currentMail || !currentMail.accountId) return; // mock mail has no real folders to move into
+    const id = currentMailId;
+    openMoveModalForMail(currentMail.accountId, id, () => {
+      removeMailById(id);
+      render();
+      closeReaderPanel();
+    });
+  });
+
+  // iOS's native "tap the status bar to scroll to top" only ever reaches the
+  // document's own scroll — this panel is a position:fixed overlay with its own
+  // separate scroll (.mail-reader-scroll), which that gesture can't touch at all.
+  // Tapping the header is the conventional substitute apps use for exactly this
+  // situation. (A plain-text body scrolls with that container and this reaches it; an
+  // HTML email now renders at full natural size and is scaled to fit rather than
+  // scrolling internally, so this reaches that too.)
+  document.getElementById('mailReaderHeader').addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    mailReaderScroll.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+}
+
+function closeReaderPanel() {
+  mailReaderPanel.classList.add('hidden');
+  mailReaderHtml.removeAttribute('srcdoc'); // stop any media/connections the message kicked off
+  const cb = onBack;
+  onBack = null;
+  if (cb) cb();
+}
+
+// Archive/delete from the reader, not just by swiping the inbox row — there was no
+// way to act on a mail at all once you'd actually opened it.
+async function performReaderAction(action) {
+  const id = currentMailId;
+  try {
+    const res = await fetch(`/api/mails/${id}/${action}`, { method: 'POST', headers: dryRunHeaders() });
+    if (!res.ok) throw new Error((await res.text()) || `${action} failed`);
+  } catch (err) {
+    // the server didn't actually do it (e.g. no Trash/Archive folder found) — leave
+    // the reader open rather than closing it and pretending the action worked
+    console.error(err);
+    return;
+  }
+  removeMailById(id);
+  render();
+  closeReaderPanel();
 }
 
 // Tapping the sender's name reveals the real address next to it (animated open) with
@@ -77,7 +163,9 @@ function renderSender(mail) {
 export async function openMailReader(row) {
   onBack = null; // plain inbox-row tap — Back just closes, no special destination
   const id = row.dataset.id;
+  currentMailId = id;
   const mail = getMailById(id) || {};
+  currentMail = mail;
   showMailMeta(mail);
 
   if (row.classList.contains('unread')) {
@@ -93,13 +181,17 @@ export async function openMailReader(row) {
 // since that mail may not be on the currently-loaded page (or in the inbox at all).
 export async function openMailReaderById(id) {
   onBack = null; // caller sets a destination via setReaderBack right after, if it wants one
+  currentMailId = id;
   showMailMeta({});
   const metaRes = await fetch(`/api/mails/${id}`);
   if (!metaRes.ok) {
+    mailReaderLoading.classList.add('hidden');
+    mailReaderBody.classList.remove('hidden');
     mailReaderBody.textContent = await metaRes.text();
     return;
   }
   const mail = await metaRes.json();
+  currentMail = mail;
   showMailMeta(mail);
 
   if (mail.unread) {
@@ -113,26 +205,210 @@ function showMailMeta(mail) {
   mailReaderSubject.textContent = mail.subject || '';
   renderSender(mail);
   mailReaderTime.textContent = mail.time || '';
-  mailReaderBody.textContent = 'Loading…';
-  mailReaderBody.classList.remove('hidden');
-  mailReaderHtml.classList.add('hidden');
+  mailReaderTags.innerHTML = '';
+  const chips = renderTagChips(mail.tags);
+  if (chips) mailReaderTags.appendChild(chips);
+  loadSuggestionChips();
+  mailReaderLoadingQuip.textContent = LOADING_QUIPS[Math.floor(Math.random() * LOADING_QUIPS.length)];
+  mailReaderLoading.classList.remove('hidden');
+  mailReaderBody.classList.add('hidden');
+  mailReaderHtmlWrap.classList.add('hidden');
   mailReaderPanel.classList.remove('hidden');
+  mailReaderScroll.scrollTop = 0; // don't carry over scroll position from whatever was open before
+}
+
+// Pending smart-tag suggestions for whatever's currently open, shown alongside applied
+// tags rather than replacing them — accepting/dismissing just re-fetches both since
+// either action changes what counts as "applied" or "still pending".
+async function loadSuggestionChips() {
+  const id = currentMailId;
+  let suggestions;
+  try {
+    suggestions = await fetchTagHistory('suggested', id);
+  } catch {
+    return; // best-effort — no suggestions shown is a safe fallback, not an error to surface
+  }
+  if (id !== currentMailId) return; // the reader moved on to a different mail while this was in flight
+  const chips = renderSuggestionChips(suggestions, () => {
+    if (id === currentMailId) {
+      getMailTags(id).then((tags) => {
+        mailReaderTags.innerHTML = '';
+        const tagChips = renderTagChips(tags);
+        if (tagChips) mailReaderTags.appendChild(tagChips);
+        loadSuggestionChips();
+        updateMailTags(id, tags);
+      });
+    }
+  });
+  if (chips) mailReaderTags.appendChild(chips);
+}
+
+let tagSheetModal, tagSheetList, tagSheetError, tagNameInput;
+
+export function setupTagSheet() {
+  tagSheetModal = document.getElementById('tagSheetModal');
+  tagSheetList = document.getElementById('tagSheetList');
+  tagSheetError = document.getElementById('tagSheetError');
+  tagNameInput = document.getElementById('tagNameInput');
+
+  document.getElementById('tagSheetClose').addEventListener('click', closeTagSheet);
+  tagSheetModal.addEventListener('click', (e) => {
+    if (e.target === tagSheetModal) closeTagSheet();
+  });
+
+  document.getElementById('tagCreateForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = tagNameInput.value.trim();
+    if (!name) return;
+    tagSheetError.textContent = '';
+    try {
+      const tag = await createTag(name);
+      tagNameInput.value = '';
+      // a freshly created tag is presumably what you meant to apply right now
+      const current = await getMailTags(currentMailId);
+      const tagIds = current.map((t) => t.id);
+      tagIds.push(tag.id);
+      const updated = await setMailTags(currentMailId, tagIds);
+      renderTagSheetRows(await fetchTags(true), updated);
+      refreshReaderTags(updated);
+    } catch (err) {
+      tagSheetError.textContent = err.message;
+    }
+  });
+}
+
+function closeTagSheet() {
+  tagSheetModal.classList.add('hidden');
+}
+
+// Used both by the reader's own Tags button and the "tag" swipe action — swiping
+// doesn't open the full reader, just this picker, and the row stays in the inbox
+// (tagging isn't a remove-from-list action like archive/delete/move).
+export function openTagSheetForRow(row) {
+  currentMailId = row.dataset.id;
+  openTagSheet(row.dataset.id);
+}
+
+async function openTagSheet(mailId) {
+  if (!mailId) return;
+  tagSheetModal.classList.remove('hidden');
+  tagSheetError.textContent = '';
+  tagNameInput.value = '';
+  tagSheetList.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
+  try {
+    const [allTags, mailTags] = await Promise.all([fetchTags(), getMailTags(mailId)]);
+    renderTagSheetRows(allTags, mailTags);
+  } catch (err) {
+    tagSheetList.innerHTML = '';
+    tagSheetError.textContent = err.message;
+  }
+}
+
+function renderTagSheetRows(allTags, mailTags) {
+  const checked = new Set(mailTags.map((t) => t.id));
+  tagSheetList.innerHTML = '';
+  if (allTags.length === 0) {
+    tagSheetList.innerHTML = '<li class="folder-empty-status">No tags yet — add one above.</li>';
+    return;
+  }
+  for (const tag of allTags) {
+    const li = document.createElement('li');
+    li.className = 'tag-sheet-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.id = 'tagrow-' + tag.id;
+    checkbox.checked = checked.has(tag.id);
+    const dot = document.createElement('span');
+    dot.className = 'tag-sheet-dot';
+    dot.style.background = tag.color;
+    const label = document.createElement('label');
+    label.htmlFor = checkbox.id;
+    label.textContent = tag.name;
+    li.append(checkbox, dot, label);
+    checkbox.addEventListener('change', async () => {
+      if (checkbox.checked) checked.add(tag.id);
+      else checked.delete(tag.id);
+      const updated = await setMailTags(currentMailId, Array.from(checked));
+      refreshReaderTags(updated);
+    });
+    tagSheetList.appendChild(li);
+  }
+}
+
+// Updates the chips shown in the open reader right away, without waiting for the
+// inbox row underneath to catch up (it'll show the change next time it reloads).
+function refreshReaderTags(tags) {
+  mailReaderTags.innerHTML = '';
+  const chips = renderTagChips(tags);
+  if (chips) mailReaderTags.appendChild(chips);
+  // also patches the inbox row underneath, whether this came from the reader's Tags
+  // button or the swipe-to-tag action (which never opens the reader at all)
+  updateMailTags(currentMailId, tags);
 }
 
 async function loadMailBody(id) {
   const res = await fetch(`/api/mails/${id}/body`);
+  mailReaderLoading.classList.add('hidden');
   if (!res.ok) {
+    mailReaderBody.classList.remove('hidden');
     mailReaderBody.textContent = await res.text();
     return;
   }
   const data = await res.json();
   if (data.html) {
-    // sandboxed with no tokens at all: no script execution, no same-origin access —
-    // this is untrusted content, so render it but never let it run anything.
+    // sandbox="allow-same-origin" only (no allow-scripts) — embedded scripts still
+    // can't execute, but the parent can read the iframe's own DOM to size it to its
+    // content instead of trapping the email in its own internally-scrolling box.
     mailReaderBody.classList.add('hidden');
-    mailReaderHtml.classList.remove('hidden');
+    mailReaderHtmlWrap.classList.remove('hidden');
+    mailReaderHtml.style.width = '';
+    mailReaderHtml.style.transform = '';
+    mailReaderHtml.onload = resizeMailReaderIframe;
     mailReaderHtml.srcdoc = RESPONSIVE_RESET + data.html;
   } else {
+    mailReaderBody.classList.remove('hidden');
     mailReaderBody.textContent = data.text || '(no readable body)';
   }
+}
+
+let mailReaderResizeObserver = null;
+
+function resizeMailReaderIframe() {
+  let doc;
+  try {
+    doc = mailReaderHtml.contentDocument;
+  } catch {
+    return; // shouldn't happen with allow-same-origin, but fall back to internal scroll if it does
+  }
+  if (!doc || !doc.documentElement) return;
+  const root = doc.documentElement;
+
+  // Measured once, while the iframe is still at the wrapper's (cramped, mobile) width —
+  // some email HTML, rigid newsletter footers especially, has elements that just won't
+  // shrink no matter what CSS gets injected into them, so this reports how wide the
+  // content actually wants to be, overflow and all. Re-rendering the iframe at exactly
+  // that width gives every element all the room it wants (nothing left to clip or wrap
+  // awkwardly), then a CSS transform visually scales the whole thing back down to fit —
+  // the same trick a "fit to screen" zoom does, rather than fighting each fixed-width
+  // newsletter footer's CSS one quirk at a time.
+  const naturalWidth = root.scrollWidth;
+  const available = mailReaderHtmlWrap.clientWidth;
+  const scale = naturalWidth > available ? available / naturalWidth : 1;
+  mailReaderHtml.style.width = naturalWidth + 'px';
+  mailReaderHtml.style.transform = scale < 1 ? `scale(${scale})` : '';
+
+  const resizeHeight = () => {
+    mailReaderHtml.style.height = root.scrollHeight + 'px';
+    // the transform shrinks the iframe visually without affecting layout flow on its
+    // own — without an explicit height here, the page would reserve the iframe's full
+    // unscaled height's worth of space, leaving a tall blank gap below the shrunk email.
+    mailReaderHtmlWrap.style.height = (root.scrollHeight * scale) + 'px';
+  };
+  resizeHeight();
+
+  // Images load asynchronously and can grow the content well after the load event
+  // fires — keep tracking height as that happens, not just once.
+  if (mailReaderResizeObserver) mailReaderResizeObserver.disconnect();
+  mailReaderResizeObserver = new ResizeObserver(resizeHeight);
+  mailReaderResizeObserver.observe(root);
 }

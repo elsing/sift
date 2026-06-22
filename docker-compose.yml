@@ -2,12 +2,19 @@ services:
   db:
     image: postgres:17-alpine
     env_file: .env
+    environment:
+      # env_file alone has no notion of a default — it just passes through whatever's
+      # in .env (or nothing). These two are plain identifiers, not secrets, so a
+      # fallback is fine; POSTGRES_PASSWORD deliberately has none — defaulting a
+      # password would undo the point of moving it out of this file in the first place.
+      POSTGRES_USER: ${POSTGRES_USER:-mailapp}
+      POSTGRES_DB: ${POSTGRES_DB:-mailapp}
     expose:
       - "5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mailapp}"]
       interval: 2s
       timeout: 5s
       retries: 10
@@ -18,7 +25,7 @@ services:
     environment:
       # the only one not a direct passthrough from .env — composed from the Postgres
       # vars above, which env_file already injected
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-mailapp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mailapp}?sslmode=disable
     ports:
       - "8080:8080"
     depends_on:

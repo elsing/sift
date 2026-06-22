@@ -136,21 +136,66 @@ export function renderFolderTree(nodes, opts = {}) {
   return ul;
 }
 
-let sheetModal, sheetBody, sheetError, sheetTitle;
+let sheetModal, sheetBody, sheetError, sheetTitle, sheetSearch;
 
 export function setupFolderSheet() {
   sheetModal = document.getElementById('folderSheetModal');
   sheetBody = document.getElementById('folderSheetBody');
   sheetError = document.getElementById('folderSheetError');
   sheetTitle = document.getElementById('folderSheetTitle');
+  sheetSearch = document.getElementById('folderSheetSearch');
   document.getElementById('folderSheetClose').addEventListener('click', closeFolderSheet);
   closeOnBackdropTap(sheetModal, closeFolderSheet);
+  sheetSearch.addEventListener('input', () => renderCurrentTree());
 }
 
 function closeFolderSheet() {
   sheetModal.classList.add('hidden');
   sheetBody.innerHTML = '';
   sheetError.textContent = '';
+  sheetSearch.value = '';
+}
+
+// Keeps only nodes whose name matches (case-insensitive substring), plus any ancestor
+// needed to reach a match — a folder with no matching name but a matching descendant
+// still has to show up, just to contain it.
+function filterTree(nodes, term) {
+  const result = [];
+  for (const node of nodes) {
+    const selfMatch = node.name.toLowerCase().includes(term);
+    const filteredChildren = node.children ? filterTree(node.children, term) : [];
+    if (selfMatch || filteredChildren.length > 0) {
+      result.push({ ...node, children: filteredChildren });
+    }
+  }
+  return result;
+}
+
+// Every remaining branch in a filtered tree should render expanded — there's no point
+// filtering down to a match and then still requiring a manual tap to reveal it.
+function collectBranchPaths(nodes, set) {
+  for (const node of nodes) {
+    if (node.children && node.children.length > 0) {
+      set.add(node.path);
+      collectBranchPaths(node.children, set);
+    }
+  }
+}
+
+let lastFolders = null, lastTreeOpts = null;
+
+function renderCurrentTree() {
+  if (!lastFolders) return;
+  const term = sheetSearch.value.trim().toLowerCase();
+  sheetBody.innerHTML = '';
+  if (!term) {
+    sheetBody.appendChild(renderFolderTree(lastFolders, lastTreeOpts));
+    return;
+  }
+  const filtered = filterTree(lastFolders, term);
+  const expandedSet = new Set();
+  collectBranchPaths(filtered, expandedSet);
+  sheetBody.appendChild(renderFolderTree(filtered, { ...lastTreeOpts, expandedSet }));
 }
 
 // Shows one account's folder tree in the shared sheet, cache-then-network. treeOpts is
@@ -159,10 +204,12 @@ function showFolderSheet(accountId, title, treeOpts) {
   sheetModal.classList.remove('hidden');
   sheetTitle.textContent = title;
   sheetError.textContent = '';
+  sheetSearch.value = '';
 
   const render = (folders) => {
-    sheetBody.innerHTML = '';
-    sheetBody.appendChild(renderFolderTree(folders, treeOpts));
+    lastFolders = folders;
+    lastTreeOpts = treeOpts;
+    renderCurrentTree();
   };
 
   const cached = folderCache.get(accountId);
@@ -182,13 +229,10 @@ function showFolderSheet(accountId, title, treeOpts) {
     });
 }
 
-export async function openMoveModal(row, direction = 'left') {
-  row.dataset.moveDirection = direction;
-  const accountId = row.dataset.accountId;
-
-  // Match whatever's expanded in the Folder Browser for this account — without this,
-  // the move picker always opened fully collapsed regardless of where you'd actually
-  // navigated to elsewhere, which felt like it had no memory of its own.
+// Match whatever's expanded in the Folder Browser for this account — without this,
+// every picker opened fully collapsed regardless of where you'd actually navigated to
+// elsewhere, which felt like it had no memory of its own.
+async function loadExpandedFolders(accountId) {
   let expandedSet = new Set();
   try {
     const res = await fetch('/api/accounts');
@@ -198,8 +242,23 @@ export async function openMoveModal(row, direction = 'left') {
       if (account) expandedSet = new Set(account.expandedFolders || []);
     }
   } catch {
-    // best-effort — worst case the tree just opens collapsed, same as before this fix
+    // best-effort — worst case the tree just opens collapsed
   }
+  return expandedSet;
+}
+
+function persistExpandedFolders(accountId, expandedSet) {
+  fetch(`/api/accounts/${accountId}/expanded-folders`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths: Array.from(expandedSet) }),
+  });
+}
+
+export async function openMoveModal(row, direction = 'left') {
+  row.dataset.moveDirection = direction;
+  const accountId = row.dataset.accountId;
+  const expandedSet = await loadExpandedFolders(accountId);
 
   showFolderSheet(accountId, 'Move to…', {
     onSelect: (path) => moveRowToFolder(row, path),
@@ -207,11 +266,38 @@ export async function openMoveModal(row, direction = 'left') {
     onToggle: (path, isExpanded) => {
       if (isExpanded) expandedSet.add(path);
       else expandedSet.delete(path);
-      fetch(`/api/accounts/${accountId}/expanded-folders`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: Array.from(expandedSet) }),
-      });
+      persistExpandedFolders(accountId, expandedSet);
+    },
+  });
+}
+
+// Same picker, but for the mail reader's Move button — there's no swipeable row to
+// animate (the mail might not even be in the currently-loaded list, e.g. opened via
+// search or a deep link), so this just calls the move API directly and lets the
+// caller decide what happens next.
+export async function openMoveModalForMail(accountId, mailId, onMoved) {
+  const expandedSet = await loadExpandedFolders(accountId);
+
+  showFolderSheet(accountId, 'Move to…', {
+    expandedSet,
+    onSelect: async (path) => {
+      closeFolderSheet();
+      try {
+        const res = await fetch(`/api/mails/${mailId}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...dryRunHeaders() },
+          body: JSON.stringify({ folder: path }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        onMoved();
+      } catch (err) {
+        console.error(err);
+      }
+    },
+    onToggle: (path, isExpanded) => {
+      if (isExpanded) expandedSet.add(path);
+      else expandedSet.delete(path);
+      persistExpandedFolders(accountId, expandedSet);
     },
   });
 }

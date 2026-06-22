@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"io"
 	"net"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -153,14 +155,47 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 			Unread:      !slices.Contains(m.Flags, imap.FlagSeen),
 			UID:         uint32(m.UID),
 			Folder:      folder,
+			MessageID:   m.Envelope.MessageID,
 		})
 	}
 	return mails, oldestUID
 }
 
+// fetchMessageID looks up a single message's Message-ID header live — used to
+// backfill mails.message_id for a row cached before that column was tracked.
+func fetchMessageID(acct dbAccount, password, folder string, uid uint32) (string, error) {
+	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	if err != nil {
+		return "", fmt.Errorf("connect: %w", err)
+	}
+	defer c.Close()
+	if err := c.Login(acct.Username, password).Wait(); err != nil {
+		return "", fmt.Errorf("login: %w", err)
+	}
+	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return "", fmt.Errorf("select %s: %w", folder, err)
+	}
+
+	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{Envelope: true})
+	defer fetchCmd.Close()
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	if len(msgs) == 0 {
+		return "", fmt.Errorf("message not found")
+	}
+	return msgs[0].Envelope.MessageID, nil
+}
+
 // fetchFolderMail returns the most recent `limit` messages from an arbitrary mailbox
 // (not just INBOX), for read-only folder browsing. Not cached/persisted locally.
-func fetchFolderMail(acct dbAccount, password, folder string, limit int) ([]Mail, error) {
+// fetchFolderMail returns up to `limit` messages from a folder. beforeUID == 0 means
+// "the most recent page" (by sequence number, cheap — no search needed); beforeUID > 0
+// pages older, fetching the newest `limit` messages with UID < beforeUID — this is
+// what powers infinite scroll in a browsed folder, which previously didn't paginate
+// at all and just showed one fixed page.
+func fetchFolderMail(acct dbAccount, password, folder string, limit int, beforeUID uint32) ([]Mail, error) {
 	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
@@ -174,25 +209,56 @@ func fetchFolderMail(acct dbAccount, password, folder string, limit int) ([]Mail
 	if err != nil {
 		return nil, fmt.Errorf("select %s: %w", folder, err)
 	}
+	return fetchFolderMailPage(c, acct.ID, mbox, folder, limit, beforeUID)
+}
+
+// fetchFolderMailPage fetches one page from a mailbox the caller has already
+// connected to and selected — split out from fetchFolderMail so a caller paging
+// through an entire folder (e.g. bulk-applying a tag to everything in it) can reuse
+// one connection across every page instead of reconnecting from scratch each time,
+// which made that operation feel like it was doing nothing for a large folder.
+func fetchFolderMailPage(c *imapclient.Client, accountID string, mbox *imap.SelectData, folder string, limit int, beforeUID uint32) ([]Mail, error) {
 	if mbox.NumMessages == 0 {
 		return nil, nil
 	}
 
-	start := uint32(1)
-	if mbox.NumMessages > uint32(limit) {
-		start = mbox.NumMessages - uint32(limit) + 1
+	var fetchTarget imap.NumSet
+	if beforeUID == 0 {
+		start := uint32(1)
+		if mbox.NumMessages > uint32(limit) {
+			start = mbox.NumMessages - uint32(limit) + 1
+		}
+		seqSet := imap.SeqSetNum()
+		seqSet.AddRange(start, mbox.NumMessages)
+		fetchTarget = seqSet
+	} else {
+		if beforeUID <= 1 {
+			return nil, nil // UID 1 is the lowest possible — nothing older exists
+		}
+		var uidRange imap.UIDSet
+		uidRange.AddRange(1, imap.UID(beforeUID-1))
+		data, err := c.UIDSearch(&imap.SearchCriteria{UID: []imap.UIDSet{uidRange}}, nil).Wait()
+		if err != nil {
+			return nil, fmt.Errorf("uid search: %w", err)
+		}
+		uids := data.AllUIDs()
+		if len(uids) == 0 {
+			return nil, nil
+		}
+		if len(uids) > limit {
+			uids = uids[len(uids)-limit:] // newest of the older batch — keeps paging backward in order
+		}
+		fetchTarget = imap.UIDSetNum(uids...)
 	}
-	seqSet := imap.SeqSetNum()
-	seqSet.AddRange(start, mbox.NumMessages)
 
-	fetchCmd := c.Fetch(seqSet, &imap.FetchOptions{Envelope: true, Flags: true, UID: true})
+	fetchCmd := c.Fetch(fetchTarget, &imap.FetchOptions{Envelope: true, Flags: true, UID: true})
 	defer fetchCmd.Close()
 	msgs, err := fetchCmd.Collect()
 	if err != nil {
 		return nil, fmt.Errorf("fetch: %w", err)
 	}
 
-	mails, _ := mailsFromFetch(acct.ID, folder, msgs)
+	mails, _ := mailsFromFetch(accountID, folder, msgs)
 	return mails, nil
 }
 
@@ -440,4 +506,26 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 		body.Text = "(no readable body)"
 	}
 	return body, nil
+}
+
+var (
+	htmlTagPattern    = regexp.MustCompile(`<[^>]*>`)
+	whitespacePattern = regexp.MustCompile(`\s+`)
+)
+
+// snippetFromBody collapses a fetched body down to a short plain-text preview — for
+// the push notification's expanded view, which otherwise has nothing more to show than
+// the subject line already visible collapsed. Falls back to stripping tags from the
+// HTML part when there's no plain-text one (most newsletter/marketing mail).
+func snippetFromBody(body MailBody, maxLen int) string {
+	text := body.Text
+	if text == "" && body.HTML != "" {
+		text = html.UnescapeString(htmlTagPattern.ReplaceAllString(body.HTML, " "))
+	}
+	text = strings.TrimSpace(whitespacePattern.ReplaceAllString(text, " "))
+	runes := []rune(text)
+	if len(runes) > maxLen {
+		text = strings.TrimSpace(string(runes[:maxLen])) + "…"
+	}
+	return text
 }

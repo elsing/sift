@@ -113,7 +113,11 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   50% { transform: rotate(180deg) scale(1.35); }
 }
 
-.inbox { list-style: none; margin: 0; padding: 0; }
+/* render() fully clears and rebuilds this list's contents on every call (entering/
+   leaving a group, a folder, etc) — the browser's automatic scroll anchoring can react
+   to that content swap by nudging the scroll position to "compensate", which is what
+   made an explicit scrollTo() right after render() land inconsistently. */
+.inbox { list-style: none; margin: 0; padding: 0; overflow-anchor: none; }
 
 .date-section-header {
   padding: 10px 16px 6px; font-size: 12px; font-weight: 800; color: var(--accent);
@@ -178,12 +182,15 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .accounts-panel {
   position: fixed; inset: 0; background: var(--bg); z-index: 20;
   padding: calc(env(safe-area-inset-top, 0px) + 20px) 16px 20px; overflow-y: auto;
+  overscroll-behavior: contain; /* stop scroll-chaining into the inbox behind it */
   transform: translateY(100%); opacity: 0;
-  transition: transform 0.35s var(--bounce), opacity 0.3s ease, background-color 0.25s ease;
+  transition: transform 0.48s var(--bounce), opacity 0.4s ease, background-color 0.25s ease;
 }
 .accounts-panel.hidden { pointer-events: none; }
 .accounts-panel:not(.hidden) { transform: translateY(0); opacity: 1; }
 .accounts-panel h2 { font-size: 18px; margin: 0 0 12px; }
+.panel-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.panel-header-row h2 { margin: 0; }
 .settings-subhead { font-size: 13px; font-weight: 700; color: var(--text-dim); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
 
 .theme-options { display: flex; gap: 8px; margin-bottom: 20px; }
@@ -208,6 +215,27 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 
 .accounts-list { list-style: none; margin: 0 0 20px; padding: 0; }
 .accounts-list li { padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+.auto-move-delay-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 20px; color: var(--text-dim);
+}
+.auto-move-delay-row input[type="number"] {
+  width: 64px; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 12px; color: var(--text); padding: 8px 10px; font-size: 14px;
+}
+.smart-history-row { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.smart-history-row-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.smart-history-meta { font-size: 12px; color: var(--text-dim); }
+.smart-history-badge {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  border: 1.5px solid var(--border); color: var(--text-dim); white-space: nowrap;
+}
+.smart-suggestion-actions { display: flex; gap: 6px; flex: none; }
+.smart-suggestion-actions button {
+  font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px;
+  border: 2px solid var(--border); background: none; color: var(--text-dim);
+}
+.smart-suggestion-actions .accept-btn { border-color: var(--accent); color: var(--accent); }
+.smart-suggestion-actions .dismiss-btn { border-color: var(--delete); color: var(--delete); }
 .account-row { display: flex; justify-content: space-between; align-items: center; }
 .account-row span { display: flex; gap: 6px; }
 .accounts-list button {
@@ -215,6 +243,16 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   border-radius: 12px; padding: 3px 10px;
 }
 .account-row button:last-child { color: var(--delete); border-color: var(--delete); }
+/* Self-contained, not relying on .accounts-list button for base styling (padding,
+   radius, font-size) — the scan results row this is used in isn't inside an
+   .accounts-list, so it never picked any of that up and looked like a bare unstyled
+   button. Also why this isn't just an override on .account-row button:last-child:
+   that rule assumes the rightmost button in a row is the destructive one, which isn't
+   true for a single affirmative "Create tag" action sitting alone in its row. */
+.create-tag-btn {
+  font-size: 12px; font-weight: 600; background: none; border: 2px solid var(--accent);
+  border-radius: 12px; padding: 3px 10px; color: var(--accent); flex: none;
+}
 .account-sync-error {
   margin: 6px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.4;
   background: var(--error-bg); border: 2px solid var(--error-border);
@@ -307,6 +345,7 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .move-modal.hidden { opacity: 0; pointer-events: none; }
 .move-modal-content {
   width: 100%; max-height: 70vh; overflow-y: auto; background: var(--bg);
+  overscroll-behavior: contain; /* stop scroll-chaining into the inbox behind it */
   border-radius: 24px 24px 0 0; padding: 16px;
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
   transform: translateY(0); transition: transform 0.35s var(--bounce);
@@ -318,6 +357,10 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .move-modal-header button { background: none; border: none; color: var(--text-dim); font-size: 16px; }
 .move-folder-tree { background: none; border: none; padding: 0; margin: 0; }
+.folder-sheet-search {
+  width: 100%; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 10px;
+}
 
 .folder-banner {
   display: flex; align-items: center; gap: 10px;
@@ -329,7 +372,22 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   background: none; border: 2px solid var(--move); border-radius: 12px;
   color: var(--move); font-weight: 700; font-size: 12px; padding: 4px 10px;
 }
-.folder-banner span { font-size: 14px; font-weight: 700; }
+.folder-banner span {
+  font-size: 14px; font-weight: 700; flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.folder-auto-tag-select {
+  flex: none; max-width: 40%; background: var(--bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text-dim); font-size: 11px; font-weight: 700;
+  padding: 4px 8px;
+}
+/* .folder-banner button (above) sets every button in the banner to --move's color —
+   needs the extra class-selector specificity here to actually override that. */
+.folder-banner button.folder-auto-tag-apply-btn {
+  flex: none; background: none; border: 2px solid var(--accent); color: var(--accent);
+  border-radius: 999px; font-size: 11px; font-weight: 700; padding: 4px 10px;
+}
+.folder-auto-tag-apply-btn.hidden { display: none; }
 
 .account-filter-bar {
   display: flex; gap: 6px; padding: 8px 16px; overflow-x: auto;
@@ -343,11 +401,93 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .account-chip.active { border-color: var(--accent); color: var(--accent); background: var(--input-bg); }
 
-.mail-reader-header { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
-.mail-reader-header button {
+.mail-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.mail-tag-chip {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  color: #fff; white-space: nowrap;
+}
+/* A suggestion hasn't actually been applied yet (no message_tags row) — dashed and
+   unfilled so it reads as "proposed," not "done," with its own accept/dismiss baked
+   right into the chip rather than a static label. */
+.mail-tag-chip.suggested {
+  background: none; border: 1.5px dashed; color: var(--text);
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.mail-tag-chip.suggested button {
+  background: none; border: none; color: inherit; font-size: 11px; font-weight: 700;
+  padding: 0; line-height: 1; cursor: pointer;
+}
+
+.tag-group-content {
+  display: flex; align-items: center; gap: 10px; cursor: pointer;
+}
+.tag-group-content .unread-dot { margin-top: 0; }
+.tag-group-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; margin-top: 3px; }
+.tag-group-text { flex: 1; min-width: 0; }
+.tag-group-label { font-weight: 700; font-size: 14px; color: var(--text-dim); }
+.tag-group-row.unread .tag-group-label { color: var(--text); }
+.tag-group-preview {
+  font-size: 12px; color: var(--text-dim); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tag-group-chevron { color: var(--text-dim); flex: none; font-size: 18px; }
+.tag-sheet-list { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow-y: auto; overscroll-behavior: contain; }
+.tag-sheet-row {
+  display: flex; align-items: center; gap: 10px; padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.tag-sheet-row input[type="checkbox"] { width: 18px; height: 18px; flex: none; }
+.tag-sheet-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.tag-sheet-row label { flex: 1; font-size: 14px; }
+
+.tag-manager-name-input {
+  flex: 1; min-width: 0; background: none; border: none; font-size: 14px;
+  color: var(--text); padding: 4px 6px; border-radius: 8px;
+}
+.tag-manager-name-input:focus { background: var(--input-bg); outline: none; }
+.tag-manager-swatches { display: flex; gap: 6px; padding: 6px 0 12px; }
+.tag-manager-swatch {
+  width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent;
+  padding: 0;
+}
+.tag-manager-swatch.selected { border-color: var(--text); }
+
+/* While an overlay holds the body scroll lock (position: fixed, see lockBody() in
+   inbox.js), .sticky-header's own position: sticky stops tracking the viewport the way
+   it normally does — its containing block just changed out from under it — and visibly
+   jumps. Pin it to the viewport directly for the duration instead of relying on sticky. */
+body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; }
+
+/* Sticky-positioning the header inside one big scrolling panel kept breaking under
+   real-world conditions (nested fixed-position ancestors elsewhere in the app, iOS
+   Safari's own sticky quirks) no matter how that surrounding context got adjusted —
+   a real flex layout removes the ambiguity instead of fighting it again: the header is
+   a normal, non-scrolling flex item, and .mail-reader-scroll below is the only thing
+   that actually scrolls. */
+.mail-reader-panel { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+.mail-reader-header {
+  flex: none; z-index: 1; background: var(--bg);
+  display: flex; align-items: center; gap: 8px;
+  padding: calc(env(safe-area-inset-top, 0px) + 20px) 16px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.mail-reader-scroll {
+  flex: 1; overflow-y: auto; overscroll-behavior: contain;
+  padding: 14px 16px 20px;
+}
+.mail-reader-header button:not(.icon-btn) {
   background: none; border: 2px solid var(--border); border-radius: 12px;
   color: var(--text-dim); font-size: 13px; padding: 5px 10px;
 }
+/* Pushed to the far end of the header, next to Tags — these used to be a separate
+   full-width row of text buttons under the subject, taking up space better spent on
+   the email itself. Icon-only + grouped with Tags reads as "the actions for this mail"
+   in one place, and an overflow-x scroller is cheap insurance on narrow phones rather
+   than the buttons wrapping or getting cramped. */
+.mail-reader-header-actions {
+  display: flex; gap: 6px; margin-left: auto; overflow-x: auto;
+}
+#mailReaderDeleteBtn { border-color: var(--delete); color: var(--delete); }
 .mail-reader-meta { margin-bottom: 16px; }
 .mail-reader-subject { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
 .mail-reader-sender { font-size: 14px; font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; }
@@ -356,11 +496,52 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   font-family: inherit; font-size: 14px; line-height: 1.6; color: var(--text);
   white-space: pre-wrap; word-wrap: break-word; margin: 0;
 }
-.mail-reader-body.hidden { display: none; }
-.mail-reader-html {
-  width: 100%; height: 70vh; border: none; background: #fff; border-radius: 14px;
+
+/* Three dots, each its own color, bouncing in a staggered wave with a little spin and
+   squash thrown in for character — a plain spinner felt like an afterthought for a
+   moment you hit constantly (opening every single email). */
+.mail-loading {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 16px; padding: 70px 20px;
 }
-.mail-reader-html.hidden { display: none; }
+.mail-loading.hidden { display: none; }
+.mail-loading-dots { display: flex; gap: 10px; }
+.mail-loading-dots span {
+  width: 14px; height: 14px; border-radius: 50%;
+  animation: mail-loading-bounce 1.1s ease-in-out infinite;
+}
+.mail-loading-dots span:nth-child(1) { background: var(--accent); animation-delay: 0s; }
+.mail-loading-dots span:nth-child(2) { background: #ff9f1c; animation-delay: 0.15s; }
+.mail-loading-dots span:nth-child(3) { background: #00d9a3; animation-delay: 0.3s; }
+@keyframes mail-loading-bounce {
+  0%, 60%, 100% { transform: translateY(0) scale(0.85) rotate(0deg); }
+  30% { transform: translateY(-20px) scale(1.2) rotate(160deg); }
+}
+.mail-loading-quip {
+  margin: 0; color: var(--text-dim); font-size: 13px; font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.mail-reader-body.hidden { display: none; }
+/* Some HTML email (rigid newsletter footers especially) ignores max-width no matter
+   what CSS gets injected into it — fixed-width tables/divs that just won't shrink.
+   Rather than clip that content (or let it scroll sideways), resizeMailReaderIframe
+   (reader.js) renders the iframe at its own natural/unclamped width, then visually
+   scales the whole thing down with a CSS transform to fit — this wrapper clips to the
+   scaled-down box and reserves exactly that much vertical space (a transform doesn't
+   affect layout size on its own, so without this the page would keep the iframe's full
+   unscaled height's worth of blank space below it). */
+.mail-reader-html-wrap { width: 100%; overflow: hidden; border-radius: 14px; }
+.mail-reader-html-wrap.hidden { display: none; }
+.mail-reader-html {
+  /* width starts at 100% (of the wrapper) specifically so resizeMailReaderIframe's
+     very first scrollWidth measurement reflects "how wide does this content want to be
+     given the screen's real width" — without this base rule the iframe defaults to the
+     browser's ~300px UA default at that moment, so the natural-width measurement (and
+     therefore the scale computed from it) was based on the wrong starting width,
+     leaving the visible gap on the right once scaled. JS then overrides width/height/
+     transform once it has the real measurement. */
+  display: block; width: 100%; transform-origin: top left; border: none; background: #fff;
+}
 
 .folder-empty-status { padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 14px; }
 
@@ -388,8 +569,25 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   width: 100%; background: var(--input-bg); border: 2px solid var(--border);
   border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 8px;
 }
+#historySection.hidden { display: none; }
+#smartHistorySearch {
+  width: 100%; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 8px;
+}
+.smart-history-row.openable, .smart-history-meta.openable { cursor: pointer; }
+.search-date-range {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text-dim);
+}
+.search-date-range input[type="date"] {
+  flex: 1; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px;
+}
 .search-folder-picker.hidden { display: none; }
-.search-folder-picker { margin-bottom: 8px; max-height: 240px; overflow-y: auto; }
+.search-folder-picker { margin-bottom: 8px; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; }
+.search-tag-filter {
+  flex-wrap: wrap; overflow: visible; border: none; background: none;
+  padding: 0; margin: 8px 0 0; max-height: 90px; overflow-y: auto; overscroll-behavior: contain;
+}
 .search-progress { margin-bottom: 10px; }
 .search-progress.hidden { display: none; }
 .search-progress-bar { height: 4px; border-radius: 999px; background: var(--border); overflow: hidden; }

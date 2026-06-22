@@ -11,7 +11,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +28,16 @@ type Mail struct {
 	Date        string `json:"date"` // RFC3339; the client groups by this (Today/This Week/Last Week/Older)
 	Unread      bool   `json:"unread"`
 	AccountID   string `json:"accountId,omitempty"` // empty for mock mail; tells the client which account's folders to offer for "move"
-	UID         uint32 `json:"-"`                   // IMAP UID within Folder; zero for mock mail, used to move/delete/read on the server
+	UID         uint32 `json:"uid,omitempty"`       // IMAP UID within Folder; zero for mock mail. Exposed so the client can page a folder view by "older than this UID" — not sensitive, just a mailbox-relative sequence number.
 	Folder      string `json:"folder,omitempty"`    // IMAP mailbox this UID belongs to; shown for search results spanning folders
+	MessageID   string `json:"-"`                   // RFC 5322 Message-ID — stable across moves/re-syncs, unlike ID; tags are keyed on this
+	Tags        []Tag  `json:"tags,omitempty"`
+}
+
+type Tag struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
 }
 
 var senders = []string{"Alex Chen", "Notion", "Sarah Park", "GitHub", "Mom", "Stripe", "Figma", "Delta", "Sam Lee", "Linear"}
@@ -162,9 +169,17 @@ func accountFilter(r *http.Request) []string {
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	// Cursor-based, not offset-based: paging by row count breaks the moment a new mail
+	// is inserted mid-scroll (the IMAP IDLE watcher can do this at any time) — every row
+	// at or after the insertion point shifts by one position, so the next "offset N"
+	// either repeats a row already shown or skips one entirely. Paging by "older than
+	// the last mail you saw" is immune to that: an insertion elsewhere can't move where
+	// an already-seen mail sits relative to its own neighbors.
+	before := r.URL.Query().Get("before")
+	beforeID := r.URL.Query().Get("beforeId")
+	firstPage := beforeID == ""
 	accountIDs := accountFilter(r)
-	mails, err := s.list(offset, pageSize, accountIDs)
+	mails, err := s.list(pageSize, accountIDs, before, beforeID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -177,13 +192,13 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	// Skipped while a filter is active — an empty page there just means "this account
 	// has no mail," not "the cache is broken," and resyncing every account regardless
 	// of the filter would be pointless work.
-	if offset == 0 && len(mails) == 0 && len(accountIDs) == 0 {
+	if firstPage && len(mails) == 0 && len(accountIDs) == 0 {
 		if _, err := s.db.Exec("UPDATE accounts SET oldest_synced_uid = NULL"); err != nil {
 			log.Printf("reset backfill progress: %v", err)
 		}
 		if err := s.syncAllAccounts(); err != nil {
 			log.Printf("auto-sync: %v", err)
-		} else if refreshed, err := s.list(offset, pageSize, accountIDs); err == nil {
+		} else if refreshed, err := s.list(pageSize, accountIDs, before, beforeID); err == nil {
 			mails = refreshed
 		}
 	}
@@ -193,7 +208,7 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 		// and avoids a filter switch immediately looking under-backfilled.
 		if _, err := s.backfillAllAccounts(pageSize); err != nil {
 			log.Printf("backfill: %v", err)
-		} else if refreshed, err := s.list(offset, pageSize, accountIDs); err == nil {
+		} else if refreshed, err := s.list(pageSize, accountIDs, before, beforeID); err == nil {
 			mails = refreshed
 		}
 	}
@@ -208,10 +223,10 @@ func (s *Store) handleGetMail(w http.ResponseWriter, r *http.Request) {
 	var m Mail
 	var sentAt sql.NullTime
 	row := s.db.QueryRow(
-		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE id = $1",
+		"SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, '') FROM mails WHERE id = $1",
 		id,
 	)
-	if err := row.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt); err != nil {
+	if err := row.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID); err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
 			return
@@ -222,19 +237,40 @@ func (s *Store) handleGetMail(w http.ResponseWriter, r *http.Request) {
 	if sentAt.Valid {
 		m.Date = sentAt.Time.Format(time.RFC3339)
 	}
+	mails := []Mail{m}
+	if err := s.attachTags(mails); err == nil {
+		m = mails[0]
+	}
 	writeJSON(w, m)
 }
 
 // list returns inbox mail, optionally restricted to accountIDs (empty/nil means all).
-func (s *Store) list(offset, limit int, accountIDs []string) ([]Mail, error) {
-	query := "SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at FROM mails WHERE folder = 'INBOX'"
+// list returns inbox mail, newest first, optionally restricted to accountIDs (empty/nil
+// means all) and to mail older than the (before, beforeID) cursor (beforeID == "" means
+// the first page). sent_at can be null (e.g. mock mail) — coalesced to -infinity
+// consistently in both the cursor comparison and the ORDER BY, so the two stay in sync.
+func (s *Store) list(limit int, accountIDs []string, before, beforeID string) ([]Mail, error) {
+	query := "SELECT id, sender, sender_email, subject, snippet, time, unread, coalesce(account_id, ''), sent_at, coalesce(message_id, '') FROM mails WHERE folder = 'INBOX'"
 	args := []any{}
 	if len(accountIDs) > 0 {
-		query += " AND account_id = ANY($1)"
 		args = append(args, accountIDs)
+		query += fmt.Sprintf(" AND account_id = ANY($%d)", len(args))
 	}
-	query += fmt.Sprintf(" ORDER BY id DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
-	args = append(args, limit, offset)
+	if beforeID != "" {
+		var beforeArg any
+		if before != "" {
+			beforeArg = before
+		}
+		args = append(args, beforeArg, beforeID)
+		query += fmt.Sprintf(
+			" AND (coalesce(sent_at, '-infinity'::timestamptz), id) < (coalesce($%d::timestamptz, '-infinity'::timestamptz), $%d)",
+			len(args)-1, len(args),
+		)
+	}
+	// id as a tiebreaker just keeps paging deterministic for the rare case of two mails
+	// sharing a timestamp.
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY coalesce(sent_at, '-infinity'::timestamptz) DESC, id DESC LIMIT $%d", len(args))
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -246,7 +282,7 @@ func (s *Store) list(offset, limit int, accountIDs []string) ([]Mail, error) {
 	for rows.Next() {
 		var m Mail
 		var sentAt sql.NullTime
-		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &m.AccountID, &sentAt, &m.MessageID); err != nil {
 			return nil, err
 		}
 		if sentAt.Valid {
@@ -254,7 +290,51 @@ func (s *Store) list(offset, limit int, accountIDs []string) ([]Mail, error) {
 		}
 		mails = append(mails, m)
 	}
-	return mails, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.attachTags(mails); err != nil {
+		return nil, err
+	}
+	return mails, nil
+}
+
+// attachTags fills in Tags for each mail, batched into one query rather than one
+// per row. Mutates mails in place.
+func (s *Store) attachTags(mails []Mail) error {
+	byMessageID := map[string]*Mail{}
+	messageIDs := make([]string, 0, len(mails))
+	for i := range mails {
+		if mails[i].MessageID == "" {
+			continue
+		}
+		byMessageID[mails[i].MessageID] = &mails[i]
+		messageIDs = append(messageIDs, mails[i].MessageID)
+	}
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	rows, err := s.db.Query(`
+		SELECT mt.message_id, t.id, t.name, t.color
+		FROM message_tags mt JOIN tags t ON t.id = mt.tag_id
+		WHERE mt.message_id = ANY($1) ORDER BY t.name`, messageIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var messageID string
+		var tag Tag
+		if err := rows.Scan(&messageID, &tag.ID, &tag.Name, &tag.Color); err != nil {
+			return err
+		}
+		if m, ok := byMessageID[messageID]; ok {
+			m.Tags = append(m.Tags, tag)
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -272,7 +352,7 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	mails, err := s.list(0, pageSize, accountFilter(r))
+	mails, err := s.list(pageSize, accountFilter(r), "", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
