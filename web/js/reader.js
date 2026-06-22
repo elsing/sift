@@ -67,7 +67,7 @@ export function setupMailReader() {
   trustSenderBtn = document.getElementById('trustSenderBtn');
   showImagesBtn.addEventListener('click', () => {
     imagesBlockedBanner.classList.add('hidden');
-    renderMailHtml(lastHtml, true);
+    renderMailHtml(lastHtml, 'proxy');
   });
   trustSenderBtn.addEventListener('click', async () => {
     trustSenderBtn.disabled = true;
@@ -81,7 +81,7 @@ export function setupMailReader() {
       // best-effort — worst case images stay blocked and "Show images" still works this time
     }
     imagesBlockedBanner.classList.add('hidden');
-    renderMailHtml(lastHtml, true);
+    renderMailHtml(lastHtml, 'proxy');
   });
   document.getElementById('mailReaderTagsBtn').addEventListener('click', () => openTagSheet(currentMailId));
   document.getElementById('mailReaderBack').addEventListener('click', () => closeReaderPanel());
@@ -392,22 +392,46 @@ function refreshReaderTags(tags) {
   updateMailTags(currentMailId, tags);
 }
 
-// Blocks remote image loads (most commonly tracking pixels — they confirm you opened
-// the mail and can leak your IP/timing the instant an HTML body renders) via a CSP
-// meta tag in the iframe's own document, ahead of any sender-supplied markup. data:/
-// cid: URIs (already-embedded images, not network fetches) still work either way.
+// Blocking remote images outright (the only option before) and fully trusting a
+// sender's direct links (raw passthrough) were the only two choices, and they're both
+// worse than they need to be: a tracking pixel is indistinguishable from a real image
+// at the HTTP level, so there's no way to inspect-and-allow; but a direct fetch to the
+// sender's own server still hands them your IP and exact open time regardless of
+// whether the image itself was "real". Proxying every image through this server gets
+// the visual result of "images loaded" while the sender only ever sees this server's
+// IP, not yours — so "allow images" now always means "proxy them", never raw passthrough.
 const IMAGE_BLOCK_CSP = `<meta http-equiv="Content-Security-Policy" content="img-src data: cid:;">`;
+const IMAGE_PROXY_CSP = `<meta http-equiv="Content-Security-Policy" content="img-src data: cid: 'self';">`;
 
 let lastHtml = '';
 let lastSenderEmail = '';
 
-function renderMailHtml(html, allowImages) {
+// Rewrites <img src="http(s)://..."> to route through this server's image proxy
+// instead of fetching the sender's URL directly from the reader's own device/IP.
+function proxyImageSrcs(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('img[src]').forEach((img) => {
+    const src = img.getAttribute('src');
+    if (/^https?:\/\//i.test(src)) {
+      img.setAttribute('src', `/api/image-proxy?u=${encodeURIComponent(src)}`);
+    }
+  });
+  return '<!doctype html>' + doc.documentElement.outerHTML;
+}
+
+function renderMailHtml(html, mode) {
   mailReaderBody.classList.add('hidden');
   mailReaderHtmlWrap.classList.remove('hidden');
   mailReaderHtml.style.width = '';
   mailReaderHtml.style.transform = '';
   mailReaderHtml.onload = resizeMailReaderIframe;
-  mailReaderHtml.srcdoc = (allowImages ? '' : IMAGE_BLOCK_CSP) + RESPONSIVE_RESET + html;
+  const csp = mode === 'proxy' ? IMAGE_PROXY_CSP : IMAGE_BLOCK_CSP;
+  const body = mode === 'proxy' ? proxyImageSrcs(html) : html;
+  mailReaderHtml.srcdoc = csp + RESPONSIVE_RESET + body;
+}
+
+function autoLoadImagesEnabled() {
+  return localStorage.getItem('autoLoadImages') !== '0'; // on by default — see settings.js
 }
 
 async function loadMailBody(id) {
@@ -426,8 +450,9 @@ async function loadMailBody(id) {
     // sandbox="allow-same-origin" only (no allow-scripts) — embedded scripts still
     // can't execute, but the parent can read the iframe's own DOM to size it to its
     // content instead of trapping the email in its own internally-scrolling box.
-    if (!data.trustedSender) imagesBlockedBanner.classList.remove('hidden');
-    renderMailHtml(data.html, data.trustedSender);
+    const proxied = data.trustedSender || autoLoadImagesEnabled();
+    if (!proxied) imagesBlockedBanner.classList.remove('hidden');
+    renderMailHtml(data.html, proxied ? 'proxy' : 'block');
   } else {
     mailReaderBody.classList.remove('hidden');
     mailReaderBody.textContent = data.text || '(no readable body)';

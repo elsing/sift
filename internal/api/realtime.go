@@ -182,7 +182,7 @@ func (s *Store) idleOnce(ctx context.Context, accountID string) error {
 	}
 	defer c.Close()
 
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
+	if err := imapAuth(c, acct.Username, password, acct.OAuthProvider); err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
 	if !c.Caps().Has(imap.CapIdle) {

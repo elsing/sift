@@ -95,6 +95,8 @@ export function setupSwipeOptions() {
   setupSwipeSide('swipeLeftOptions', 'swipeLeft', 'delete');
   setupSwipeSide('swipeRightOptions', 'swipeRight', 'move');
   setupFunDeleteToggle();
+  setupAutoLoadImagesToggle();
+  setupImageCacheSettings();
 }
 
 function setupFunDeleteToggle() {
@@ -102,6 +104,103 @@ function setupFunDeleteToggle() {
   toggle.checked = localStorage.getItem('funDeleteAnimation') !== 'off'; // on by default
   toggle.addEventListener('change', () => {
     localStorage.setItem('funDeleteAnimation', toggle.checked ? 'on' : 'off');
+  });
+}
+
+// On by default (like OWA/Gmail) — every image still goes through the server-side
+// proxy (reader.js) and is sniffed/verified server-side (imageproxy.go rejects
+// anything that doesn't genuinely sniff as a raster image, and SVG outright), so
+// auto-showing doesn't mean trusting the sender's link directly, just that you don't
+// need to tap "Show images" each time. Still off-by-request, not off-by-default,
+// since the proxy already does the actual safety work.
+function setupAutoLoadImagesToggle() {
+  const toggle = document.getElementById('autoLoadImagesToggle');
+  toggle.checked = localStorage.getItem('autoLoadImages') !== '0';
+  toggle.addEventListener('change', () => {
+    localStorage.setItem('autoLoadImages', toggle.checked ? '1' : '0');
+  });
+}
+
+// Server-side (image_cache table is global, not localStorage) — shares /api/owner-settings
+// with the Smart Tagging panel's autoTagMode/autoMoveDelayDays, so saving here has to
+// send the whole object back, not just this one field, or it'd clobber the others.
+async function setupImageCacheSettings() {
+  const input = document.getElementById('imageCacheRetentionInput');
+  const backfillBtn = document.getElementById('backfillImageCacheBtn');
+  const statusEl = document.getElementById('imageBackfillStatus');
+  const progressWrap = document.getElementById('imageCacheProgress');
+  const progressFill = document.getElementById('imageCacheProgressFill');
+  const progressText = document.getElementById('imageCacheProgressText');
+
+  // A one-time bootstrap, not a routine action — ordinary new mail already gets its
+  // images prefetched automatically going forward (syncAccount). Showing when it last
+  // ran (instead of just always offering a bare "Download now" button) is the nudge
+  // away from re-running it "just in case" every time this panel's opened.
+  const renderStatus = () => {
+    statusEl.textContent = settings.imageBackfillCompletedAt
+      ? `Last ran ${new Date(settings.imageBackfillCompletedAt).toLocaleString()}`
+      : "Hasn't been run yet";
+  };
+
+  let settings = { autoTagMode: 'review', autoMoveDelayDays: 3, imageCacheRetentionDays: 90, imageBackfillCompletedAt: null };
+  try {
+    const res = await fetch('/api/owner-settings');
+    if (res.ok) settings = await res.json();
+  } catch {
+    // best-effort — input just shows the 90-day default until the next successful load
+  }
+  input.value = settings.imageCacheRetentionDays;
+  renderStatus();
+
+  input.addEventListener('change', async () => {
+    const days = Math.min(90, Math.max(1, parseInt(input.value, 10) || 90)); // server clamps too — this just avoids the round trip showing you a value it's about to reject
+    input.value = days;
+    settings = { ...settings, imageCacheRetentionDays: days };
+    try {
+      await fetch('/api/owner-settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings),
+      });
+    } catch {
+      // best-effort — worst case the next backfill/cleanup still uses the old value
+    }
+  });
+
+  backfillBtn.addEventListener('click', () => {
+    backfillBtn.disabled = true;
+    progressWrap.classList.remove('hidden');
+    progressFill.style.width = '0%';
+    progressText.textContent = 'Starting…';
+    const source = new EventSource('/api/image-cache/backfill');
+    const finish = () => {
+      source.close();
+      backfillBtn.disabled = false;
+    };
+    source.addEventListener('progress', (e) => {
+      const { done, total } = JSON.parse(e.data);
+      progressFill.style.width = (total ? Math.round((done / total) * 100) : 100) + '%';
+      progressText.textContent = `Scanned ${done} of ${total} folders…`;
+    });
+    source.addEventListener('complete', (e) => {
+      const { imagesCached } = JSON.parse(e.data);
+      progressFill.style.width = '100%';
+      progressText.textContent = `Done — ${imagesCached} image${imagesCached === 1 ? '' : 's'} cached.`;
+      settings = { ...settings, imageBackfillCompletedAt: new Date().toISOString() };
+      renderStatus();
+      finish();
+    });
+    // EventSource fires the generic 'error' event both for a real failure and for the
+    // browser's own auto-retry attempts — by the time this runs the source is already
+    // closed either way (we just closed it ourselves on 'complete', or it died on its
+    // own), so there's nothing left worth distinguishing (same reasoning as the Smart
+    // Tagging scan's own SSE error handling).
+    source.addEventListener('error', () => {
+      if (source.readyState === EventSource.CLOSED) {
+        progressText.textContent = "Didn't finish — try again.";
+      }
+      finish();
+    });
   });
 }
 

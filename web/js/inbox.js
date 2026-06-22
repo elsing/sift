@@ -143,6 +143,25 @@ export async function fetchMails(force) {
       mails = cached;
       hasMore = mails.length === PAGE_SIZE; // matches loadMore's own heuristic below
       render();
+    } else if (!force) {
+      // No in-memory cache (first visit this page load) — try the server's own local
+      // cache (populated by any previous live fetch, survives reloads) before paying
+      // for a live IMAP round trip, which can take seconds against a remote server.
+      // Best-effort: a miss/failure here just means the skeleton stays up a bit longer,
+      // same as before this existed.
+      const { accountId, path } = currentFolder;
+      fetch(`/api/accounts/${accountId}/folder-mails?path=${encodeURIComponent(path)}&cacheOnly=1`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!data || data.length === 0) return;
+          if (!currentFolder || currentFolder.accountId !== accountId || currentFolder.path !== path) return;
+          if (folderMailCache.get(cacheKey)) return; // the live fetch already landed first
+          mails = data;
+          sortMailsNewestFirst();
+          hasMore = mails.length === PAGE_SIZE;
+          render();
+        })
+        .catch(() => {});
     }
     const myGen = ++fetchGeneration;
     const res = await fetch(`/api/accounts/${currentFolder.accountId}/folder-mails?path=${encodeURIComponent(currentFolder.path)}`);
@@ -854,8 +873,10 @@ const DELETE_ANIM_VARIANTS = ['fling', 'shatter'];
 const DELETE_ANIM_MS = 380;
 
 const SHATTER_SLIDE_MS = 110; // content's own quick exit, before the shards punch out
-const SHATTER_BURST_MS = 340; // matches row-shard-pop's duration in style.css
-const SHARD_COUNT = 7;
+const SHATTER_BURST_MS = 420; // matches row-shard-pop's duration in style.css
+// Bumped up across the board (count, distance, size — see .row-burst-shard in
+// style.css too) — still too subtle to actually register at the old numbers.
+const SHARD_COUNT = 12;
 const SHARD_COLORS = ['--delete', '--accent', '--move', '--archive'];
 
 // Each shard gets its own random direction/distance/spin via CSS custom properties —
@@ -865,13 +886,13 @@ function spawnShards(container) {
   container.innerHTML = '';
   for (let i = 0; i < SHARD_COUNT; i++) {
     const angle = (Math.PI * 2 * i) / SHARD_COUNT + (Math.random() - 0.5) * 0.6;
-    const distance = 36 + Math.random() * 28; // bigger spread — too subtle to read clearly on an actual phone screen at the old 26-48px
+    const distance = 55 + Math.random() * 45;
     const shard = document.createElement('span');
     shard.className = 'row-burst-shard';
     shard.style.background = `var(${SHARD_COLORS[i % SHARD_COLORS.length]})`;
     shard.style.setProperty('--dx', `${Math.cos(angle) * distance}px`);
     shard.style.setProperty('--dy', `${Math.sin(angle) * distance}px`);
-    shard.style.setProperty('--rot', `${(Math.random() - 0.5) * 360}deg`);
+    shard.style.setProperty('--rot', `${(Math.random() - 0.5) * 540}deg`);
     container.appendChild(shard);
   }
 }
@@ -1038,7 +1059,7 @@ function lockBody() {
   document.body.style.position = 'fixed';
   document.body.style.top = `-${savedScrollY}px`;
   document.body.style.width = '100%';
-  document.body.classList.add('scroll-locked'); // see style.css: keeps .sticky-header from jumping
+  document.body.classList.add('scroll-locked'); // marker class only, no styling — .sticky-header is always position:fixed now, so it's unaffected by this either way
 }
 
 function unlockBody() {
@@ -1049,17 +1070,20 @@ function unlockBody() {
   window.scrollTo(0, savedScrollY);
 }
 
-// Only the bottom-sheet modals actually need the body lock: they're a dimmed backdrop
-// with content sitting on top, so the inbox behind is still visible and its momentum
-// scroll bleeding through is something to guard against. The full-screen panels
-// (reader, settings, accounts...) are opaque and cover the entire viewport themselves —
-// nothing's visible behind them to bleed through, so there's nothing to gain from
-// locking body for as long as one's open. There's a real cost to doing it anyway: those
-// panels are themselves `position: fixed`, and toggling body's own position between
-// static and fixed while one is open is exactly the kind of nested-fixed-context change
-// iOS Safari has long-standing rendering bugs with — which is what caused the reader's
-// own sticky header to visibly glitch while scrolling.
-const BODY_LOCK_IDS = ['folderSheetModal', 'tagSheetModal'];
+// The bottom-sheet modals obviously need this (a dimmed backdrop with content on top —
+// the inbox behind is still visible, so its momentum scroll bleeding through is
+// directly visible too). searchPanel turned out to need it as well even though it's a
+// full-screen *opaque* panel: the touchmove-block above only stops new drag gestures,
+// not the body's scroll position actually changing underneath (e.g. iOS's own
+// native "scroll the focused input into view" behavior firing on the document itself
+// when the search box gets focus, invisible while the panel covers it, but leaving the
+// inbox scrolled to a different spot once the panel closes — and reachable mid-keyboard-
+// transition where the opaque coverage isn't perfectly continuous). Other full-screen
+// panels (reader, settings, accounts...) don't focus a text input that triggers this,
+// so they're left alone — locking body has a real cost (toggling its position while
+// another `position: fixed` panel is open risks the kind of nested-fixed-context
+// rendering glitch iOS Safari is known for), not worth paying where nothing needs it.
+const BODY_LOCK_IDS = ['folderSheetModal', 'tagSheetModal', 'searchPanel'];
 
 function bodyLockNeeded() {
   return BODY_LOCK_IDS.some((id) => {

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,11 +17,12 @@ import (
 )
 
 type dbAccount struct {
-	ID       string
-	Email    string
-	Host     string
-	Port     int
-	Username string
+	ID            string
+	Email         string
+	Host          string
+	Port          int
+	Username      string
+	OAuthProvider string // "" for password accounts, "google" for OAuth-linked ones
 }
 
 type accountOut struct {
@@ -64,21 +67,53 @@ func isDryRun(r *http.Request) bool {
 	return r.Header.Get("X-Dry-Run") == "1"
 }
 
-// loadAccountCreds fetches and decrypts the IMAP credentials for an account.
+// loadAccountCreds fetches and decrypts the IMAP credentials for an account. For an
+// OAuth-linked account the returned "password" is actually a fresh access token —
+// refreshed here if the cached one has expired — and acct.OAuthProvider tells every
+// IMAP call site (via dialIMAP/imapAuth) to authenticate with OAUTHBEARER instead of
+// plain LOGIN.
 func (s *Store) loadAccountCreds(id string) (dbAccount, string, error) {
 	var acct dbAccount
-	var encPassword []byte
+	var encPassword, encRefresh, encAccess []byte
+	var tokenExpiry *time.Time
 	err := s.db.QueryRow(
-		"SELECT id, email, host, port, username, password_enc FROM accounts WHERE id = $1", id,
-	).Scan(&acct.ID, &acct.Email, &acct.Host, &acct.Port, &acct.Username, &encPassword)
+		`SELECT id, email, host, port, username, password_enc, oauth_provider, oauth_refresh_token_enc, oauth_access_token_enc, oauth_token_expiry
+		 FROM accounts WHERE id = $1`, id,
+	).Scan(&acct.ID, &acct.Email, &acct.Host, &acct.Port, &acct.Username, &encPassword,
+		&acct.OAuthProvider, &encRefresh, &encAccess, &tokenExpiry)
 	if err != nil {
 		return acct, "", fmt.Errorf("load account: %w", err)
 	}
-	password, err := s.crypto.decrypt(encPassword)
-	if err != nil {
-		return acct, "", fmt.Errorf("decrypt password: %w", err)
+
+	if acct.OAuthProvider == "" {
+		password, err := s.crypto.decrypt(encPassword)
+		if err != nil {
+			return acct, "", fmt.Errorf("decrypt password: %w", err)
+		}
+		return acct, password, nil
 	}
-	return acct, password, nil
+
+	// Refresh a little early (60s) rather than right at expiry, so a slow IMAP call
+	// started just before expiry doesn't get cut off mid-request by Gmail.
+	if tokenExpiry != nil && time.Now().Add(60*time.Second).Before(*tokenExpiry) {
+		access, err := s.crypto.decrypt(encAccess)
+		if err == nil {
+			return acct, access, nil
+		}
+	}
+	refresh, err := s.crypto.decrypt(encRefresh)
+	if err != nil {
+		return acct, "", fmt.Errorf("decrypt refresh token: %w", err)
+	}
+	tok, err := refreshGoogleAccessToken(context.Background(), refresh)
+	if err != nil {
+		return acct, "", fmt.Errorf("refresh google token: %w", err)
+	}
+	encNewAccess, err := s.crypto.encrypt(tok.AccessToken)
+	if err == nil {
+		s.db.Exec("UPDATE accounts SET oauth_access_token_enc = $1, oauth_token_expiry = $2 WHERE id = $3", encNewAccess, tok.Expiry, id)
+	}
+	return acct, tok.AccessToken, nil
 }
 
 func (s *Store) handleListAccounts(w http.ResponseWriter, r *http.Request, owner string) {
@@ -200,7 +235,7 @@ func (s *Store) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	names, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password)
+	names, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
 		log.Printf("list folders %s: %v", acct.Email, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -224,7 +259,7 @@ func (s *Store) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password)
+	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -237,7 +272,7 @@ func (s *Store) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 	if req.ParentPath != "" {
 		path = req.ParentPath + sep + req.Name
 	}
-	if err := createFolder(acct.Host, acct.Port, acct.Username, password, path); err != nil {
+	if err := createFolder(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider, path); err != nil {
 		log.Printf("create folder %s/%s: %v", acct.Email, path, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -261,7 +296,7 @@ func (s *Store) handleRenameFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password)
+	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -274,7 +309,7 @@ func (s *Store) handleRenameFolder(w http.ResponseWriter, r *http.Request) {
 	if i := strings.LastIndex(req.Path, sep); i >= 0 {
 		to = req.Path[:i] + sep + req.NewName
 	}
-	if err := renameFolder(acct.Host, acct.Port, acct.Username, password, req.Path, to); err != nil {
+	if err := renameFolder(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider, req.Path, to); err != nil {
 		log.Printf("rename folder %s/%s->%s: %v", acct.Email, req.Path, to, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -299,7 +334,7 @@ func (s *Store) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	if err := deleteFolder(acct.Host, acct.Port, acct.Username, password, req.Path); err != nil {
+	if err := deleteFolder(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider, req.Path); err != nil {
 		log.Printf("delete folder %s/%s: %v", acct.Email, req.Path, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -309,11 +344,58 @@ func (s *Store) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// cachedFolderMails reads whatever's already in the local mails table for this
+// account+folder — populated by a previous live folder-mails fetch (handleFolderMails
+// below). No IMAP round trip, so it's instant; used to paint something immediately
+// while the live fetch (which can take seconds against a remote server) runs behind it.
+func (s *Store) cachedFolderMails(accountID, folder string) ([]Mail, error) {
+	rows, err := s.db.Query(
+		`SELECT id, sender, sender_email, subject, snippet, time, unread, sent_at, coalesce(message_id, ''), has_attachments
+		 FROM mails WHERE account_id = $1 AND folder = $2
+		 ORDER BY coalesce(sent_at, '-infinity'::timestamptz) DESC, id DESC LIMIT $3`,
+		accountID, folder, pageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mails := []Mail{}
+	for rows.Next() {
+		var m Mail
+		var sentAt sql.NullTime
+		if err := rows.Scan(&m.ID, &m.Sender, &m.SenderEmail, &m.Subject, &m.Snippet, &m.Time, &m.Unread, &sentAt, &m.MessageID, &m.HasAttachments); err != nil {
+			return nil, err
+		}
+		if sentAt.Valid {
+			m.Date = sentAt.Time.Format(time.RFC3339)
+		}
+		m.AccountID = accountID
+		m.Folder = folder
+		mails = append(mails, m)
+	}
+	return mails, rows.Err()
+}
+
 func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	folder := r.URL.Query().Get("path")
 	if folder == "" {
 		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	// Cache-only: instant, no IMAP — the client calls this first to paint something
+	// right away, then calls the regular (live) endpoint behind it to get the real,
+	// current state. Only ever used for the first page (a "beforeUid" page only makes
+	// sense once you already know the live, current ordering).
+	if r.URL.Query().Get("cacheOnly") == "1" {
+		mails, err := s.cachedFolderMails(id, folder)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.attachTags(mails)
+		writeJSON(w, mails)
 		return
 	}
 	acct, password, err := s.loadAccountCreds(id)
@@ -434,7 +516,14 @@ func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 		// auto-moved mail was good for a spurious push about old, already-seen mail
 		// that happened to still be sitting at the top of the inbox.
 		s.notifyNewMail(accountID, newMails)
+		// Fire-and-forget: warms the image proxy cache (imageproxy.go) ahead of you ever
+		// opening these mails, so a sender can't infer open-time from proxy fetch timing
+		// even with the IP itself already hidden. Each mail needs its own body fetch
+		// (sync only ever pulled envelope/flags), so this runs off the sync's own
+		// goroutine rather than block the response on it.
+		go s.prefetchMailImages(acct, password, newMails)
 	}
+	s.maybeCleanupImageCache()
 	// Not gated on new mail — this is about time elapsed since tagging, not what just
 	// arrived, so it should run every sync regardless.
 	var ownerSubject string
@@ -493,7 +582,7 @@ func (s *Store) resolveFolders(accountID string) (archive, trash string, err err
 	if err != nil {
 		return "", "", err
 	}
-	archive, trash, err = detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password)
+	archive, trash, err = detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
 		return "", "", err
 	}
@@ -531,7 +620,7 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if err != nil {
 		return err
 	}
-	if err := moveMail(acct.Host, acct.Port, acct.Username, password, uint32(*uid), sourceFolder, destFolder); err != nil {
+	if err := moveMail(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider, uint32(*uid), sourceFolder, destFolder); err != nil {
 		return err
 	}
 	if destFolder == "INBOX" {

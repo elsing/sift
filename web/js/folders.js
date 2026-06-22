@@ -2,21 +2,42 @@ import { dryRunHeaders } from './util.js';
 import { removeMailById, openFolder, beginRowAnimation, endRowAnimation, render } from './inbox.js';
 import { confirmModal, promptModal } from './confirmModal.js';
 
-// Folder lists rarely change, so every sheet open here uses cache-then-network:
-// show the last-known tree instantly (no spinner, no flash) while quietly refetching
-// in the background, swapping in fresh data only if it actually differs.
-const folderCache = new Map(); // accountId -> folders array
+// Folder lists rarely change, so every sheet open here uses cache-then-network: show
+// the last-known tree instantly (no spinner, no flash) while quietly refetching in the
+// background. Persisted to localStorage (survives reloads, like tags.js's tag cache) —
+// and throttled (FOLDER_CACHE_TTL) so a fresh-enough cache skips the network call
+// entirely rather than re-running an IMAP LIST against the remote server every single
+// time a folder picker opens, which adds up for something that almost never changes.
+const FOLDER_CACHE_TTL = 5 * 60 * 1000;
+const FOLDERS_STORAGE_KEY = 'sift_folders_cache';
+const folderCache = new Map(); // accountId -> { folders, fetchedAt }
+try {
+  const stored = JSON.parse(localStorage.getItem(FOLDERS_STORAGE_KEY) || '{}');
+  for (const [id, entry] of Object.entries(stored)) folderCache.set(id, entry);
+} catch {}
 
-export async function fetchFolders(accountId) {
+function persistFolderCache() {
+  try {
+    localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(Object.fromEntries(folderCache)));
+  } catch {}
+}
+
+export async function fetchFolders(accountId, force) {
+  const entry = folderCache.get(accountId);
+  if (!force && entry && Date.now() - entry.fetchedAt < FOLDER_CACHE_TTL) {
+    return entry.folders;
+  }
   const res = await fetch(`/api/accounts/${accountId}/folders`);
   if (!res.ok) throw new Error(await res.text());
   const folders = await res.json();
-  folderCache.set(accountId, folders);
+  folderCache.set(accountId, { folders, fetchedAt: Date.now() });
+  persistFolderCache();
   return folders;
 }
 
 export function cachedFolders(accountId) {
-  return folderCache.get(accountId);
+  const entry = folderCache.get(accountId);
+  return entry && entry.folders;
 }
 
 // parentPath is "" for a root-level folder. The server joins parentPath+name using
@@ -30,6 +51,7 @@ export async function createFolder(accountId, parentPath, name) {
   });
   if (!res.ok) throw new Error(await res.text());
   folderCache.delete(accountId);
+  persistFolderCache();
 }
 
 // Renames in place (same parent, new leaf name only) — moving to a different parent
@@ -42,6 +64,7 @@ export async function renameFolder(accountId, path, newName) {
   });
   if (!res.ok) throw new Error(await res.text());
   folderCache.delete(accountId);
+  persistFolderCache();
 }
 
 export async function deleteFolderOnServer(accountId, path) {
@@ -52,6 +75,7 @@ export async function deleteFolderOnServer(accountId, path) {
   });
   if (!res.ok) throw new Error(await res.text());
   folderCache.delete(accountId);
+  persistFolderCache();
 }
 
 // A skeleton at roughly the height of a real folder tree, not "Loading…" text —
@@ -293,7 +317,7 @@ function showFolderSheet(accountId, title, treeOpts, confirm) {
     renderCurrentTree();
   };
 
-  const cached = folderCache.get(accountId);
+  const cached = cachedFolders(accountId);
   if (cached) render(cached);
   else setLoading(sheetBody, true);
 

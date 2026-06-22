@@ -1,0 +1,5 @@
+ALTER TABLE accounts ALTER COLUMN password_enc DROP NOT NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS oauth_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS oauth_refresh_token_enc BYTEA;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS oauth_access_token_enc BYTEA;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS oauth_token_expiry TIMESTAMPTZ;

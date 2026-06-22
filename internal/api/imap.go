@@ -16,35 +16,56 @@ import (
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-message/mail"
+	"github.com/emersion/go-sasl"
 )
 
 const syncCount = 30 // most recent N messages to pull per account, per regular sync
 
-// testIMAPLogin just confirms the credentials work, used when adding an account.
-func testIMAPLogin(host string, port int, username, password string) error {
+// imapAuth logs in to an already-connected client. Password accounts use plain LOGIN;
+// OAuth-linked accounts (oauthProvider != "", currently just "google") use OAUTHBEARER
+// (RFC 7628) instead, with credential being a fresh access token rather than a password
+// — Gmail's IMAP server accepts both that and the older Google-specific XOAUTH2, and
+// go-sasl only ships the standards-based one.
+func imapAuth(c *imapclient.Client, username, credential, oauthProvider string) error {
+	if oauthProvider != "" {
+		return c.Authenticate(sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{Username: username, Token: credential}))
+	}
+	return c.Login(username, credential).Wait()
+}
+
+// dialIMAP connects and authenticates in one step — nearly every IMAP-touching
+// function here did this same dial+login dance individually before OAuth accounts
+// needed a second auth path; now there's exactly one place that decides which.
+func dialIMAP(host string, port int, username, credential, oauthProvider string) (*imapclient.Client, error) {
 	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if err := imapAuth(c, username, credential, oauthProvider); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("login: %w", err)
+	}
+	return c, nil
+}
+
+// testIMAPLogin just confirms the credentials work, used when adding an account.
+func testIMAPLogin(host string, port int, username, password string) error {
+	c, err := dialIMAP(host, port, username, password, "")
+	if err != nil {
+		return err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	return nil
 }
 
 // syncIMAP fetches the most recent messages from INBOX and returns them as Mails,
 // along with the lowest UID fetched (the boundary backfill continues below).
 func syncIMAP(acct dbAccount, password string) ([]Mail, imap.UID, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return nil, 0, fmt.Errorf("connect: %w", err)
+		return nil, 0, err
 	}
 	defer c.Close()
-
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return nil, 0, fmt.Errorf("login: %w", err)
-	}
 
 	mbox, err := c.Select("INBOX", nil).Wait()
 	if err != nil {
@@ -86,15 +107,12 @@ func backfillIMAP(acct dbAccount, password string, beforeUID imap.UID, batchSize
 		return nil, 0, nil // already at the oldest message
 	}
 
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return nil, 0, fmt.Errorf("connect: %w", err)
+		return nil, 0, err
 	}
 	defer c.Close()
 
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return nil, 0, fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
 		return nil, 0, fmt.Errorf("select inbox: %w", err)
 	}
@@ -185,14 +203,11 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 // fetchMessageID looks up a single message's Message-ID header live — used to
 // backfill mails.message_id for a row cached before that column was tracked.
 func fetchMessageID(acct dbAccount, password, folder string, uid uint32) (string, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return "", fmt.Errorf("connect: %w", err)
+		return "", err
 	}
 	defer c.Close()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return "", fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		return "", fmt.Errorf("select %s: %w", folder, err)
 	}
@@ -217,14 +232,11 @@ func fetchMessageID(acct dbAccount, password, folder string, uid uint32) (string
 // what powers infinite scroll in a browsed folder, which previously didn't paginate
 // at all and just showed one fixed page.
 func fetchFolderMail(acct dbAccount, password, folder string, limit int, beforeUID uint32) ([]Mail, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, err
 	}
 	defer c.Close()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return nil, fmt.Errorf("login: %w", err)
-	}
 
 	mbox, err := c.Select(folder, nil).Wait()
 	if err != nil {
@@ -296,15 +308,12 @@ func formatMailTime(t time.Time) string {
 }
 
 // listFolders returns every mailbox name on the account and the server's hierarchy delimiter.
-func listFolders(host string, port int, username, password string) ([]string, rune, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func listFolders(host string, port int, username, password, oauthProvider string) ([]string, rune, error) {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return nil, 0, fmt.Errorf("connect: %w", err)
+		return nil, 0, err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return nil, 0, fmt.Errorf("login: %w", err)
-	}
 
 	data, err := c.List("", "*", nil).Collect()
 	if err != nil {
@@ -398,15 +407,12 @@ func envelopeSenderEmail(env *imap.Envelope) string {
 // the SPECIAL-USE extension (RFC 6154); servers that don't support it (common on
 // self-hosted Dovecot) fall back to matching common folder names. Either return value
 // can come back empty if nothing matched — that's not an error, just "not found".
-func detectSpecialUseFolders(host string, port int, username, password string) (archive, trash string, err error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func detectSpecialUseFolders(host string, port int, username, password, oauthProvider string) (archive, trash string, err error) {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return "", "", fmt.Errorf("connect: %w", err)
+		return "", "", err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return "", "", fmt.Errorf("login: %w", err)
-	}
 
 	data, err := c.List("", "*", &imap.ListOptions{ReturnSpecialUse: true}).Collect()
 	if err != nil {
@@ -443,15 +449,12 @@ func matchFolderName(data []*imap.ListData, needles ...string) string {
 }
 
 // moveMail moves a single message (by UID, within sourceFolder) to destFolder.
-func moveMail(host string, port int, username, password string, uid uint32, sourceFolder, destFolder string) error {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func moveMail(host string, port int, username, password, oauthProvider string, uid uint32, sourceFolder, destFolder string) error {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select(sourceFolder, nil).Wait(); err != nil {
 		return fmt.Errorf("select %s: %w", sourceFolder, err)
 	}
@@ -464,15 +467,12 @@ func moveMail(host string, port int, username, password string, uid uint32, sour
 // createFolder makes a new IMAP mailbox. path is the full path (e.g.
 // "Archives/Newsletters/New Folder") — the caller is responsible for using the
 // account's own hierarchy delimiter when building nested paths.
-func createFolder(host string, port int, username, password, path string) error {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func createFolder(host string, port int, username, password, oauthProvider, path string) error {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	if err := c.Create(path, nil).Wait(); err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
@@ -482,15 +482,12 @@ func createFolder(host string, port int, username, password, path string) error 
 // renameFolder renames (or moves, since IMAP rename can change the parent too) an
 // existing mailbox. Subfolders move with it automatically — that's IMAP RENAME's own
 // behavior, not something this has to do manually.
-func renameFolder(host string, port int, username, password, from, to string) error {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func renameFolder(host string, port int, username, password, oauthProvider, from, to string) error {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	if err := c.Rename(from, to, nil).Wait(); err != nil {
 		return fmt.Errorf("rename %s to %s: %w", from, to, err)
 	}
@@ -500,15 +497,12 @@ func renameFolder(host string, port int, username, password, from, to string) er
 // deleteFolder removes a mailbox. A folder containing subfolders or mail is the
 // server's own call to allow or reject — this doesn't pre-check either, the same way
 // the rest of this app lets IMAP itself be the source of truth rather than guessing.
-func deleteFolder(host string, port int, username, password, path string) error {
-	c, err := imapclient.DialTLS(net.JoinHostPort(host, fmt.Sprint(port)), nil)
+func deleteFolder(host string, port int, username, password, oauthProvider, path string) error {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return err
 	}
 	defer c.Close()
-	if err := c.Login(username, password).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	if err := c.Delete(path).Wait(); err != nil {
 		return fmt.Errorf("delete %s: %w", path, err)
 	}
@@ -540,14 +534,11 @@ type Attachment struct {
 // ponytail: no inline images/attachments resolved into the HTML yet — cid: references
 // will show as broken images. Add a part-fetching pass if that's needed.
 func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBody, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return MailBody{}, fmt.Errorf("connect: %w", err)
+		return MailBody{}, err
 	}
 	defer c.Close()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return MailBody{}, fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select(folder, nil).Wait(); err != nil {
 		return MailBody{}, fmt.Errorf("select %s: %w", folder, err)
 	}
@@ -619,14 +610,11 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 // assigned). A second IMAP round trip per download rather than caching every
 // attachment's bytes from the original body fetch, which most opens never need.
 func fetchMailAttachment(acct dbAccount, password, folder string, uid uint32, index int) (Attachment, []byte, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return Attachment{}, nil, fmt.Errorf("connect: %w", err)
+		return Attachment{}, nil, err
 	}
 	defer c.Close()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return Attachment{}, nil, fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select(folder, nil).Wait(); err != nil {
 		return Attachment{}, nil, fmt.Errorf("select %s: %w", folder, err)
 	}

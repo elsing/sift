@@ -3,13 +3,25 @@
 import { dryRunHeaders, withBusyButton } from './util.js';
 import { confirmModal } from './confirmModal.js';
 
+// Tags change far less often than mail does — worth persisting across reloads/PWA
+// relaunches (unlike the in-memory-only mail caches elsewhere), not just within a
+// single page session. createTag/updateTag/deleteTag below still null this out on any
+// change, so the next fetchTags() call goes to the network and overwrites it.
+const TAGS_STORAGE_KEY = 'sift_tags_cache';
 let cachedTags = null;
+try {
+  const stored = localStorage.getItem(TAGS_STORAGE_KEY);
+  if (stored) cachedTags = JSON.parse(stored);
+} catch {}
 
 export async function fetchTags(force) {
   if (cachedTags && !force) return cachedTags;
   const res = await fetch('/api/tags');
   if (!res.ok) throw new Error(await res.text());
   cachedTags = await res.json();
+  try {
+    localStorage.setItem(TAGS_STORAGE_KEY, JSON.stringify(cachedTags));
+  } catch {}
   return cachedTags;
 }
 

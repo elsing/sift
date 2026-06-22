@@ -5,14 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 // Tunable thresholds for the smart-tagging scorer (Phase 2 reads these too — defined
@@ -651,14 +648,22 @@ func (s *Store) handleBlockSenderTagHistory(w http.ResponseWriter, r *http.Reque
 func (s *Store) handleGetOwnerSettings(w http.ResponseWriter, r *http.Request, owner string) {
 	mode := "review"
 	delay := 3
-	s.db.QueryRow("SELECT auto_tag_mode, auto_move_delay_days FROM owner_settings WHERE owner_subject = $1", owner).Scan(&mode, &delay)
-	writeJSON(w, map[string]any{"autoTagMode": mode, "autoMoveDelayDays": delay})
+	imageRetention := 90
+	var backfillCompletedAt *time.Time
+	s.db.QueryRow(
+		"SELECT auto_tag_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at FROM owner_settings WHERE owner_subject = $1", owner,
+	).Scan(&mode, &delay, &imageRetention, &backfillCompletedAt)
+	writeJSON(w, map[string]any{
+		"autoTagMode": mode, "autoMoveDelayDays": delay,
+		"imageCacheRetentionDays": imageRetention, "imageBackfillCompletedAt": backfillCompletedAt,
+	})
 }
 
 func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, owner string) {
 	var req struct {
-		AutoTagMode       string `json:"autoTagMode"`
-		AutoMoveDelayDays int    `json:"autoMoveDelayDays"`
+		AutoTagMode             string `json:"autoTagMode"`
+		AutoMoveDelayDays       int    `json:"autoMoveDelayDays"`
+		ImageCacheRetentionDays int    `json:"imageCacheRetentionDays"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
@@ -671,10 +676,17 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	if req.AutoMoveDelayDays < 0 {
 		req.AutoMoveDelayDays = 0
 	}
+	if req.ImageCacheRetentionDays < 1 {
+		req.ImageCacheRetentionDays = 1
+	}
+	if req.ImageCacheRetentionDays > imageBackfillMaxDays {
+		req.ImageCacheRetentionDays = imageBackfillMaxDays
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO owner_settings (owner_subject, auto_tag_mode, auto_move_delay_days) VALUES ($1, $2, $3)
-		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, auto_move_delay_days = excluded.auto_move_delay_days`,
-		owner, req.AutoTagMode, req.AutoMoveDelayDays,
+		INSERT INTO owner_settings (owner_subject, auto_tag_mode, auto_move_delay_days, image_cache_retention_days) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, auto_move_delay_days = excluded.auto_move_delay_days,
+			image_cache_retention_days = excluded.image_cache_retention_days`,
+		owner, req.AutoTagMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -746,7 +758,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 
 	// Resolved once up front and reused below — both for excluding Trash from "all
 	// folders" scans, and for the new-tag-candidate guard further down.
-	_, trashFolder, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password)
+	_, trashFolder, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 
 	var names []string
 	if len(folders) > 0 {
@@ -754,7 +766,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 	} else if scope == "inbox" {
 		names = []string{"INBOX"}
 	} else {
-		names, _, err = listFolders(acct.Host, acct.Port, acct.Username, password)
+		names, _, err = listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 		if err != nil {
 			return summary, err
 		}
@@ -799,29 +811,11 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 		folder string
 	}
 	var all []mailInFolder
-	for i, folder := range names {
-		if ctx.Err() != nil {
-			return summary, ctx.Err() // client closed the connection (e.g. tapped Cancel) — stop burning IMAP round trips on a scan nobody's waiting for
-		}
-		mails, err := fetchFolderMail(acct, password, folder, scanFolderLimit, 0)
-		if err == nil {
-			// Without this, scanned mail was never cached locally at all — there was no
-			// mails.id to resolve, so a scan-derived suggestion could never be opened
-			// from the Smart Tagging panel (the "click into a suggestion" feature
-			// silently had nothing to point at for anything the scan found).
-			for i := range mails {
-				mails[i].AccountID = accountID
-			}
-			if err := s.upsertMails(accountID, mails); err != nil {
-				log.Printf("cache scanned mail %s/%s: %v", acct.Email, folder, err)
-			}
-			for _, m := range mails {
-				all = append(all, mailInFolder{m, folder})
-			}
-		} // unselectable/empty folder — skip, not fatal to the rest of the scan
-		if onProgress != nil {
-			onProgress(i+1, len(names))
-		}
+	err = s.walkAccountFolders(ctx, acct, password, accountID, names, scanFolderLimit, func(m Mail, folder string) {
+		all = append(all, mailInFolder{m, folder})
+	}, onProgress)
+	if err != nil {
+		return summary, err
 	}
 
 	// Every folder's been fetched, but scoring every mail against tag history (several
@@ -1141,16 +1135,12 @@ func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
 		sendEvent("error", map[string]string{"message": err.Error()})
 		return
 	}
 	defer c.Close()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
-	}
 	mbox, err := c.Select(folder, nil).Wait()
 	if err != nil {
 		sendEvent("error", map[string]string{"message": err.Error()})

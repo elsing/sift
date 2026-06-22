@@ -1,25 +1,3 @@
-/* Self-hosted (not Google Fonts' CDN) — this app already goes out of its way to avoid
-   third-party requests (blocked remote images by default, no external trackers), and
-   a font load on every page view would quietly undo that. Fraunces is a variable
-   font: one file covers the whole weight range plus its own "optical size" (opsz),
-   "soft" (rounded terminals), and "wonk" (old-style character/quirk) axes. */
-@font-face {
-  font-family: 'Fraunces';
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url('fonts/Fraunces-latin.woff2') format('woff2');
-  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-}
-@font-face {
-  font-family: 'Fraunces';
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url('fonts/Fraunces-latin-ext.woff2') format('woff2');
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-}
-
 :root {
   --bg: #1a1625;
   --bg-row: #1a1625;
@@ -76,26 +54,16 @@
 [data-palette="candy"] { --accent: #ff6fae; --archive: #4ecdc4; --delete: #ff6b6b; --move: #c77dff; }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+/* Three custom fonts (Fraunces, Lora, Source Serif 4) all missed in one way or
+   another — plain system default, no custom font-family at all, is what this app
+   looked best with the whole time. */
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
-  font-family: 'Fraunces', -apple-system, BlinkMacSystemFont, serif; overscroll-behavior-y: contain;
-  scrollbar-width: none; transition: background-color 0.25s ease, color 0.25s ease;
-  /* opsz auto: the browser picks a point on Fraunces' own optical-size axis based on
-     the rendered font-size, so a dense list at 13px automatically gets a calmer, more
-     legible cut while a big heading gets the full ornamental character — without
-     having to hand-tune opsz per rule. SOFT/WONK still need setting explicitly (not
-     size-driven), see the heading/display override below for where those go further. */
-  font-optical-sizing: auto;
-  font-variation-settings: 'SOFT' 25, 'WONK' 0; }
+  overscroll-behavior-y: contain;
+  scrollbar-width: none; transition: background-color 0.25s ease, color 0.25s ease; }
 html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
 
-/* Big, infrequent, "this is the app's voice" text gets a touch more old-style
-   character — the topbar wordmark, panel titles, the tag-group badges just
-   redesigned to be more colorful. WONK is the genuinely old-timey quirk (asymmetric,
-   slightly irregular letterforms) — dialed back to a hint of it, not the full effect,
-   which read as too costume-y for an everyday UI. Small/dense text (mail list rows,
-   buttons, form fields) stays on the calmer body default above. */
 .topbar-brand, h2, h3, .tag-group-badge {
-  font-variation-settings: 'SOFT' 55, 'WONK' 0.35;
+  font-weight: 600;
 }
 
 /* Form controls don't inherit the page font by default in any browser's UA
@@ -112,7 +80,14 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
 }
 
-.sticky-header { position: sticky; top: 0; z-index: 10; background: var(--bg); }
+/* Fixed, not sticky — position: sticky only tracks the viewport correctly while its
+   containing block is the normal document flow; it broke (and stayed broken until
+   reload) the moment anything changed that out from under it, e.g. the old scroll-lock
+   override below used to need to exist at all. Fixed sidesteps that class of bug
+   entirely. body's padding-top (kept in sync in main.js via ResizeObserver, since this
+   header's height varies with which banners are showing) reserves the space this no
+   longer takes up in-flow. */
+.sticky-header { position: fixed; top: 0; left: 0; right: 0; z-index: 10; background: var(--bg); }
 
 .topbar {
   padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 12px;
@@ -211,13 +186,24 @@ button:active { transform: scale(0.9); opacity: 0.8; }
    not one static glyph flashing in place. */
 .row-burst { position: absolute; inset: 0; pointer-events: none; z-index: 2; overflow: visible; }
 .row-burst-shard {
-  position: absolute; top: 50%; left: 50%; width: 11px; height: 11px; border-radius: 3px;
-  margin: -5px 0 0 -5px; opacity: 0; box-shadow: 0 0 4px rgba(0,0,0,0.25);
+  position: absolute; top: 50%; left: 50%; width: 16px; height: 16px; border-radius: 4px;
+  margin: -8px 0 0 -8px; opacity: 0; box-shadow: 0 0 6px rgba(0,0,0,0.35);
 }
-.row-burst.bursting .row-burst-shard { animation: row-shard-pop 0.34s cubic-bezier(.2,.8,.4,1) forwards; }
+/* A quick bright flash at the very center, right as the shards launch — gives the
+   burst an actual point of impact instead of just particles appearing mid-air. */
+.row-burst::before {
+  content: ''; position: absolute; top: 50%; left: 50%; width: 10px; height: 10px;
+  margin: -5px 0 0 -5px; border-radius: 50%; background: #fff; opacity: 0;
+}
+.row-burst.bursting::before { animation: row-burst-flash 0.22s ease-out forwards; }
+@keyframes row-burst-flash {
+  0%   { transform: scale(0.4); opacity: 0.9; }
+  100% { transform: scale(4.5); opacity: 0; }
+}
+.row-burst.bursting .row-burst-shard { animation: row-shard-pop 0.42s cubic-bezier(.15,.85,.3,1) forwards; }
 @keyframes row-shard-pop {
-  0%   { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 1; }
-  100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(0.4); opacity: 0; }
+  0%   { transform: translate(0, 0) rotate(0deg) scale(1.3); opacity: 1; }
+  100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(0.3); opacity: 0; }
 }
 
 .row-action {
@@ -645,11 +631,6 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .tag-manager-card:last-child { border-bottom: none; }
 .tag-manager-card .account-row { margin-bottom: 4px; }
 
-/* While an overlay holds the body scroll lock (position: fixed, see lockBody() in
-   inbox.js), .sticky-header's own position: sticky stops tracking the viewport the way
-   it normally does — its containing block just changed out from under it — and visibly
-   jumps. Pin it to the viewport directly for the duration instead of relying on sticky. */
-body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; }
 
 /* Sticky-positioning the header inside one big scrolling panel kept breaking under
    real-world conditions (nested fixed-position ancestors elsewhere in the app, iOS
@@ -763,7 +744,17 @@ body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; 
 
 .folder-empty-status { padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 14px; }
 
-.search-form { margin-bottom: 10px; }
+/* Pinned to the top of #searchPanel's own scroll (sticky relative to it, not the page —
+   the panel itself is what scrolls), so it doesn't disappear upward once results push
+   the panel's content taller than the screen. Negative top margin + matching padding
+   cancels out the panel's own top padding (safe-area inset + 20px) for this one element,
+   so it sticks flush with zero gap instead of leaving a sliver of scrolled-past content
+   peeking above it. */
+.search-form {
+  margin: calc(-1 * (env(safe-area-inset-top, 0px) + 20px)) 0 10px;
+  padding-top: calc(env(safe-area-inset-top, 0px) + 20px);
+  position: sticky; top: 0; z-index: 5; background: var(--bg);
+}
 .search-form-row { display: flex; align-items: center; gap: 8px; }
 .search-form input {
   flex: 1; min-width: 0; background: var(--input-bg); border: 2px solid var(--border);
@@ -781,11 +772,18 @@ body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; 
   background: none; border: none; color: var(--text-dim); font-size: 12px;
   font-weight: 700; padding: 0; margin-bottom: 8px;
 }
-.search-advanced { margin-bottom: 12px; }
+.search-advanced { margin-bottom: 12px; padding-top: 4px; }
 .search-advanced.hidden { display: none; }
 .search-advanced input[type="text"] {
   width: 100%; background: var(--input-bg); border: 2px solid var(--border);
-  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 8px;
+  border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 12px;
+}
+/* A small heading, not just a bare row of chips with nothing saying what they're for —
+   the tag filter used to sit directly under "Choose folders…" with zero separation,
+   reading as a continuation of the folder picker instead of its own filter. */
+.search-section-label {
+  font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;
+  letter-spacing: 0.04em; margin: 14px 0 6px;
 }
 #historySection.hidden { display: none; }
 #smartHistorySearch {
@@ -794,17 +792,22 @@ body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; 
 }
 .smart-history-row.openable, .smart-history-meta.openable { cursor: pointer; }
 .search-date-range {
-  display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text-dim);
+  display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--text-dim);
 }
 .search-date-range input[type="date"] {
   flex: 1; background: var(--input-bg); border: 2px solid var(--border);
   border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px;
 }
-.search-folder-picker.hidden { display: none; }
-.search-folder-picker { margin-bottom: 8px; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; }
+.search-clear-dates {
+  flex: none; width: 28px; height: 28px; border-radius: 50%; background: none;
+  border: 2px solid var(--border); color: var(--text-dim); font-size: 12px; padding: 0;
+}
 .search-tag-filter {
-  flex-wrap: wrap; overflow: visible; border: none; background: none;
-  padding: 0; margin: 8px 0 0; max-height: 90px; overflow-y: auto; overscroll-behavior: contain;
+  flex-wrap: wrap; border: none; background: none; padding: 0; margin: 8px 0 0;
+  max-height: none; overflow: visible; transition: max-height 0.2s ease;
+}
+.search-tag-filter.collapsed {
+  max-height: 34px; overflow-y: auto; overscroll-behavior: contain;
 }
 .search-progress { margin-bottom: 10px; }
 .search-progress.hidden { display: none; }
@@ -826,11 +829,12 @@ body.scroll-locked .sticky-header { position: fixed; top: 0; left: 0; right: 0; 
   50% { transform: translateY(-8px) rotate(4deg); }
 }
 
-.show-add-account-btn {
+.connect-google-btn, .show-add-account-btn {
   display: block; width: 100%; background: none; border: 2px dashed var(--border);
   border-radius: 14px; color: var(--accent); font-weight: 700; font-size: 14px;
-  padding: 10px; margin-bottom: 16px;
+  padding: 10px; margin-bottom: 10px; text-align: center; text-decoration: none;
 }
+.show-add-account-btn { margin-bottom: 16px; }
 
 #addAccountForm { display: flex; flex-direction: column; gap: 10px; }
 #addAccountForm.hidden { display: none; }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 const searchResultLimit = 50
@@ -362,16 +360,13 @@ func (s *Store) ownedAccountIDs(owner string, filter []string) ([]string, error)
 }
 
 func listFoldersForSearch(acct dbAccount, password string) ([]string, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, err
 	}
 	defer c.Close()
 	watchdog := time.AfterFunc(perFolderSearchTimeout, func() { c.Close() })
 	defer watchdog.Stop()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return nil, fmt.Errorf("login: %w", err)
-	}
 	data, err := c.List("", "*", nil).Collect()
 	if err != nil {
 		return nil, err
@@ -412,16 +407,13 @@ func parseSearchDate(s string) (time.Time, error) {
 const perFolderSearchTimeout = 12 * time.Second
 
 func searchFolder(acct dbAccount, password, folder, query, from string, deep bool, since, before time.Time) ([]Mail, error) {
-	c, err := imapclient.DialTLS(net.JoinHostPort(acct.Host, fmt.Sprint(acct.Port)), nil)
+	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, err
 	}
 	defer c.Close()
 	watchdog := time.AfterFunc(perFolderSearchTimeout, func() { c.Close() })
 	defer watchdog.Stop()
-	if err := c.Login(acct.Username, password).Wait(); err != nil {
-		return nil, fmt.Errorf("login: %w", err)
-	}
 	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		return nil, nil // unselectable mailbox (e.g. a \Noselect parent node) — skip it
 	}

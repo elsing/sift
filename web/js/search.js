@@ -1,12 +1,12 @@
 import { currentFolder, openFolder } from './inbox.js';
 import { getSelectedAccountIds } from './accountFilter.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
-import { renderFolderTree, fetchFolders, cachedFolders, setLoading } from './folders.js';
+import { pickFolders } from './folders.js';
 import { fetchTags } from './tags.js';
 
 let panel, input, scopeBtn, accountScopeEl, errorEl, results;
 let progressWrap, progressFill, progressText, deepBtn, continueBtn;
-let advancedToggle, advancedPanel, fromInput, sinceInput, beforeInput, folderPickerToggle, folderPicker, tagFilterEl;
+let advancedToggle, advancedPanel, fromInput, sinceInput, beforeInput, folderPickerToggle, tagFilterEl;
 let searchAllFolders = true; // toggled off via scopeBtn to restrict to the folder you opened search from
 let currentSource = null;
 let matches = [];
@@ -41,8 +41,35 @@ export function setupSearch() {
   sinceInput = document.getElementById('searchSinceInput');
   beforeInput = document.getElementById('searchBeforeInput');
   folderPickerToggle = document.getElementById('searchFolderPickerToggle');
-  folderPicker = document.getElementById('searchFolderPicker');
   tagFilterEl = document.getElementById('searchTagFilter');
+
+  // Previous attempts resized #searchPanel itself (to visualViewport.height) — that's
+  // what caused the worse regressions (a stuck-short panel, jank from toolbar-driven
+  // resize events, a literal gap exposing the inbox underneath). The panel's own
+  // size/position is never touched now, full stop — still plain `position: fixed;
+  // inset: 0`, always fully covering the screen regardless of keyboard state.
+  //
+  // But that on its own left genuinely nothing to scroll for a short result list: the
+  // panel's box never shrinks, so its scrollable content (input + filters + a couple of
+  // results) can easily be shorter than that box even while the keyboard visually
+  // covers the bottom third of it — scrollBy/scrollIntoView have no effect when there's
+  // no overflow to scroll into in the first place. Padding the *results* element specif-
+  // ically (never the panel) by the actual keyboard height — window.innerHeight minus
+  // visualViewport.height, the one number iOS reports correctly — manufactures that
+  // room without changing what the panel itself covers.
+  if (window.visualViewport) {
+    const syncKeyboardPadding = () => {
+      if (document.activeElement !== input) {
+        results.style.paddingBottom = '';
+        return;
+      }
+      const keyboardHeight = Math.max(0, window.innerHeight - window.visualViewport.height);
+      results.style.paddingBottom = keyboardHeight > 0 ? `${keyboardHeight}px` : '';
+    };
+    window.visualViewport.addEventListener('resize', syncKeyboardPadding);
+    input.addEventListener('focus', syncKeyboardPadding);
+    input.addEventListener('blur', syncKeyboardPadding);
+  }
 
   document.getElementById('searchBtn').addEventListener('click', openSearch);
   document.getElementById('closeSearchBtn').addEventListener('click', closeSearch);
@@ -67,6 +94,14 @@ export function setupSearch() {
 
   folderPickerToggle.addEventListener('click', () => openFolderPicker());
 
+  // The 1-month default (openSearch, below) needs an easy way back out to "no date
+  // filter at all" — clearing two date fields by hand felt fiddlier than it should.
+  document.getElementById('searchClearDatesBtn').addEventListener('click', () => {
+    sinceInput.value = '';
+    beforeInput.value = '';
+    if (hasQuery()) startSearch('light');
+  });
+
   // search-as-you-type, debounced — always "light" (headers only): cheap enough to
   // run on every pause, unlike a full body search across every folder
   let debounce;
@@ -79,9 +114,11 @@ export function setupSearch() {
       deepBtn.classList.add('hidden');
       continueBtn.classList.add('hidden');
       progressWrap.classList.add('hidden');
+      tagFilterEl.classList.remove('collapsed');
+      if (!advancedPanel.classList.contains('hidden')) renderTagFilter();
       return;
     }
-    debounce = setTimeout(() => startSearch('light'), 400);
+    debounce = setTimeout(() => startSearch('light'), 700);
   };
   input.addEventListener('input', onFilterInput);
   fromInput.addEventListener('input', onFilterInput);
@@ -96,45 +133,17 @@ function hasQuery() {
   return input.value.trim() !== '' || fromInput.value.trim() !== '' || sinceInput.value !== '' || beforeInput.value !== '' || chosenTags.size > 0;
 }
 
-// Folder picker only really makes sense scoped to one account (folder names are
-// account-specific) — with several accounts selected, fall back to "all folders"
-// rather than trying to merge unrelated folder trees into one picker.
-async function openFolderPicker() {
-  const showing = !folderPicker.classList.contains('hidden');
-  if (showing) {
-    folderPicker.classList.add('hidden');
-    return;
-  }
-
-  const res = await fetch('/api/accounts');
-  if (!res.ok) return;
-  const accounts = await res.json();
-  const selectedIds = getSelectedAccountIds();
-  const inScope = selectedIds ? accounts.filter((a) => selectedIds.includes(a.id)) : accounts;
-  if (inScope.length !== 1) {
-    folderPicker.classList.remove('hidden');
-    folderPicker.textContent = 'Pick a single account above (in the account filter) to choose specific folders.';
-    return;
-  }
-
-  const accountId = inScope[0].id;
-  folderPicker.classList.remove('hidden');
-  const render = (folders) => {
-    folderPicker.innerHTML = '';
-    folderPicker.appendChild(renderFolderTree(folders, { checkSet: chosenFolders }));
-  };
-  const cached = cachedFolders(accountId);
-  if (cached) render(cached);
-  else setLoading(folderPicker, true);
-  try {
-    const folders = await fetchFolders(accountId);
-    if (!folderPicker.classList.contains('hidden')) render(folders);
-  } catch (err) {
-    if (!cached) {
-      folderPicker.textContent = '';
-      errorEl.textContent = err.message;
-    }
-  }
+// Uses the same shared move-to-folder modal every other folder picker in the app
+// already uses (checkbox mode, account-picked-first if there's more than one) —
+// the old version rendered its own inline tree directly in the search panel, which
+// is exactly what made the panel feel cramped/overlapping.
+function openFolderPicker() {
+  pickFolders('Search these folders', chosenFolders, () => {
+    folderPickerToggle.textContent = chosenFolders.size > 0
+      ? `${chosenFolders.size} folder${chosenFolders.size === 1 ? '' : 's'} chosen`
+      : 'Choose folders…';
+    if (hasQuery()) startSearch('light');
+  });
 }
 
 async function renderTagFilter() {
@@ -146,6 +155,12 @@ async function renderTagFilter() {
   }
   tagFilterEl.innerHTML = '';
   if (tags.length === 0) return;
+  // Once a search is actually running, the full tag list is just noise next to the
+  // results — only the ones you picked still matter, capped well under what the
+  // collapsed strip could ever show anyway.
+  if (tagFilterEl.classList.contains('collapsed')) {
+    tags = tags.filter((t) => chosenTags.has(t.id)).slice(0, 8);
+  }
   for (const tag of tags) {
     const chip = document.createElement('button');
     chip.type = 'button';
@@ -176,17 +191,23 @@ function openSearch() {
   }
   input.value = '';
   fromInput.value = '';
-  sinceInput.value = '';
+  // A blank date range looked like something had gone wrong rather than "no filter
+  // set yet" — defaulting to the last month gives it an obviously-intentional
+  // starting point instead, one tap away from being changed or cleared entirely.
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+  sinceInput.value = oneMonthAgo.toISOString().slice(0, 10);
   beforeInput.value = '';
   chosenFolders.clear();
+  folderPickerToggle.textContent = 'Choose folders…';
   advancedPanel.classList.add('hidden');
   advancedToggle.textContent = 'Advanced filters ▾';
-  folderPicker.classList.add('hidden');
   results.innerHTML = '';
   errorEl.textContent = '';
   progressWrap.classList.add('hidden');
   deepBtn.classList.add('hidden');
   continueBtn.classList.add('hidden');
+  tagFilterEl.classList.remove('collapsed');
   input.focus();
   updateAccountScopeLabel();
 }
@@ -249,6 +270,12 @@ function startSearch(mode, resumeToken) {
     matches = [];
     results.innerHTML = '';
   }
+  // Tag filter starts fully open (room to pick tags before you've typed anything) and
+  // shrinks down once an actual search is running — no point spending vertical space
+  // on the full picker once results are what you're looking at, just the tags you
+  // actually filtered by.
+  tagFilterEl.classList.add('collapsed');
+  renderTagFilter();
   progressWrap.classList.remove('hidden');
   progressFill.style.width = resumeToken ? progressFill.style.width : '0%';
   progressText.textContent = resumeToken
@@ -369,5 +396,21 @@ function renderResults(mails) {
       setReaderBack(() => panel.classList.remove('hidden'));
     });
     results.appendChild(li);
+  }
+  // scrollIntoView checks visibility against the panel's own (unshrunk, full-layout-
+  // viewport) bounds — it has no idea the keyboard is covering the bottom portion of
+  // that box, so it considers a result "in view" even when it's visually hidden behind
+  // the keyboard. window.visualViewport.height is the one number that's actually
+  // correct here (the genuinely visible height above the keyboard), so this computes
+  // the exact scroll distance by hand instead of asking the browser to guess.
+  if (mails.length > 0 && document.activeElement === input && window.visualViewport) {
+    requestAnimationFrame(() => {
+      const last = results.lastElementChild;
+      if (!last) return;
+      const overflow = last.getBoundingClientRect().bottom - window.visualViewport.height;
+      if (overflow > 0) {
+        panel.scrollBy({ top: overflow + 16, behavior: 'smooth' });
+      }
+    });
   }
 }

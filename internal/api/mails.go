@@ -62,6 +62,8 @@ type Store struct {
 	db     *sql.DB
 	crypto *encryptor
 
+	oauthStates *oauthStateStore
+
 	broadcaster *broadcaster
 
 	watchCtx     context.Context
@@ -94,7 +96,7 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		db: db, crypto: crypto, broadcaster: newBroadcaster(),
+		db: db, crypto: crypto, broadcaster: newBroadcaster(), oauthStates: newOAuthStateStore(),
 		watchCancels:         make(map[string]context.CancelFunc),
 		selfMovedIntoInboxAt: make(map[string]time.Time),
 	}
@@ -183,6 +185,7 @@ func (s *Store) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/mails/{id}/body", s.handleMailBody)
 	mux.HandleFunc("GET /api/mails/{id}/attachments/{index}", s.handleMailAttachment)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("GET /api/image-proxy", s.handleImageProxy)
 }
 
 // accountFilter parses the optional ?accounts=id1,id2 query param. An empty result
