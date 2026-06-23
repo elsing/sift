@@ -6,8 +6,8 @@
 // target for the whole gesture in iOS standalone/PWA mode, where Pointer Events + setPointerCapture
 // have known quirks (gesture randomly reverts to native scroll mid-drag).
 import { dryRunHeaders } from './util.js';
-import { renderTagChips, setupFolderAutoTagSelect } from './tags.js';
-import { moveRowToFolder } from './folders.js';
+import { renderTagChips, setupFolderAutoTagSelect, fetchTagDestinations } from './tags.js';
+import { moveRowToFolder, invalidateAllFolderCaches } from './folders.js';
 
 const EDGE_GUARD = 20;     // px from screen edge where swipe is ignored, avoids iOS back/app-switcher gesture
 const COMMIT_RATIO = 0.3;  // fraction of row width dragged at release-time to commit; below this, releasing cancels
@@ -96,7 +96,32 @@ export function setHandlers({ onMove, onTap, onTag }) {
 // always blocked on a live IMAP fetch. Same cache-then-network pattern already used
 // for the folder tree itself: show the last-known list instantly, then quietly
 // refetch and replace it. force=true (pull-to-refresh) skips straight to network.
+//
+// Persisted to sessionStorage too — an in-memory-only Map meant every reload/PWA
+// relaunch started cold again, still paying for at least the server's fast local-DB
+// read (cacheOnly) even for a folder visited two minutes ago. sessionStorage (not
+// localStorage) since mail content goes stale faster than folder structure does —
+// scoped to "this browsing session," not "forever until something invalidates it."
+// Capped at the 10 most recently touched folders so this can't grow unbounded.
+const FOLDER_MAIL_STORAGE_KEY = 'sift_folder_mail_cache';
+const FOLDER_MAIL_CACHE_LIMIT = 10;
 const folderMailCache = new Map(); // "accountId|path" -> mails array
+try {
+  const stored = JSON.parse(sessionStorage.getItem(FOLDER_MAIL_STORAGE_KEY) || '{}');
+  for (const [key, mails] of Object.entries(stored)) folderMailCache.set(key, mails);
+} catch {}
+
+function persistFolderMailCache() {
+  try {
+    // Map iteration order is insertion order — dropping from the front is a
+    // reasonable approximate-LRU eviction without needing a real LRU structure for
+    // what's realistically a handful of folders per session.
+    while (folderMailCache.size > FOLDER_MAIL_CACHE_LIMIT) {
+      folderMailCache.delete(folderMailCache.keys().next().value);
+    }
+    sessionStorage.setItem(FOLDER_MAIL_STORAGE_KEY, JSON.stringify(Object.fromEntries(folderMailCache)));
+  } catch {}
+}
 
 // Keeps `mails` itself newest-first, not just the rendered display order — buildDisplayItems
 // sorts its own derived list for display, but the underlying array was never sorted to
@@ -135,7 +160,7 @@ let activeRowAnimations = 0;
 export function beginRowAnimation() { activeRowAnimations++; }
 export function endRowAnimation() { activeRowAnimations = Math.max(0, activeRowAnimations - 1); }
 
-export async function fetchMails(force) {
+export async function fetchMails(force, live) {
   if (currentFolder) {
     const cacheKey = currentFolder.accountId + '|' + currentFolder.path;
     const cached = !force && folderMailCache.get(cacheKey);
@@ -143,28 +168,27 @@ export async function fetchMails(force) {
       mails = cached;
       hasMore = mails.length === PAGE_SIZE; // matches loadMore's own heuristic below
       render();
-    } else if (!force) {
-      // No in-memory cache (first visit this page load) — try the server's own local
-      // cache (populated by any previous live fetch, survives reloads) before paying
-      // for a live IMAP round trip, which can take seconds against a remote server.
-      // Best-effort: a miss/failure here just means the skeleton stays up a bit longer,
-      // same as before this existed.
-      const { accountId, path } = currentFolder;
-      fetch(`/api/accounts/${accountId}/folder-mails?path=${encodeURIComponent(path)}&cacheOnly=1`)
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (!data || data.length === 0) return;
-          if (!currentFolder || currentFolder.accountId !== accountId || currentFolder.path !== path) return;
-          if (folderMailCache.get(cacheKey)) return; // the live fetch already landed first
-          mails = data;
-          sortMailsNewestFirst();
-          hasMore = mails.length === PAGE_SIZE;
-          render();
-        })
-        .catch(() => {});
     }
+    // The server's own copy is DB-backed and instant by default now — no IMAP round
+    // trip here at all unless `live` is explicitly set, which only refreshMails'
+    // actual pull-to-refresh gesture does. force alone (the SSE/visibility-change
+    // auto-refreshes below) just means "skip the stale in-memory flash, re-read the
+    // DB" — still no IMAP, just no longer just trusting the in-memory copy either.
+    // An ordinary visit just reads whatever the periodic full-folder sync
+    // (watchFolderMailSync, server-side) and this account's IMAP IDLE watch have
+    // already kept current — not this request's job.
+    //
+    // Captured before this replaces `mails` with just its first page — reflects
+    // however deep this folder was already showing (cache hit or not). Without paging
+    // back up afterward (catchUpToDepth, same as the inbox path below already does),
+    // every single revisit to a folder you'd previously scrolled into snapped back
+    // down to page 1, several pages worth of already-loaded mail just gone until
+    // manually scrolled back down through again — which read as mail "missing" or
+    // whole date ranges "skipped."
+    const folderTargetCount = Math.max(mails.length, PAGE_SIZE * 2);
     const myGen = ++fetchGeneration;
-    const res = await fetch(`/api/accounts/${currentFolder.accountId}/folder-mails?path=${encodeURIComponent(currentFolder.path)}`);
+    const liveParam = live ? '&live=1' : '';
+    const res = await fetch(`/api/accounts/${currentFolder.accountId}/folder-mails?path=${encodeURIComponent(currentFolder.path)}${liveParam}`);
     if (!res.ok) {
       const msg = await res.text();
       if (cached) return; // keep showing what we had rather than blow it away on a failed refresh
@@ -175,7 +199,19 @@ export async function fetchMails(force) {
     mails = data;
     sortMailsNewestFirst();
     folderMailCache.set(cacheKey, mails);
+    persistFolderMailCache();
     hasMore = mails.length === PAGE_SIZE;
+    // Rendered now, with just the first page, rather than waiting for the whole
+    // catch-up-to-previous-depth chain below to finish first — that chain is several
+    // sequential network round trips (one per page) when a folder was previously
+    // scrolled deep, and over a real network (not a local docker network — a phone
+    // over a VPN tunnel, say) each one of those round trips pays real latency on top
+    // of how fast the query itself runs. Caller still does .then(render) once this
+    // whole function resolves, which repaints again once depth is fully restored.
+    render();
+    await catchUpToDepth(folderTargetCount);
+    folderMailCache.set(cacheKey, mails);
+    persistFolderMailCache();
     return;
   }
   const targetCount = Math.max(mails.length, PAGE_SIZE * 2);
@@ -185,6 +221,9 @@ export async function fetchMails(force) {
   if (myGen !== fetchGeneration) return;
   mails = data;
   hasMore = mails.length === PAGE_SIZE;
+  // Same "don't wait for the whole catch-up chain" reasoning as the folder branch
+  // above — first page renders immediately, catch-up continues behind it.
+  render();
   // Same reasoning as refreshMails below: a brand-new mail at the very top can share a
   // tag with something that's always just past page 1 — this isn't only a refresh
   // problem, the plain initial page load (main.js's startup fetchMails().then(render))
@@ -217,7 +256,7 @@ async function catchUpToDepth(targetCount) {
 }
 
 export async function refreshMails() {
-  if (currentFolder) return fetchMails(true); // force network, skip the cached flash
+  if (currentFolder) return fetchMails(true, true); // the actual pull-to-refresh gesture — the one place that should hit IMAP live
   // Always catch up to at least 2 pages, not just whatever depth was there before —
   // a brand-new mail at the very top, sharing a tag with something that's always
   // just past page 1, would otherwise show up ungrouped every single refresh (not
@@ -226,6 +265,15 @@ export async function refreshMails() {
   const targetCount = Math.max(mails.length, PAGE_SIZE * 2);
   const myGen = ++fetchGeneration;
   const res = await fetch(`/api/mails/refresh?${accountsQueryParam('')}`, { method: 'POST' });
+  if (!res.ok) {
+    // The server fails this whole request (a plain-text 502, not JSON) if even one
+    // account's IMAP sync hiccups — calling .json() on that unconditionally used to
+    // throw a SyntaxError here instead of a clear message, with nothing downstream
+    // ever catching it (see endPull in setupPullToRefresh, which had no .catch() on
+    // this at all) — silently wedging pull-to-refresh's "locked" state forever, which
+    // is what showed up as the UI going blank/unresponsive after a failed refresh.
+    throw new Error((await res.text()) || 'refresh failed');
+  }
   const data = await res.json();
   if (myGen !== fetchGeneration) return;
   mails = data;
@@ -246,10 +294,14 @@ export async function loadMore(skipRender = false) {
   const oldest = mails[mails.length - 1];
   let more;
   if (currentFolder) {
-    // IMAP has no date-cursor equivalent here — page by UID instead (also
-    // monotonic, same idea): fetch the next batch with UID below the oldest one
-    // already loaded.
-    const params = `path=${encodeURIComponent(currentFolder.path)}&beforeUid=${oldest.uid || ''}`;
+    // Same date+id cursor as the no-folder branch below now that this reads from the
+    // DB too — paging by IMAP UID used to be the only option live, but UID order only
+    // tracks Date order for mail delivered straight into a folder, not mail that
+    // arrived by being *moved* in (a fresh UID at move time, unrelated to its actual
+    // Date header) — Junk especially, being mostly moved-in mail, paged wildly out of
+    // date order against the live UID cursor, which is what "skips months"/missing
+    // mail further down a folder actually was.
+    const params = `path=${encodeURIComponent(currentFolder.path)}&before=${encodeURIComponent(oldest.date || '')}&beforeId=${encodeURIComponent(oldest.id)}`;
     const res = await fetch(`/api/accounts/${currentFolder.accountId}/folder-mails?${params}`);
     more = res.ok ? await res.json() : [];
   } else {
@@ -269,6 +321,14 @@ export async function loadMore(skipRender = false) {
   if (currentFolder) {
     sortMailsNewestFirst(); // folder pages come back oldest-first; keep the invariant loadMore's cursor relies on
     folderMailCache.set(currentFolder.accountId + '|' + currentFolder.path, mails);
+    // skipRender is only ever true when this is one step of catchUpToDepth's own
+    // internal loop (real user-driven scrolling always passes the default false) —
+    // persistFolderMailCache does a full JSON.stringify + sessionStorage.setItem of
+    // every cached folder, not just this one, and re-running that synchronously after
+    // *every single page* of a multi-page catch-up (a phone CPU, not a dev machine)
+    // was real, measurable cost stacked on top of the network round trips themselves.
+    // fetchMails already does one final persist once the whole chain settles.
+    if (!skipRender) persistFolderMailCache();
   }
   if (!skipRender) {
     // full re-render rather than appending incrementally: newly-loaded older mail can
@@ -350,11 +410,22 @@ export function renderLoadingSkeleton() {
   }
 }
 
+// One-shot override for what the folder banner's back button does next — defaults to
+// the real inbox (backToInbox). Set by openTagGroup's own "go to folder" shortcut so
+// stepping out of a tag-group-opened folder returns to that group instead of skipping
+// past it straight to the inbox. Mirrors reader.js's identical setReaderBack pattern.
+let folderBackOverride = null;
+export function setFolderBack(fn) {
+  folderBackOverride = fn;
+}
+
 export function openFolder(accountId, path, name) {
+  folderBackOverride = null; // a plain folder navigation always goes back to inbox, unless a caller sets its own override right after this returns
   currentFolder = { accountId, path, name };
   lastRefreshAt = 0; // a different view now — don't carry over the inbox's cooldown
   document.getElementById('folderBannerName').textContent = name;
   document.getElementById('folderBanner').classList.remove('hidden');
+  document.getElementById('tagGroupBanner').classList.add('hidden'); // never show both banners stacked at once
   document.getElementById('accountsPanel').classList.add('hidden');
   setupFolderAutoTagSelect(
     document.getElementById('folderAutoTagSelect'),
@@ -400,7 +471,15 @@ export function backToInbox() {
 }
 
 export function setupFolderBanner() {
-  document.getElementById('folderBannerBack').addEventListener('click', backToInbox);
+  document.getElementById('folderBannerBack').addEventListener('click', () => {
+    if (folderBackOverride) {
+      const fn = folderBackOverride;
+      folderBackOverride = null;
+      fn();
+    } else {
+      backToInbox();
+    }
+  });
 }
 
 // Live push: the server holds an SSE connection open and sends a "mail" event whenever
@@ -425,6 +504,9 @@ export function setupLiveUpdates() {
       run();
     };
     runWhenIdle();
+  });
+  es.addEventListener('folders', () => {
+    invalidateAllFolderCaches();
   });
   es.addEventListener('error', () => {
     console.warn('live updates: SSE connection error (browser will retry)', es.readyState);
@@ -591,15 +673,53 @@ let savedInboxScrollY = 0;
 function openTagGroup(tag, groupMails) {
   savedInboxScrollY = window.scrollY;
   currentGroup = { tag, mails: groupMails };
+  const openedGroup = currentGroup;
   document.getElementById('tagGroupBannerName').textContent = tag.name;
   document.getElementById('tagGroupBanner').classList.remove('hidden');
   window.scrollTo(0, 0);
   render();
+
+  // Quick jump to wherever this tag actually moves mail to — a tag's mail isn't
+  // always sitting in inbox by the time you're looking at it (auto-move runs on a
+  // delay), so "go see the rest of them" is a real, common next step from here.
+  const folderBtn = document.getElementById('tagGroupBannerFolder');
+  folderBtn.classList.add('hidden');
+  fetchTagDestinations().then((destinations) => {
+    if (currentGroup !== openedGroup) return; // group changed (or closed) while this was in flight
+    const accountIds = new Set(groupMails.map((m) => m.accountId).filter(Boolean));
+    const dest = destinations.find((d) => d.tagId === tag.id && accountIds.has(d.accountId));
+    if (!dest) return;
+    folderBtn.textContent = 'Go to folder';
+    folderBtn.onclick = () => {
+      openFolder(dest.accountId, dest.folder, dest.folder);
+      // Stepping out of THIS folder should return to the tag group it was opened
+      // from, not skip past it straight to the inbox.
+      setFolderBack(() => {
+        currentFolder = null;
+        document.getElementById('folderBanner').classList.add('hidden');
+        document.getElementById('tagGroupBanner').classList.remove('hidden');
+        window.scrollTo(0, 0);
+        // mails currently holds the FOLDER's contents, not the inbox's. Resetting it
+        // to [] (matching backToInbox's own identical reset) matters for more than
+        // just staleness: fetchMails's catchUpToDepth pages back in as many mails as
+        // `mails.length` was *before* the fetch, to preserve however deep you'd
+        // already scrolled — without clearing it first, that read the FOLDER's scroll
+        // depth (after scrolling/loading dozens of pages there) and paged the inbox
+        // back in to match it, loading way more inbox mail than normal and inflating
+        // every tag group's count by everything from the folder along with it.
+        mails = [];
+        renderLoadingSkeleton();
+        fetchMails().then(render);
+      });
+    };
+    folderBtn.classList.remove('hidden');
+  }).catch(() => {}); // best-effort — the button just stays hidden on failure
 }
 
 function closeTagGroup() {
   currentGroup = null;
   document.getElementById('tagGroupBanner').classList.add('hidden');
+  document.getElementById('tagGroupBannerFolder').classList.add('hidden');
   render();
   window.scrollTo(0, savedInboxScrollY);
 }
@@ -666,15 +786,6 @@ function renderRow(mail) {
     li.querySelector('.row-content').appendChild(restoreBtn);
   }
   return li;
-}
-
-function rubberBand(dx, elasticPoint) {
-  // full-speed up to elasticPoint, diminishing returns past it
-  const abs = Math.abs(dx);
-  if (abs <= elasticPoint) return dx;
-  const over = abs - elasticPoint;
-  const damped = elasticPoint + over / (1 + over / elasticPoint);
-  return dx > 0 ? damped : -damped;
 }
 
 function performSwipeAction(row, action, direction) {
@@ -981,21 +1092,14 @@ const REFRESH_QUIPS = [
   'Bribing the IMAP server…', 'Untangling the tubes…', 'Waking up the postman…',
 ];
 
-// Refreshing repeatedly within this window just shows a quip instead of hitting the
-// IMAP server again — both kinder to it and funnier than nothing happening.
-const REFRESH_COOLDOWN_MS = 8000;
-const COOLDOWN_QUIPS = [
-  'Whoa, give me a sec! 😅', 'Easy there, tiger 🐯', 'Patience, young padawan…',
-  'Still catching my breath…', 'The mail gods need a minute…',
-];
-
 // Has to be kept in sync with every overlay panel/sheet in the app — `moveModal` was
 // a stale id left over from before it got folded into folderSheetModal, silently
 // making the old version of this check always false for that case (and every panel
 // added since never got added at all).
 const OVERLAY_IDS = [
   'mailReaderPanel', 'accountsPanel', 'settingsPanel', 'personalisationPanel',
-  'tagsPanel', 'smartTaggingPanel', 'searchPanel', 'folderSheetModal', 'tagSheetModal',
+  'tagsPanel', 'smartTaggingPanel', 'smartSpamPanel', 'autoTagActivityPanel',
+  'searchPanel', 'folderSheetModal', 'tagSheetModal',
 ];
 
 function openOverlays() {
@@ -1114,109 +1218,62 @@ export function setupOverlayScrollLock() {
   }
 }
 
-// Module-scoped (not inside setupPullToRefresh's closure) so switching context —
-// entering or leaving a folder — can reset it: the cooldown exists to stop spamming
-// the *same* refresh, not to silently block the first refresh after you've switched
-// to looking at something else entirely, which looked just like "refresh is broken."
+// Module-scoped so switching context (entering/leaving a folder) can reset it: the
+// cooldown exists to stop spamming the *same* refresh, not to silently block the
+// first refresh after you've switched to looking at something else entirely.
 let lastRefreshAt = 0;
+const REFRESH_COOLDOWN_MS = 6000;
+const COOLDOWN_QUIPS = [
+  'Whoa, give me a sec! 😅', 'Easy there, tiger 🐯', 'Patience, young padawan…',
+  'Still catching my breath…', 'The mail gods need a minute…',
+];
 
+// Many rounds of hand-rolled touch-gesture code (deadzones, claim-ordering,
+// sticky-threshold flags, lock states) never fully closed the "fast pull doesn't
+// register" gap, because the actual problem — racing iOS Safari's own native bounce/
+// scroll recognizer — is exactly what dedicated libraries for this exist to solve
+// properly. Vendored (web/js/vendor/pulltorefresh.js, self-hosted, no CDN, MIT
+// licensed, no dependencies) rather than continuing to patch a custom implementation.
 export function setupPullToRefresh() {
-  const indicator = document.getElementById('pullIndicator');
-  const icon = document.getElementById('pullIcon');
-  const text = document.getElementById('pullText');
-  const list = document.getElementById('inbox');
-  const THRESHOLD = 70;
-  let startX = 0, startY = 0, pulling = false, decided = false, claimed = false, refreshing = false, pull = 0, rafScheduled = false;
-
-  function paint() {
-    rafScheduled = false;
-    list.style.transform = `translateY(${Math.min(pull, 100)}px)`;
-    indicator.style.height = `${Math.min(pull, 60)}px`;
-    const past = pull > THRESHOLD;
-    icon.classList.toggle('tilt', past);
-    icon.textContent = past ? '📬' : '📨';
-    text.textContent = past ? 'Release to summon mail' : 'Pull to refresh';
+  if (!window.PullToRefresh) {
+    // The vendor <script> (web/index.html) failed to load or hasn't run yet — this
+    // alone should never take the rest of the app down with it (see main.js's safe()
+    // wrapper around every setup call), but fail loudly and obviously rather than
+    // throwing deep inside a third-party library's own init code.
+    console.error('PullToRefresh not loaded — pull-to-refresh disabled this session');
+    return;
   }
-
-  function schedulePaint() {
-    if (rafScheduled) return;
-    rafScheduled = true;
-    requestAnimationFrame(paint);
-  }
-
-  document.addEventListener('touchstart', (e) => {
-    if (refreshing || overlayOpen() || document.scrollingElement.scrollTop > 0) { pulling = false; return; }
-    startX = e.touches[0].clientX;
-    startY = e.touches[0].clientY;
-    pulling = true;
-    decided = false;
-    claimed = false;
-  }, { passive: true });
-
-  document.addEventListener('touchmove', (e) => {
-    if (!pulling || refreshing) return;
-    const dx = e.touches[0].clientX - startX;
-    const dy = e.touches[0].clientY - startY;
-    if (!decided) {
-      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
-      decided = true;
-      // a row swipe in progress will have dx dominant — bail out and let it handle the gesture
-      if (Math.abs(dx) >= Math.abs(dy) || dy <= 0) { pulling = false; return; }
-    }
-    if (dy <= 0) return;
-    claimed = true;
-    e.preventDefault(); // claim it before the browser starts its own scroll/bounce
-    pull = rubberBand(dy, 70);
-    schedulePaint();
-  }, { passive: false });
-
-  function endPull() {
-    if (!pulling) return;
-    pulling = false;
-    if (!claimed || refreshing) return;
-    list.style.transition = 'transform 0.28s cubic-bezier(.34,1.56,.64,1)';
-    list.style.transform = 'translateY(0)';
-    if (pull > THRESHOLD) {
-      refreshing = true;
-      indicator.classList.add('refreshing');
-      icon.classList.remove('tilt');
-
+  window.PullToRefresh.init({
+    mainElement: 'body',
+    triggerElement: 'body',
+    instructionsPullToRefresh: 'Pull to refresh',
+    instructionsReleaseToRefresh: 'Release to summon mail',
+    instructionsRefreshing: REFRESH_QUIPS[Math.floor(Math.random() * REFRESH_QUIPS.length)],
+    iconArrow: '📨',
+    iconRefreshing: '📬',
+    shouldPullToRefresh: () => !overlayOpen() && !document.scrollingElement.scrollTop,
+    onRefresh() {
       if (lastRefreshAt && Date.now() - lastRefreshAt < REFRESH_COOLDOWN_MS) {
-        // refreshed too recently — show a quip and bail out instead of hammering IMAP
-        icon.textContent = '🙃';
-        text.textContent = COOLDOWN_QUIPS[Math.floor(Math.random() * COOLDOWN_QUIPS.length)];
-        setTimeout(() => {
-          indicator.classList.remove('refreshing');
-          indicator.style.height = '0';
-          refreshing = false;
-        }, 1400);
-        pull = 0;
-        setTimeout(() => { list.style.transition = ''; }, 280);
-        return;
+        // Refreshed too recently — show a quip and skip hitting IMAP again, same
+        // reasoning as before, just without a hand-rolled lock to get wrong: the
+        // library itself already guarantees only one of these runs at a time.
+        const textEl = document.querySelector('.ptr--text');
+        if (textEl) textEl.textContent = COOLDOWN_QUIPS[Math.floor(Math.random() * COOLDOWN_QUIPS.length)];
+        return new Promise((resolve) => setTimeout(resolve, 1100));
       }
-
-      icon.classList.add('spin');
-      icon.textContent = '📨';
-      text.textContent = REFRESH_QUIPS[Math.floor(Math.random() * REFRESH_QUIPS.length)];
-      // keep the quip on screen for a beat even if the fetch resolves instantly —
-      // otherwise it flashes by unread on a fast connection. 900ms wasn't quite enough
-      // to actually read the punchline; 1400ms is.
-      const minDelay = new Promise((resolve) => setTimeout(resolve, 1400));
-      Promise.all([refreshMails(), minDelay]).then(() => {
-        lastRefreshAt = Date.now();
-        render();
-        indicator.classList.remove('refreshing');
-        icon.classList.remove('spin');
-        indicator.style.height = '0';
-        refreshing = false;
-      });
-    } else {
-      indicator.style.height = '0';
-    }
-    pull = 0;
-    setTimeout(() => { list.style.transition = ''; }, 280);
-  }
-
-  document.addEventListener('touchend', endPull);
-  document.addEventListener('touchcancel', endPull);
+      return refreshMails()
+        .then(() => {
+          lastRefreshAt = Date.now();
+          render();
+        })
+        .catch((err) => {
+          // A failed refresh (the server 502s if even one account's IMAP sync
+          // hiccups) used to leave the hand-rolled version permanently wedged shut —
+          // no .catch() anywhere in that chain. The library resets its own UI
+          // regardless of whether this promise resolves or rejects, so a failure
+          // here can't get pull-to-refresh stuck the way it used to.
+          console.error('pull-to-refresh failed:', err);
+        });
+    },
+  });
 }

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -206,7 +208,7 @@ func (s *Store) handleAddAccount(w http.ResponseWriter, r *http.Request, owner s
 	// Best-effort, right away rather than waiting for whatever else happens to need it
 	// first (an archive/delete) — without this, "Restore" in Trash wouldn't show up
 	// until something else had already triggered this same lookup.
-	if _, trash, err := s.resolveFolders(id); err == nil {
+	if _, trash, _, err := s.resolveFolders(id); err == nil {
 		out.TrashFolder = trash
 	}
 	s.watchAccount(id)
@@ -228,6 +230,167 @@ func (s *Store) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// cachedListFolders serves the server-side folder_cache if present (any age — this
+// app's own create/rename/delete handlers refresh it directly after every mutation
+// they make, so there's no external drift to guard against with a TTL the way the
+// image proxy's cache needs one). Falls back to a live IMAP LIST on a genuine miss
+// (a brand-new account, or the cache row never having been written yet).
+func (s *Store) cachedListFolders(acct dbAccount, password string) ([]string, rune, error) {
+	var names []string
+	var delim string
+	err := s.db.QueryRow("SELECT names, delim FROM folder_cache WHERE account_id = $1", acct.ID).Scan(&names, &delim)
+	if err == nil {
+		var d rune
+		if delim != "" {
+			d = rune(delim[0])
+		}
+		return names, d, nil
+	}
+	return s.refreshFolderCache(acct, password)
+}
+
+// refreshFolderCache does the actual live IMAP LIST and writes the result back —
+// called both on a cache miss (cachedListFolders above) and proactively after this
+// app's own folder mutations, so the next read is instant instead of starting cold.
+func (s *Store) refreshFolderCache(acct dbAccount, password string) ([]string, rune, error) {
+	names, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.db.Exec(
+		`INSERT INTO folder_cache (account_id, names, delim) VALUES ($1, $2, $3)
+		 ON CONFLICT (account_id) DO UPDATE SET names = excluded.names, delim = excluded.delim, fetched_at = now()`,
+		acct.ID, names, string(delim),
+	)
+	return names, delim, nil
+}
+
+// watchFolderChanges periodically re-checks every account's folder list directly over
+// IMAP and publishes "folders" if anything changed — this app's own create/rename/
+// delete already refresh+publish immediately and don't need to wait for this, but a
+// folder added/renamed/removed through some *other* mail client (the actual webmail,
+// Outlook, whatever) has no other way to ever reach this app's cache otherwise. Every
+// 2 hours, not on every sync — an IMAP LIST per account is cheap enough, but there's
+// no reason to run it any more often than something might plausibly have changed.
+// FOLDER_CHECK_INTERVAL_HOURS overrides how often (default 2h); mainly useful for
+// testing this without waiting two real hours for a tick.
+func folderCheckInterval() time.Duration {
+	if v := os.Getenv("FOLDER_CHECK_INTERVAL_HOURS"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
+			return time.Duration(n * float64(time.Hour))
+		}
+	}
+	return 2 * time.Hour
+}
+
+func (s *Store) watchFolderChanges(ctx context.Context) {
+	ticker := time.NewTicker(folderCheckInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.checkAllAccountsForFolderChanges()
+		}
+	}
+}
+
+// folderMailSyncLimit caps how many of each folder's most recent mails the periodic
+// sync keeps fresh — mirrors scanFolderLimit (smarttags.go); deep history in a rarely-
+// opened folder isn't worth an IMAP round trip every cycle, the first live page load
+// (or pull-to-refresh) into it backfills further if you actually scroll that deep.
+const folderMailSyncLimit = 200
+
+// watchFolderMailSync is what actually makes handleFolderMails' "no IMAP round trip
+// for ordinary browsing" claim true: every folderCheckInterval, every account's every
+// folder gets its recent mail re-fetched and upserted into the DB directly — not
+// triggered by, or waited on by, any client page load. A folder's own IMAP IDLE watch
+// (syncAccount) only ever covers INBOX; this is what keeps every other folder's local
+// copy from just going stale forever between visits.
+func (s *Store) watchFolderMailSync(ctx context.Context) {
+	s.syncAllFolderMail(ctx)
+	ticker := time.NewTicker(folderCheckInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.syncAllFolderMail(ctx)
+		}
+	}
+}
+
+func (s *Store) syncAllFolderMail(ctx context.Context) {
+	rows, err := s.db.Query("SELECT id FROM accounts")
+	if err != nil {
+		log.Printf("folder mail sync: %v", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		acct, password, err := s.loadAccountCreds(id)
+		if err != nil {
+			continue
+		}
+		names, _, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+		if err != nil {
+			log.Printf("folder mail sync %s: list folders: %v", acct.Email, err)
+			continue
+		}
+		// walkAccountFolders upserts every mail it finds into the DB itself — nothing
+		// extra to do per mail here, this loop just needs to run.
+		if err := s.walkAccountFolders(ctx, acct, password, id, names, folderMailSyncLimit, func(Mail, string) {}, nil); err != nil {
+			log.Printf("folder mail sync %s: %v", acct.Email, err)
+		}
+	}
+}
+
+func (s *Store) checkAllAccountsForFolderChanges() {
+	rows, err := s.db.Query("SELECT id FROM accounts")
+	if err != nil {
+		log.Printf("check folder changes: %v", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		acct, password, err := s.loadAccountCreds(id)
+		if err != nil {
+			continue
+		}
+		var before []string
+		s.db.QueryRow("SELECT names FROM folder_cache WHERE account_id = $1", id).Scan(&before)
+		after, _, err := s.refreshFolderCache(acct, password)
+		if err != nil {
+			log.Printf("check folder changes %s: %v", acct.Email, err)
+			continue
+		}
+		if !slices.Equal(before, after) {
+			s.broadcaster.publish("folders")
+		}
+	}
+}
+
 func (s *Store) handleListFolders(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	acct, password, err := s.loadAccountCreds(id)
@@ -235,7 +398,16 @@ func (s *Store) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	names, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	// ?force=1 skips the server cache too, not just the client's — used when opening
+	// Settings > Manage folders, the one place you're actively editing folders and
+	// want the genuine current state rather than whatever's cached, even briefly.
+	var names []string
+	var delim rune
+	if r.URL.Query().Get("force") == "1" {
+		names, delim, err = s.refreshFolderCache(acct, password)
+	} else {
+		names, delim, err = s.cachedListFolders(acct, password)
+	}
 	if err != nil {
 		log.Printf("list folders %s: %v", acct.Email, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -259,7 +431,7 @@ func (s *Store) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	_, delim, err := s.cachedListFolders(acct, password)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -277,6 +449,15 @@ func (s *Store) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// Refreshed right away rather than just invalidated — the next read (almost
+	// certainly this same request's response landing in the UI) is then instant
+	// instead of starting cold on whatever happens to ask first. Published over SSE so
+	// any client sitting on a much longer-lived local cache (24h) knows to drop it too,
+	// rather than only this one request's own view staying correct.
+	if _, _, err := s.refreshFolderCache(acct, password); err != nil {
+		log.Printf("refresh folder cache %s: %v", acct.Email, err)
+	}
+	s.broadcaster.publish("folders")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -296,7 +477,7 @@ func (s *Store) handleRenameFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	_, delim, err := listFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	_, delim, err := s.cachedListFolders(acct, password)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -314,6 +495,10 @@ func (s *Store) handleRenameFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	if _, _, err := s.refreshFolderCache(acct, password); err != nil {
+		log.Printf("refresh folder cache %s: %v", acct.Email, err)
+	}
+	s.broadcaster.publish("folders")
 	// Best-effort: a folder this app already knew about (a tag-destination rule, mail
 	// cached under its old path) shouldn't silently keep pointing at a name that no
 	// longer exists just because the rename itself succeeded.
@@ -339,22 +524,40 @@ func (s *Store) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	if _, _, err := s.refreshFolderCache(acct, password); err != nil {
+		log.Printf("refresh folder cache %s: %v", acct.Email, err)
+	}
+	s.broadcaster.publish("folders")
 	s.db.Exec("DELETE FROM folder_tag_rules WHERE account_id = $1 AND folder = $2", id, req.Path)
 	s.db.Exec("DELETE FROM mails WHERE account_id = $1 AND folder = $2", id, req.Path)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // cachedFolderMails reads whatever's already in the local mails table for this
-// account+folder — populated by a previous live folder-mails fetch (handleFolderMails
-// below). No IMAP round trip, so it's instant; used to paint something immediately
-// while the live fetch (which can take seconds against a remote server) runs behind it.
-func (s *Store) cachedFolderMails(accountID, folder string) ([]Mail, error) {
-	rows, err := s.db.Query(
-		`SELECT id, sender, sender_email, subject, snippet, time, unread, sent_at, coalesce(message_id, ''), has_attachments
-		 FROM mails WHERE account_id = $1 AND folder = $2
-		 ORDER BY coalesce(sent_at, '-infinity'::timestamptz) DESC, id DESC LIMIT $3`,
-		accountID, folder, pageSize,
-	)
+// account+folder — populated by a previous live fetch, the periodic full-folder sync
+// (watchFolderMailSync), or any of the scan features that happen to walk this folder.
+// No IMAP round trip, so it's instant. before/beforeID is the same cursor-tuple
+// pagination handleList (mails.go) uses for the inbox — immune to a new mail landing
+// mid-scroll shifting every row's offset, unlike paging by row count.
+func (s *Store) cachedFolderMails(accountID, folder, before, beforeID string) ([]Mail, error) {
+	query := `SELECT id, sender, sender_email, subject, snippet, time, unread, sent_at, coalesce(message_id, ''), has_attachments
+		 FROM mails WHERE account_id = $1 AND folder = $2`
+	args := []any{accountID, folder}
+	if beforeID != "" {
+		var beforeArg any
+		if before != "" {
+			beforeArg = before
+		}
+		args = append(args, beforeArg, beforeID)
+		query += fmt.Sprintf(
+			" AND (coalesce(sent_at, '-infinity'::timestamptz), id) < (coalesce($%d::timestamptz, '-infinity'::timestamptz), $%d)",
+			len(args)-1, len(args),
+		)
+	}
+	args = append(args, pageSize)
+	query += fmt.Sprintf(" ORDER BY coalesce(sent_at, '-infinity'::timestamptz) DESC, id DESC LIMIT $%d", len(args))
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -384,12 +587,15 @@ func (s *Store) handleFolderMails(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	// Cache-only: instant, no IMAP — the client calls this first to paint something
-	// right away, then calls the regular (live) endpoint behind it to get the real,
-	// current state. Only ever used for the first page (a "beforeUid" page only makes
-	// sense once you already know the live, current ordering).
-	if r.URL.Query().Get("cacheOnly") == "1" {
-		mails, err := s.cachedFolderMails(id, folder)
+	// DB-backed by default — no IMAP round trip for ordinary folder browsing. The DB
+	// copy is kept fresh by the periodic full sync (watchFolderMailSync, every
+	// folderCheckInterval) and by the IMAP IDLE push for whichever folder that's
+	// watching, not by each page load doing its own live fetch. live=1 is the explicit
+	// override (pull-to-refresh while browsing a folder) that actually goes to IMAP.
+	if r.URL.Query().Get("live") != "1" {
+		before := r.URL.Query().Get("before")
+		beforeID := r.URL.Query().Get("beforeId")
+		mails, err := s.cachedFolderMails(id, folder, before, beforeID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -566,28 +772,28 @@ func (s *Store) upsertMails(accountID string, mails []Mail) error {
 // resolveFolders returns the account's Archive/Trash mailbox names, detecting and
 // caching them on first use so we don't re-run a full folder LIST on every swipe.
 // Either value can be "" if the server has no such folder.
-func (s *Store) resolveFolders(accountID string) (archive, trash string, err error) {
-	var archiveCol, trashCol *string
+func (s *Store) resolveFolders(accountID string) (archive, trash, junk string, err error) {
+	var archiveCol, trashCol, junkCol *string
 	err = s.db.QueryRow(
-		"SELECT archive_folder, trash_folder FROM accounts WHERE id = $1", accountID,
-	).Scan(&archiveCol, &trashCol)
+		"SELECT archive_folder, trash_folder, junk_folder FROM accounts WHERE id = $1", accountID,
+	).Scan(&archiveCol, &trashCol, &junkCol)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	if archiveCol != nil && trashCol != nil {
-		return *archiveCol, *trashCol, nil
+	if archiveCol != nil && trashCol != nil && junkCol != nil {
+		return *archiveCol, *trashCol, *junkCol, nil
 	}
 
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	archive, trash, err = detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	archive, trash, junk, err = detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	s.db.Exec("UPDATE accounts SET archive_folder = $1, trash_folder = $2 WHERE id = $3", archive, trash, accountID)
-	return archive, trash, nil
+	s.db.Exec("UPDATE accounts SET archive_folder = $1, trash_folder = $2, junk_folder = $3 WHERE id = $4", archive, trash, junk, accountID)
+	return archive, trash, junk, nil
 }
 
 // moveMailToFolder loads a mail's account + UID + source folder and moves it to
@@ -657,7 +863,7 @@ func (s *Store) archiveOrDeleteOnServer(mailID, action string) error {
 		return nil
 	}
 
-	archive, trash, err := s.resolveFolders(*accountID)
+	archive, trash, _, err := s.resolveFolders(*accountID)
 	if err != nil {
 		return fmt.Errorf("resolve folders: %w", err)
 	}

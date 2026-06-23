@@ -2,7 +2,7 @@
 // review), the auto-move delay, the live pending-suggestions queue, and a read-only
 // history/audit list — see docs/smart-tagging.md for how the scoring underneath this
 // actually works.
-import { fetchTagHistory, acceptSuggestion, dismissSuggestion, blockSenderForSuggestion, createTag, setFolderTagRule, fetchMisplacedMail, moveMail } from './tags.js';
+import { fetchTagHistory, acceptSuggestion, dismissSuggestion, blockSenderForSuggestion, createTag, setFolderTagRule, fetchMisplacedMail, moveMail, getMailTags, setMailTags } from './tags.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
 import { withBusyButton } from './util.js';
 import { pickFolders } from './folders.js';
@@ -224,7 +224,9 @@ async function renderSuggestions() {
   const acceptAllBtn = document.getElementById('acceptAllSuggestionsBtn');
   const dismissAllBtn = document.getElementById('dismissAllSuggestionsBtn');
   try {
-    pendingSuggestions = await fetchTagHistory('suggested');
+    // Spam gets its own dedicated queue (spam.js's Smart Spam panel) — excluded here
+    // so it isn't suggested twice in two different places.
+    pendingSuggestions = (await fetchTagHistory('suggested')).filter((e) => e.source !== 'spam_engine');
   } catch (err) {
     errorEl.textContent = err.message;
     return;
@@ -356,7 +358,28 @@ function renderMisplacedRow(entry, onResolved) {
       errorEl.textContent = err.message;
     }
   });
-  top.append(name, moveBtn);
+  // The other way to resolve a mismatch — this mail just shouldn't have this tag at
+  // all, rather than belonging in its destination folder. Misplaced mail is a live
+  // query against current state (no stored suggestion row to dismiss), so removing
+  // the tag is what actually makes the mismatch go away for good, not just hide it
+  // from this one render.
+  const rejectBtn = document.createElement('button');
+  rejectBtn.className = 'dismiss-btn';
+  rejectBtn.textContent = 'Remove tag';
+  rejectBtn.addEventListener('click', async () => {
+    moveBtn.disabled = true;
+    try {
+      await withBusyButton(rejectBtn, 'Removing…', async () => {
+        const tags = await getMailTags(entry.mailId);
+        await setMailTags(entry.mailId, tags.filter((t) => t.id !== entry.tagId).map((t) => t.id));
+      });
+      onResolved();
+    } catch (err) {
+      errorEl.textContent = err.message;
+      moveBtn.disabled = false;
+    }
+  });
+  top.append(name, moveBtn, rejectBtn);
   const meta = document.createElement('div');
   meta.className = 'smart-history-meta';
   meta.textContent = `${entry.sender}${entry.subject ? ' — ' + entry.subject : ''} (currently in ${entry.currentFolder})`;

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -647,14 +649,15 @@ func (s *Store) handleBlockSenderTagHistory(w http.ResponseWriter, r *http.Reque
 
 func (s *Store) handleGetOwnerSettings(w http.ResponseWriter, r *http.Request, owner string) {
 	mode := "review"
+	spamMode := "review"
 	delay := 3
 	imageRetention := 90
 	var backfillCompletedAt *time.Time
 	s.db.QueryRow(
-		"SELECT auto_tag_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at FROM owner_settings WHERE owner_subject = $1", owner,
-	).Scan(&mode, &delay, &imageRetention, &backfillCompletedAt)
+		"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at FROM owner_settings WHERE owner_subject = $1", owner,
+	).Scan(&mode, &spamMode, &delay, &imageRetention, &backfillCompletedAt)
 	writeJSON(w, map[string]any{
-		"autoTagMode": mode, "autoMoveDelayDays": delay,
+		"autoTagMode": mode, "spamMode": spamMode, "autoMoveDelayDays": delay,
 		"imageCacheRetentionDays": imageRetention, "imageBackfillCompletedAt": backfillCompletedAt,
 	})
 }
@@ -662,6 +665,7 @@ func (s *Store) handleGetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, owner string) {
 	var req struct {
 		AutoTagMode             string `json:"autoTagMode"`
+		SpamMode                string `json:"spamMode"`
 		AutoMoveDelayDays       int    `json:"autoMoveDelayDays"`
 		ImageCacheRetentionDays int    `json:"imageCacheRetentionDays"`
 	}
@@ -671,6 +675,13 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	}
 	if req.AutoTagMode != "full_auto" && req.AutoTagMode != "review" {
 		http.Error(w, "autoTagMode must be full_auto or review", http.StatusBadRequest)
+		return
+	}
+	if req.SpamMode == "" {
+		req.SpamMode = s.ownerSpamMode(owner) // PUT only sends autoTagMode today — keep spam_mode untouched rather than resetting it
+	}
+	if req.SpamMode != "full_auto" && req.SpamMode != "review" {
+		http.Error(w, "spamMode must be full_auto or review", http.StatusBadRequest)
 		return
 	}
 	if req.AutoMoveDelayDays < 0 {
@@ -683,10 +694,10 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 		req.ImageCacheRetentionDays = imageBackfillMaxDays
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO owner_settings (owner_subject, auto_tag_mode, auto_move_delay_days, image_cache_retention_days) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, auto_move_delay_days = excluded.auto_move_delay_days,
-			image_cache_retention_days = excluded.image_cache_retention_days`,
-		owner, req.AutoTagMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays,
+		INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, spam_mode = excluded.spam_mode,
+			auto_move_delay_days = excluded.auto_move_delay_days, image_cache_retention_days = excluded.image_cache_retention_days`,
+		owner, req.AutoTagMode, req.SpamMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -758,7 +769,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 
 	// Resolved once up front and reused below — both for excluding Trash from "all
 	// folders" scans, and for the new-tag-candidate guard further down.
-	_, trashFolder, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+	_, trashFolder, _, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 
 	var names []string
 	if len(folders) > 0 {
@@ -975,10 +986,10 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
 // delay, move it into that tag's mapped folder. Reads the same folder_tag_rules table
 // the other direction — no new mapping concept for the user to learn.
 //
-// Opportunistic, not a real timer (no cron infra in this app) — called from points
-// already doing work (a sync), so this fires the next time something happens for an
-// account after the delay elapses, not exactly at the delay's edge. That's an accepted
-// tradeoff, documented in docs/smart-tagging.md.
+// Mostly opportunistic (called from points already doing work, like a sync) PLUS a
+// real periodic tick (watchAutoMove below) — opportunistic alone meant an
+// instant_move tag (e.g. Spam, which wants to move right away, not wait for unrelated
+// IMAP activity) could sit for an arbitrarily long time in an otherwise-quiet mailbox.
 func (s *Store) ownerAutoMoveDelayDays(ownerSubject string) int {
 	var delayDays int
 	if err := s.db.QueryRow(
@@ -1081,7 +1092,65 @@ func (s *Store) autoMoveTaggedMail(ownerSubject string) (int, []movedMailDetail)
 		moved++
 		details = append(details, movedMailDetail{Sender: p.sender, Subject: p.subject, Tag: tagName, Folder: folder})
 	}
+	if moved > 0 {
+		// Some callers (handleAcceptTagHistory, recordManualTagChange) already published
+		// their own "mail" event for the tag change itself — a second one here is a
+		// harmless no-op refresh for them. The one caller that had NO publish at all
+		// until now was the periodic ticker (watchAutoMove): a scheduled move happening
+		// in the background, with no interactive action of its own to hang a publish
+		// off, left an already-open inbox showing mail that had actually already moved
+		// server-side until the next manual refresh.
+		s.broadcaster.publish("mail")
+	}
 	return moved, details
+}
+
+// autoMoveCheckInterval mirrors folderCheckInterval's override pattern (accounts.go) —
+// AUTO_MOVE_CHECK_INTERVAL_MINUTES mainly for testing without waiting the real default.
+func autoMoveCheckInterval() time.Duration {
+	if v := os.Getenv("AUTO_MOVE_CHECK_INTERVAL_MINUTES"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
+			return time.Duration(n * float64(time.Minute))
+		}
+	}
+	return 10 * time.Minute
+}
+
+// watchAutoMove is the real scheduled half of auto-move (see autoMoveTaggedMail's own
+// comment) — runs independently of sync/IMAP activity, so an instant_move tag (Spam)
+// actually moves promptly even in an otherwise-quiet mailbox, not just whenever
+// something else happens to trigger a sync first.
+func (s *Store) watchAutoMove(ctx context.Context) {
+	s.autoMoveTaggedMailForEveryOwner() // don't wait a full interval for the first run
+	ticker := time.NewTicker(autoMoveCheckInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.autoMoveTaggedMailForEveryOwner()
+		}
+	}
+}
+
+func (s *Store) autoMoveTaggedMailForEveryOwner() {
+	rows, err := s.db.Query("SELECT DISTINCT owner_subject FROM accounts")
+	if err != nil {
+		log.Printf("auto-move: list owners: %v", err)
+		return
+	}
+	var owners []string
+	for rows.Next() {
+		var owner string
+		if rows.Scan(&owner) == nil {
+			owners = append(owners, owner)
+		}
+	}
+	rows.Close()
+	for _, owner := range owners {
+		s.autoMoveTaggedMail(owner)
+	}
 }
 
 // handleRunAutoMove triggers autoMoveTaggedMail on demand — it normally only runs

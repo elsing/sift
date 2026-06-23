@@ -107,6 +107,9 @@ func (s *Store) StartWatching(ctx context.Context) {
 	for _, id := range ids {
 		s.watchAccount(id)
 	}
+	go s.watchFolderChanges(ctx)
+	go s.watchAutoMove(ctx)
+	go s.watchFolderMailSync(ctx)
 }
 
 // watchAccount runs (and indefinitely restarts, with backoff) an IDLE loop for one

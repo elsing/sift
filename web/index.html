@@ -57,48 +57,55 @@
     <div class="folder-banner hidden" id="tagGroupBanner">
       <button id="tagGroupBannerBack">← Inbox</button>
       <span id="tagGroupBannerName"></span>
+      <button id="tagGroupBannerFolder" class="hidden">Folder →</button>
     </div>
 
     <div class="account-filter-bar hidden" id="accountFilterBar"></div>
   </div>
 
-  <div class="pull-indicator" id="pullIndicator">
-    <span class="pull-icon" id="pullIcon">📨</span>
-    <span class="pull-text" id="pullText">Pull to refresh</span>
-  </div>
-
   <ul class="inbox" id="inbox"></ul>
 
-  <div id="searchPanel" class="accounts-panel hidden">
-    <form id="searchForm" class="search-form search-form-row">
-      <input id="searchInput" type="search" placeholder="Search all mail…" autocomplete="off">
-      <button id="closeSearchBtn" type="button" class="icon-btn" title="Close">✕</button>
-    </form>
-    <button id="searchFolderScope" type="button" class="search-scope-btn hidden"></button>
-    <p id="searchAccountScope" class="search-scope-label"></p>
-
-    <button id="advancedSearchToggle" type="button" class="search-advanced-toggle">Advanced filters ▾</button>
-    <div id="advancedSearchPanel" class="search-advanced hidden">
-      <input id="searchFromInput" type="text" placeholder="From (sender contains…)" autocomplete="off">
-      <div class="search-date-range">
-        <input id="searchSinceInput" type="date" aria-label="From date">
-        <span>–</span>
-        <input id="searchBeforeInput" type="date" aria-label="To date">
-        <button id="searchClearDatesBtn" type="button" class="search-clear-dates" title="Search all time instead">✕</button>
+  <!-- Same bottom-sheet shell as the folder picker (folderSheetModal) — pops up from
+       the bottom, swipe-down or backdrop-tap to dismiss, capped well short of full
+       screen, and gets the global keyboard-safe padding (main.js's
+       modalKeyboardPadding) for free just by using .move-modal-content. -->
+  <div id="searchPanel" class="move-modal hidden">
+    <div class="move-modal-content">
+      <div class="move-modal-drag-catcher"></div>
+      <div class="move-modal-grabber"></div>
+      <div class="move-modal-header">
+        <span>Search</span>
+        <button id="searchPanelClose">✕</button>
       </div>
-      <button id="searchFolderPickerToggle" type="button" class="search-scope-btn">Choose folders…</button>
-      <p class="search-section-label">Filter by tag</p>
-      <div id="searchTagFilter" class="account-filter-bar search-tag-filter"></div>
-    </div>
+      <form id="searchForm" class="search-form search-form-row">
+        <input id="searchInput" type="search" placeholder="Search all mail…" autocomplete="off">
+      </form>
+      <button id="searchFolderScope" type="button" class="search-scope-btn hidden"></button>
+      <p id="searchAccountScope" class="search-scope-label"></p>
 
-    <div id="searchProgress" class="search-progress hidden">
-      <div class="search-progress-bar"><div id="searchProgressFill" class="search-progress-fill"></div></div>
-      <p id="searchProgressText" class="search-progress-text"></p>
+      <button id="advancedSearchToggle" type="button" class="search-advanced-toggle">Advanced filters ▾</button>
+      <div id="advancedSearchPanel" class="search-advanced hidden">
+        <input id="searchFromInput" type="text" placeholder="From (sender contains…)" autocomplete="off">
+        <div class="search-date-range">
+          <input id="searchSinceInput" type="date" aria-label="From date">
+          <span>–</span>
+          <input id="searchBeforeInput" type="date" aria-label="To date">
+          <button id="searchClearDatesBtn" type="button" class="search-clear-dates" title="Search all time instead">✕</button>
+        </div>
+        <button id="searchFolderPickerToggle" type="button" class="search-scope-btn">Choose folders…</button>
+        <p class="search-section-label">Filter by tag</p>
+        <div id="searchTagFilter" class="account-filter-bar search-tag-filter"></div>
+      </div>
+
+      <div id="searchProgress" class="search-progress hidden">
+        <div class="search-progress-bar"><div id="searchProgressFill" class="search-progress-fill"></div></div>
+        <p id="searchProgressText" class="search-progress-text"></p>
+      </div>
+      <button id="continueSearchBtn" type="button" class="search-scope-btn hidden"></button>
+      <button id="deepSearchBtn" type="button" class="search-scope-btn hidden">Deep search (slower — also searches message bodies)</button>
+      <p id="searchError" class="form-error"></p>
+      <ul id="searchResults" class="inbox search-results"></ul>
     </div>
-    <button id="continueSearchBtn" type="button" class="search-scope-btn hidden"></button>
-    <button id="deepSearchBtn" type="button" class="search-scope-btn hidden">Deep search (slower — also searches message bodies)</button>
-    <p id="searchError" class="form-error"></p>
-    <ul id="searchResults" class="inbox search-results"></ul>
   </div>
 
   <div id="accountsPanel" class="accounts-panel hidden">
@@ -123,8 +130,9 @@
     <button id="openPersonalisationBtn" class="settings-row-btn">🎨 Personalisation</button>
     <button id="openTagsBtn" class="settings-row-btn">🏷️ Tags</button>
     <button id="openSmartTaggingBtn" class="settings-row-btn">✨ Smart tagging</button>
+    <button id="openSmartSpamBtn" class="settings-row-btn">🚫 Smart spam</button>
     <button id="openFolderManagerBtn" class="settings-row-btn">📁 Manage folders</button>
-    <button id="openAutoTagActivityBtn" class="settings-row-btn">🪄 Auto-tag activity</button>
+    <button id="openAutoTagActivityBtn" class="settings-row-btn">🪄 Auto activity</button>
     <h3 class="settings-subhead">Account</h3>
     <button id="accountsBtn" class="settings-row-btn">👤 Accounts</button>
     <h3 class="settings-subhead">Notifications</h3>
@@ -147,32 +155,38 @@
     <h3 class="settings-subhead">Swipe right</h3>
     <div id="swipeRightOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Delete animation</h3>
-    <label class="tag-manager-notify" style="font-size:14px; padding: 4px 0 12px;">
-      <input type="checkbox" id="funDeleteToggle"> Fun delete animation (off = plain slide)
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="funDeleteToggle">
+      <span>Fun delete animation<small>Off = plain slide, no shatter/fling effect</small></span>
     </label>
     <h3 class="settings-subhead">Images in mail</h3>
-    <label class="tag-manager-notify" style="font-size:14px; padding: 4px 0 12px;">
-      <input type="checkbox" id="autoLoadImagesToggle"> Load images automatically (proxied through this server and verified safe — hides your real IP from the sender; turn off to require a "Show images" tap each time)
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="autoLoadImagesToggle">
+      <span>Load images automatically<small>Proxied through this server and verified safe — hides your real IP from the sender. Turn off to require a "Show images" tap each time.</small></span>
     </label>
-    <label class="tag-manager-notify" style="font-size:14px; padding: 4px 0 8px;">
-      Cache images from mail in the last
-      <input type="number" id="imageCacheRetentionInput" min="1" max="90" style="width:60px; display:inline-block;"> days (max 90), then clear older ones
-    </label>
-    <p id="imageBackfillStatus" class="search-scope-label"></p>
-    <button id="backfillImageCacheBtn" type="button" class="search-scope-btn" style="margin-bottom: 6px;">Download image cache for that window now</button>
-    <div id="imageCacheProgress" class="search-progress hidden">
-      <div class="search-progress-bar"><div id="imageCacheProgressFill" class="search-progress-fill"></div></div>
-      <p id="imageCacheProgressText" class="search-progress-text"></p>
+    <div class="image-cache-card">
+      <label class="image-cache-retention-row">
+        Cache images from mail in the last
+        <input type="number" id="imageCacheRetentionInput" min="1" max="90">
+        days (max 90), then clear older ones
+      </label>
+      <p id="imageBackfillStatus" class="search-scope-label"></p>
+      <button id="backfillImageCacheBtn" type="button" class="search-scope-btn">Download image cache for that window now</button>
+      <div id="imageCacheProgress" class="search-progress hidden">
+        <div class="search-progress-bar"><div id="imageCacheProgressFill" class="search-progress-fill"></div></div>
+        <p id="imageCacheProgressText" class="search-progress-text"></p>
+      </div>
     </div>
     <button id="closePersonalisationBtn" class="close-panel-btn">Close</button>
   </div>
 
   <div id="autoTagActivityPanel" class="accounts-panel hidden">
     <div class="panel-header-row">
-      <h2>Auto-tag activity</h2>
+      <h2>Auto activity</h2>
       <button id="closeAutoTagActivityTopBtn" type="button" class="icon-btn" title="Close">✕</button>
     </div>
     <p class="smart-history-meta">Every tag full-auto mode applied on its own, most recent first. Wrong call? Undo it — that also teaches it not to repeat the mistake.</p>
+    <div id="autoActivitySourceOptions" class="theme-options"></div>
     <p id="autoTagActivityError" class="form-error"></p>
     <ul id="autoTagActivityList" class="accounts-list"></ul>
     <button id="closeAutoTagActivityBtn" class="close-panel-btn">Close</button>
@@ -195,11 +209,11 @@
       <h2>Tags</h2>
       <button id="closeTagsTopBtn" type="button" class="icon-btn" title="Close">✕</button>
     </div>
-    <ul id="tagManagerList" class="accounts-list"></ul>
     <form id="tagManagerForm" class="search-form">
       <input id="tagManagerInput" type="text" placeholder="New tag name…" autocomplete="off">
     </form>
     <p id="tagManagerError" class="form-error"></p>
+    <ul id="tagManagerList" class="accounts-list"></ul>
     <button id="closeTagsBtn" class="close-panel-btn">Close</button>
   </div>
 
@@ -250,20 +264,60 @@
     <button id="closeSmartTaggingBtn" class="close-panel-btn">Close</button>
   </div>
 
+  <div id="smartSpamPanel" class="accounts-panel hidden">
+    <div class="panel-header-row">
+      <h2>Smart spam</h2>
+      <button id="closeSmartSpamTopBtn" type="button" class="icon-btn" title="Close">✕</button>
+    </div>
+    <h3 class="settings-subhead">Mode</h3>
+    <p class="smart-history-meta">
+      <strong>Review</strong> queues a flagged mail as a suggestion below; <strong>Full-auto</strong> applies the Spam tag and moves it to Junk without waiting for you. Review is the safer default — a spam false positive burying real mail is worse than a missed suggestion.
+    </p>
+    <div id="spamModeOptions" class="theme-options"></div>
+    <h3 class="settings-subhead">Scan existing mail for spam</h3>
+    <p class="smart-history-meta">Retroactively scores mail already sitting in your mailbox — useful for anything that arrived before this existed. Junk/Trash mail is used as training data instead of being re-scored.</p>
+    <div id="spamScanScopeOptions" class="theme-options"></div>
+    <button id="scanForSpamBtn" class="settings-row-btn">Scan for spam</button>
+    <div id="spamScanAccountPicker"></div>
+    <div id="spamBootstrapProgress" class="search-progress hidden">
+      <div class="search-progress-bar"><div id="spamBootstrapProgressFill" class="search-progress-fill"></div></div>
+      <p id="spamBootstrapProgressText" class="search-progress-text"></p>
+      <button id="cancelSpamScanBtn" type="button" class="settings-row-btn">Cancel scan</button>
+    </div>
+    <div id="spamScanResults"></div>
+    <p id="smartSpamError" class="form-error"></p>
+    <h3 class="settings-subhead">Pending suggestions</h3>
+    <div class="suggestion-bulk-actions">
+      <button id="acceptAllSpamBtn" type="button" class="settings-row-btn hidden">Accept all</button>
+      <button id="dismissAllSpamBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
+    </div>
+    <ul id="smartSpamSuggestions" class="accounts-list"></ul>
+    <button id="closeSmartSpamBtn" class="close-panel-btn">Close</button>
+  </div>
+
   <!-- One shared bottom-sheet for every folder picker: the topbar Folders shortcut,
        the Folder Browser inside it, and the swipe-to-move destination picker. They were
        previously two near-identical modals; sharing one means a fix/tweak to the shell
        (loading state, backdrop-tap-close, caching) only has to happen once. -->
   <div id="folderSheetModal" class="move-modal hidden">
     <div class="move-modal-content">
+      <div class="move-modal-drag-catcher"></div>
+      <div class="move-modal-grabber"></div>
       <div class="move-modal-header">
         <span id="folderSheetTitle">Folders</span>
-        <button id="folderSheetClose">✕</button>
+        <span class="move-modal-header-actions">
+          <button id="folderSheetRefresh" type="button" title="Check for new/changed folders">↻</button>
+          <button id="folderSheetClose">✕</button>
+        </span>
       </div>
       <p id="folderSheetError" class="form-error"></p>
       <input id="folderSheetSearch" type="search" placeholder="Filter folders…" autocomplete="off" class="folder-sheet-search">
-      <div id="folderSheetBody" class="folder-tree move-folder-tree"></div>
+      <!-- Above the (possibly long, scrolling) tree, not below it — a multi-select
+           pick (checkSet mode) needs Done reachable without scrolling all the way
+           down past every folder first. Also used by Smart Tagging/Smart Spam's own
+           "Choose folders" scan-scope pickers, since they share this same sheet. -->
       <button id="folderSheetConfirm" type="button" class="settings-row-btn hidden">Done</button>
+      <div id="folderSheetBody" class="folder-tree move-folder-tree"></div>
     </div>
   </div>
 
@@ -281,6 +335,8 @@
 
   <div id="tagSheetModal" class="move-modal hidden">
     <div class="move-modal-content">
+      <div class="move-modal-drag-catcher"></div>
+      <div class="move-modal-grabber"></div>
       <div class="move-modal-header">
         <span>Tags</span>
         <button id="tagSheetClose">✕</button>
@@ -331,6 +387,10 @@
         <div class="mail-reader-sender" id="mailReaderSender"></div>
         <div class="mail-reader-time" id="mailReaderTime"></div>
         <div id="mailReaderTags"></div>
+        <div class="spam-notice hidden" id="spamNotice">
+          <span id="spamNoticeReasons"></span>
+          <button id="notSpamBtn" type="button" class="settings-row-btn">Not spam</button>
+        </div>
       </div>
       <div class="mail-loading hidden" id="mailReaderLoading">
         <div class="mail-loading-dots"><span></span><span></span><span></span></div>
@@ -346,9 +406,15 @@
         <iframe class="mail-reader-html" id="mailReaderHtml" sandbox="allow-same-origin allow-popups"></iframe>
       </div>
       <ul id="mailReaderAttachments" class="mail-reader-attachments"></ul>
+      <div class="spam-check-footer" id="spamCheckFooter">
+        <p id="spamCheckScore" class="spam-check-score"></p>
+        <div id="spamCheckAuth" class="spam-check-auth"></div>
+        <ul id="spamCheckReasons" class="spam-check-reasons"></ul>
+      </div>
     </div>
   </div>
 
+  <script src="js/vendor/pulltorefresh.js"></script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

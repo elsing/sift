@@ -108,7 +108,7 @@ func (s *Store) backfillImageCache(ctx context.Context, ownerSubject string, pro
 		}
 		// Trash is mostly junk/spam by nature — not worth the IMAP round trips to
 		// fetch and cache images for mail about to be permanently deleted anyway.
-		_, trashFolder, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
+		_, trashFolder, _, _ := detectSpecialUseFolders(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 		if trashFolder != "" {
 			filtered := names[:0]
 			for _, n := range names {
@@ -130,12 +130,14 @@ func (s *Store) backfillImageCache(ctx context.Context, ownerSubject string, pro
 			if err != nil || t.Before(cutoff) {
 				return
 			}
-			body, err := fetchMailBody(w.acct, w.password, folder, m.UID)
+			body, err := withTimeout(imapOpTimeout, func() (MailBody, error) {
+				return fetchMailBody(w.acct, w.password, folder, m.UID)
+			})
 			if err != nil || body.HTML == "" {
 				return
 			}
 			for _, src := range extractImageSrcs(body.HTML) {
-				if _, err := s.cachedOrFetchImage(src); err == nil {
+				if _, err := s.cachedOrFetchImage(src, true); err == nil {
 					imagesCached++
 				}
 			}
@@ -175,7 +177,23 @@ func (s *Store) handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "u is required", http.StatusBadRequest)
 		return
 	}
-	img, err := s.cachedOrFetchImage(raw)
+	// mid is the client-visible mail ID (reader.js's proxyImageSrcs) — optional, only
+	// sent when the client knows which mail this image belongs to. When present and
+	// that mail currently carries the Spam tag, the image still loads (it's still
+	// proxied, never raw), it just never gets written into the persistent cache.
+	cacheable := true
+	if mid := r.URL.Query().Get("mid"); mid != "" {
+		var count int
+		s.db.QueryRow(
+			`SELECT count(*) FROM mails m
+			 JOIN message_tags mt ON mt.message_id = m.message_id
+			 JOIN tags t ON t.id = mt.tag_id
+			 WHERE m.id = $1 AND t.name = 'Spam'`,
+			mid,
+		).Scan(&count)
+		cacheable = count == 0
+	}
+	img, err := s.cachedOrFetchImage(raw, cacheable)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -192,8 +210,12 @@ func imageCacheKey(rawURL string) string {
 
 // cachedOrFetchImage checks image_cache first — populated either by a previous live
 // proxy request, or by prefetchMailImages below running ahead of time at sync — and
-// only does a real fetch on a miss.
-func (s *Store) cachedOrFetchImage(rawURL string) (fetchedImage, error) {
+// only does a real fetch on a miss. cacheable controls only whether a *fresh* fetch
+// gets written back to the cache — a cache hit is still served either way, since by
+// definition that bytes-on-disk already exists regardless of who's asking now; this
+// only stops spam-flagged mail's images from being the thing that *first* populates a
+// cache entry, never raw-fetched directly (still goes through this same proxy).
+func (s *Store) cachedOrFetchImage(rawURL string, cacheable bool) (fetchedImage, error) {
 	key := imageCacheKey(rawURL)
 	var img fetchedImage
 	err := s.db.QueryRow("SELECT content_type, bytes FROM image_cache WHERE url_hash = $1", key).Scan(&img.ContentType, &img.Bytes)
@@ -205,10 +227,12 @@ func (s *Store) cachedOrFetchImage(rawURL string) (fetchedImage, error) {
 	if err != nil {
 		return fetchedImage{}, err
 	}
-	s.db.Exec(
-		"INSERT INTO image_cache (url_hash, content_type, bytes) VALUES ($1, $2, $3) ON CONFLICT (url_hash) DO NOTHING",
-		key, img.ContentType, img.Bytes,
-	)
+	if cacheable {
+		s.db.Exec(
+			"INSERT INTO image_cache (url_hash, content_type, bytes) VALUES ($1, $2, $3) ON CONFLICT (url_hash) DO NOTHING",
+			key, img.ContentType, img.Bytes,
+		)
+	}
 	return img, nil
 }
 
@@ -282,17 +306,113 @@ func fetchAndVerifyImage(rawURL string) (fetchedImage, error) {
 // blocked/broken image just means that one mail's images stay uncached — never worth
 // failing or even logging loudly over, the live proxy path still works as a fallback).
 func (s *Store) prefetchMailImages(acct dbAccount, password string, mails []Mail) {
+	var ownerSubject string
+	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", acct.ID).Scan(&ownerSubject); err != nil {
+		return
+	}
+	spamTagID, err := s.getOrCreateSpamTag(ownerSubject)
+	if err != nil {
+		log.Printf("get/create spam tag: %v", err)
+		spamTagID = "" // scoreSpam treats "" as "skip history reinforcement" — still runs the rest
+	} else {
+		// Created proactively, not just inside the auto-apply branch below — in Review
+		// mode nothing there ever runs (everything's only ever suggested, never
+		// applied), which left no destination folder for autoMoveTaggedMail to use
+		// once a suggestion eventually got accepted by hand.
+		s.ensureSpamFolderRule(acct.ID, spamTagID)
+	}
+	mode := s.ownerSpamMode(ownerSubject)
+
 	for _, m := range mails {
 		body, err := fetchMailBody(acct, password, m.Folder, m.UID)
-		if err != nil || body.HTML == "" {
+		if err != nil {
+			continue
+		}
+
+		if m.MessageID != "" && m.SenderEmail != "" {
+			score, reasons := s.scoreSpam(ownerSubject, spamTagID, m, body)
+			// Stored for every scored mail, not just ones that clear the suggest
+			// threshold — read back by the reader's bottom-of-mail diagnostic readout
+			// (mails.go), so a low-scoring mail still has something to show.
+			s.recordSpamFlags(m.MessageID, ownerSubject, score, reasons, body)
+			if score >= spamSuggestScore {
+				status := "suggested"
+				// Review means review — a high score never overrides the mode on its own.
+				if mode == "full_auto" && score >= spamAutoApplyScore {
+					status = "applied"
+					s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, spamTagID)
+					s.ensureSpamFolderRule(acct.ID, spamTagID)
+				}
+				s.recordTagHistory(ownerSubject, acct.ID, m.MessageID, spamTagID, m.SenderEmail, m.Subject, "spam_engine", status, &score)
+				if status == "applied" {
+					// Flagged mail shouldn't have its images warmed into the persistent
+					// cache ahead of time — see imageproxy's cacheable handling for the
+					// on-demand-view side of this same rule.
+					continue
+				}
+			}
+		}
+
+		if body.HTML == "" {
 			continue
 		}
 		for _, src := range extractImageSrcs(body.HTML) {
-			if _, err := s.cachedOrFetchImage(src); err != nil {
+			if _, err := s.cachedOrFetchImage(src, true); err != nil {
 				log.Printf("prefetch image %s: %v", src, err)
 			}
 		}
 	}
+}
+
+// getOrCreateSpamTag returns the owner's "Spam" tag, creating it the first time it's
+// needed — same get-or-create upsert handleCreateTag (tags.go) already uses, so it
+// shows up in the Tag Manager like any other tag rather than being a hidden concept.
+func (s *Store) getOrCreateSpamTag(ownerSubject string) (string, error) {
+	var id string
+	// instant_move = true on creation — spam shouldn't sit in inbox for the regular
+	// auto_move_delay_days like an ordinary tag; autoMoveTaggedMail (smarttags.go)
+	// already skips the delay entirely for any tag with this set, on its next
+	// scheduled or manually-triggered run. Only set at creation (excluded.name in the
+	// upsert leaves an already-existing tag's own instant_move alone, in case the user
+	// deliberately turned it back off via the Tag Manager).
+	err := s.db.QueryRow(`
+		INSERT INTO tags (id, owner_subject, name, color, instant_move) VALUES ($1, $2, 'Spam', $3, true)
+		ON CONFLICT (owner_subject, name) DO UPDATE SET name = excluded.name
+		RETURNING id`,
+		randomID(), ownerSubject, colorForName("Spam"),
+	).Scan(&id)
+	return id, err
+}
+
+// review (not full_auto) is the default — set in the 0027 migration — for the
+// opposite reason regular tagging's own default leans review: a spam false positive
+// burying real mail is worse than a missed spam-suggestion sitting in a queue.
+func (s *Store) ownerSpamMode(ownerSubject string) string {
+	var mode string
+	if err := s.db.QueryRow("SELECT spam_mode FROM owner_settings WHERE owner_subject = $1", ownerSubject).Scan(&mode); err != nil {
+		return "review"
+	}
+	return mode
+}
+
+// ensureSpamFolderRule wires the Spam tag to the account's Junk folder the first time
+// it's needed, the same way a user could do by hand via the Tag Manager's destination
+// picker — once this rule exists, the *existing* autoMoveTaggedMail (smarttags.go)
+// already moves tagged-and-aged inbox mail there on its own; no new move code at all.
+func (s *Store) ensureSpamFolderRule(accountID, spamTagID string) {
+	var existing int
+	s.db.QueryRow("SELECT count(*) FROM folder_tag_rules WHERE account_id = $1 AND tag_id = $2", accountID, spamTagID).Scan(&existing)
+	if existing > 0 {
+		return
+	}
+	_, _, junk, err := s.resolveFolders(accountID)
+	if err != nil || junk == "" {
+		return
+	}
+	s.db.Exec(
+		"INSERT INTO folder_tag_rules (account_id, folder, tag_id) VALUES ($1, $2, $3) ON CONFLICT (account_id, folder) DO UPDATE SET tag_id = excluded.tag_id",
+		accountID, junk, spamTagID,
+	)
 }
 
 // extractImageSrcs walks parsed HTML for every <img src="http(s)://...">  — mirrors

@@ -19,6 +19,7 @@ backend, Postgres, your own IMAP accounts, your own self-hosted login.
 - Scope to one folder, a hand-picked set of folders, or everything
 - Filter by tag — local data, so this skips IMAP entirely and is instant
 - Resumable if a many-folder mailbox times out partway through
+- Same swipe-down bottom-sheet UI as the folder picker — drag the grabber or tap the dimmed area above it to dismiss
 
 **Tags**
 - Manual tagging, plus folder→tag rules (move mail into a folder, it gets tagged automatically)
@@ -28,14 +29,28 @@ backend, Postgres, your own IMAP accounts, your own self-hosted login.
 **Smart auto-tagging**
 - Scores incoming mail against your own tagging history (sender, domain, subject) and either applies or suggests a tag
 - Two modes: *Review* (everything's a suggestion) or *Full-auto* (confident matches apply immediately)
-- **Auto-tag activity** panel — full-auto's own audit trail, with one-tap undo (which also teaches it not to repeat the mistake)
 - **Scan for tags** — a one-off bootstrap pass over existing mail (all folders, just the inbox, or a hand-picked set), including a "you've already filed this elsewhere — make it a tag?" detector for folders you sorted by hand
 - **Misplaced mail** — finds mail that's tagged but not sitting in that tag's folder, with a one-tap fix
 - See [docs/smart-tagging.md](docs/smart-tagging.md) for the scoring details and design tradeoffs
 
+**Smart spam detection**
+- A real heuristic engine — SPF/DKIM/DMARC, sender/reply-to/return-path mismatches, display-name spoofing, content phrase/punctuation/link checks — not just history matching, so it actually catches a sender you've never seen before
+- Same Review/Full-auto mode choice as tagging, kept as its own separate setting and its own menu — spam is its own concept, not a sub-feature of tagging, even though it shares the same plumbing underneath
+- Spam mail never auto-loads remote images regardless of your global image setting, and never gets cached if you do load it — both reverse instantly the moment it's marked "Not spam"
+- Every opened email shows a quiet, always-visible score/SPF/DKIM/DMARC/reasons readout at the bottom of the reader — purely diagnostic, never triggers scoring on its own
+- **Scan for spam** — the same one-off bootstrap pattern as tagging's scan, including treating whatever's already sorted into Junk/Trash as training evidence (still scored for real, never a silent bypass)
+- Suggestions and full-auto activity are grouped by sender, not flattened — a bulk spam run from one sender collapses into one group instead of dozens of rows
+- See [docs/spam-detection.md](docs/spam-detection.md) for the full scoring breakdown
+
+**Auto-tag activity**
+- One shared audit/undo panel for both Smart Tagging and Smart Spam's full-auto decisions — a Tagging/Spam toggle switches which one you're looking at
+- One-tap undo, which also teaches the relevant scorer not to repeat the mistake
+
 **Folders**
 - Browse, move mail between folders, multi-account folder pickers
 - Real folder management — create, rename, delete — not just browsing
+- Folder browsing is database-backed with zero IMAP round trips on a normal visit — a periodic background sync keeps every folder current, live IMAP is reserved for an explicit pull-to-refresh; see [docs/folder-mail-caching.md](docs/folder-mail-caching.md)
+- A manual refresh button in the folder picker for an on-demand live check, without re-rendering anything if nothing actually changed
 
 **Other**
 - Web push notifications (works as a home-screen PWA, no native app required)
@@ -80,7 +95,7 @@ task build     # compile the Go server without Docker, for a quick syntax check
 
 ```
 cmd/server/        entrypoint — wires up DB, auth, routes, starts the IMAP IDLE watchers
-internal/api/      HTTP handlers + business logic (mail, tags, search, smart-tagging, folders, accounts)
+internal/api/      HTTP handlers + business logic (mail, tags, search, smart-tagging, spam detection, folders, accounts)
 internal/auth/     OIDC login/session handling
 internal/db/       migrations + migration runner
 web/               the entire frontend — index.html, style.css, js/ (one module per concern)

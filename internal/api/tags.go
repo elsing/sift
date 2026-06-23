@@ -176,6 +176,15 @@ func (s *Store) handleUpdateTag(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// The Spam tag is load-bearing for the whole spam detection system (image
+	// gating, folder_tag_rules, the Smart Spam panel's queries all key off a tag
+	// literally named "Spam") — deleting it doesn't just lose a label, it silently
+	// breaks that entire feature. Rename it if "Spam" isn't the wording you want.
+	var name string
+	if err := s.db.QueryRow("SELECT name FROM tags WHERE id = $1", id).Scan(&name); err == nil && name == "Spam" {
+		http.Error(w, "the Spam tag can't be deleted", http.StatusBadRequest)
+		return
+	}
 	if _, err := s.db.Exec("DELETE FROM tags WHERE id = $1", id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

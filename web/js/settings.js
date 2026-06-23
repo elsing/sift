@@ -1,5 +1,5 @@
 import { fetchTags, createTag, updateTag, deleteTag, fetchTagDestinations, setTagDestination, deleteTagDestination } from './tags.js';
-import { pickFolder } from './folders.js';
+import { pickFolder, setLoading } from './folders.js';
 import { withBusyButton } from './util.js';
 import { confirmModal } from './confirmModal.js';
 import { render as renderInbox } from './inbox.js';
@@ -261,8 +261,14 @@ export function setupTagManager() {
   const errorEl = document.getElementById('tagManagerError');
 
   async function render() {
+    // fetchTags() alone (not force) actually benefits from tags.js's own localStorage
+    // cache — forcing it here defeated that for no reason, since create/update/delete
+    // already invalidate it correctly on their own. destinations/accounts still aren't
+    // cached, so this can still take a moment — a skeleton instead of a frozen list
+    // is the fix for that part.
+    setLoading(list, true);
     const [tags, destinations, accountsRes] = await Promise.all([
-      fetchTags(true),
+      fetchTags(),
       fetchTagDestinations().catch(() => []),
       fetch('/api/accounts').then((r) => (r.ok ? r.json() : [])).catch(() => []),
     ]);

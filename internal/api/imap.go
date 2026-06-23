@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -184,9 +185,9 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 			// it has to never be a literal "/" in the first place. The ID is otherwise
 			// opaque (nothing parses it back apart elsewhere), so this is safe.
 			ID:             fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
-			Sender:         envelopeSender(m.Envelope),
-			SenderEmail:    envelopeSenderEmail(m.Envelope),
-			Subject:        m.Envelope.Subject,
+			Sender:         toValidUTF8(envelopeSender(m.Envelope)),
+			SenderEmail:    toValidUTF8(envelopeSenderEmail(m.Envelope)),
+			Subject:        toValidUTF8(m.Envelope.Subject),
 			Snippet:        "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
 			Time:           formatMailTime(m.Envelope.Date),
 			Date:           m.Envelope.Date.Format(time.RFC3339),
@@ -198,6 +199,20 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 		})
 	}
 	return mails, oldestUID
+}
+
+// toValidUTF8 repairs envelope text that isn't valid UTF-8 — surfaced by the periodic
+// full-folder mail sync (watchFolderMailSync, accounts.go) hitting a real mailbox's
+// real history: some senders' clients emit raw 8-bit header bytes (a sender name with
+// no RFC 2047 encoded-word at all, just a Latin-1/Windows-1252 byte) that go-imap
+// passes through as-is. Postgres rejects invalid UTF-8 outright (not just mangled
+// text — the whole INSERT errors and that mail never gets cached at all), so this has
+// to happen before any of these fields reach the DB, not just for display.
+func toValidUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "")
 }
 
 // fetchMessageID looks up a single message's Message-ID header live — used to
@@ -278,9 +293,24 @@ func fetchFolderMailPage(c *imapclient.Client, accountID string, mbox *imap.Sele
 		if len(uids) == 0 {
 			return nil, nil
 		}
-		if len(uids) > limit {
-			uids = uids[len(uids)-limit:] // newest of the older batch — keeps paging backward in order
+		// Taking the newest `limit` UIDs here (UID order) assumes UID order tracks Date
+		// order — true for mail delivered straight into this folder, false for anything
+		// that arrived by being *moved* in (auto-move, a manual move, a folder rule):
+		// IMAP assigns a fresh UID at move time, completely unrelated to the message's
+		// own Date header. Junk is the worst case for exactly this reason — it's mostly
+		// moved-in mail. Fetching a wider window by UID, then actually sorting by date
+		// before slicing to `limit`, fixes that misalignment for any realistic amount of
+		// out-of-order moved mail without paying for an unbounded fetch — capped at
+		// folderPageOverfetchCap, not literally "everything older", which a folder with
+		// tens of thousands of messages would make this loop expensive.
+		widenedTarget := len(uids)
+		if want := limit * folderPageOverfetchFactor; want < widenedTarget {
+			widenedTarget = want
 		}
+		if widenedTarget > folderPageOverfetchCap {
+			widenedTarget = folderPageOverfetchCap
+		}
+		uids = uids[len(uids)-widenedTarget:]
 		fetchTarget = imap.UIDSetNum(uids...)
 	}
 
@@ -292,8 +322,26 @@ func fetchFolderMailPage(c *imapclient.Client, accountID string, mbox *imap.Sele
 	}
 
 	mails, _ := mailsFromFetch(accountID, folder, msgs)
+	if beforeUID > 0 {
+		// The widened-then-sorted-then-sliced step the comment above describes — only
+		// needed on the paging path; the very first page (beforeUID == 0) already fetches
+		// exactly `limit` by sequence number and the caller sorts the combined result.
+		sort.Slice(mails, func(i, j int) bool { return mails[i].Date > mails[j].Date })
+		if len(mails) > limit {
+			mails = mails[:limit]
+		}
+	}
 	return mails, nil
 }
+
+// folderPageOverfetchFactor/Cap bound the wider-than-`limit` UID window fetched per
+// page when paging backward — see fetchFolderMailPage's own comment. ponytail: a
+// fixed multiplier/cap, not an adaptive widen-until-correct loop; revisit if a folder
+// with a genuinely pathological amount of out-of-date-order moved mail shows up.
+const (
+	folderPageOverfetchFactor = 4
+	folderPageOverfetchCap    = 400
+)
 
 // formatMailTime shows a bare time for today's mail, and a date for anything older.
 func formatMailTime(t time.Time) string {
@@ -327,6 +375,29 @@ func listFolders(host string, port int, username, password, oauthProvider string
 		delim = d.Delim
 	}
 	return names, delim, nil
+}
+
+// folderMessageCounts STATUS-checks each folder on one connection — cheap (no SELECT,
+// no body fetch) — so a caller can show real "X of Y emails" progress up front instead
+// of guessing at a folder's size from a fetch limit. A folder that errors (renamed,
+// unselectable, transient) is just left out of the map rather than failing the whole
+// batch; the caller treats a missing entry as "unknown, don't count it."
+func folderMessageCounts(host string, port int, username, password, oauthProvider string, folders []string) map[string]int {
+	counts := map[string]int{}
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
+	if err != nil {
+		return counts
+	}
+	defer c.Close()
+
+	for _, folder := range folders {
+		data, err := c.Status(folder, &imap.StatusOptions{NumMessages: true}).Wait()
+		if err != nil || data.NumMessages == nil {
+			continue
+		}
+		counts[folder] = int(*data.NumMessages)
+	}
+	return counts
 }
 
 type folderNode struct {
@@ -407,16 +478,16 @@ func envelopeSenderEmail(env *imap.Envelope) string {
 // the SPECIAL-USE extension (RFC 6154); servers that don't support it (common on
 // self-hosted Dovecot) fall back to matching common folder names. Either return value
 // can come back empty if nothing matched — that's not an error, just "not found".
-func detectSpecialUseFolders(host string, port int, username, password, oauthProvider string) (archive, trash string, err error) {
+func detectSpecialUseFolders(host string, port int, username, password, oauthProvider string) (archive, trash, junk string, err error) {
 	c, err := dialIMAP(host, port, username, password, oauthProvider)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer c.Close()
 
 	data, err := c.List("", "*", &imap.ListOptions{ReturnSpecialUse: true}).Collect()
 	if err != nil {
-		return "", "", fmt.Errorf("list: %w", err)
+		return "", "", "", fmt.Errorf("list: %w", err)
 	}
 
 	for _, d := range data {
@@ -426,6 +497,9 @@ func detectSpecialUseFolders(host string, port int, username, password, oauthPro
 		if slices.Contains(d.Attrs, imap.MailboxAttrTrash) {
 			trash = d.Mailbox
 		}
+		if slices.Contains(d.Attrs, imap.MailboxAttrJunk) {
+			junk = d.Mailbox
+		}
 	}
 	if archive == "" {
 		archive = matchFolderName(data, "archive")
@@ -433,7 +507,10 @@ func detectSpecialUseFolders(host string, port int, username, password, oauthPro
 	if trash == "" {
 		trash = matchFolderName(data, "trash", "deleted")
 	}
-	return archive, trash, nil
+	if junk == "" {
+		junk = matchFolderName(data, "junk", "spam", "bulk")
+	}
+	return archive, trash, junk, nil
 }
 
 func matchFolderName(data []*imap.ListData, needles ...string) string {
@@ -519,7 +596,27 @@ type MailBody struct {
 	HTML          string       `json:"html,omitempty"`
 	SenderEmail   string       `json:"senderEmail,omitempty"`
 	TrustedSender bool         `json:"trustedSender"`
+	IsSpam        bool         `json:"isSpam"`
 	Attachments   []Attachment `json:"attachments,omitempty"`
+	// Read back from spam_flags (handleMailBody never scores anything itself) — the
+	// "what the spam engine thinks" readout shown at the bottom of every email in
+	// reader.js. SpamChecked is false when this mail was never scored at all (arrived
+	// before spam detection existed and hasn't been through a scan yet).
+	SpamChecked bool     `json:"spamChecked"`
+	SpamScore   float64  `json:"spamScore"`
+	SpamReasons []string `json:"spamReasons,omitempty"`
+	SpamSPF     string   `json:"spamSpf,omitempty"`
+	SpamDKIM    string   `json:"spamDkim,omitempty"`
+	SpamDMARC   string   `json:"spamDmarc,omitempty"`
+	// Raw header values the spam scorer (spam.go) needs — not exposed to the client,
+	// just carried alongside the parsed body so scoring doesn't need a second IMAP
+	// fetch of the same message. The BODYSECTION fetch below already pulls the full
+	// raw message (headers included); this just keeps a few fields from it instead of
+	// discarding them once Text/HTML/Attachments are extracted.
+	AuthenticationResults string `json:"-"`
+	ReplyTo               string `json:"-"`
+	ReturnPath            string `json:"-"`
+	From                  string `json:"-"`
 }
 
 type Attachment struct {
@@ -561,6 +658,10 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 	}
 
 	var body MailBody
+	body.AuthenticationResults, _ = mr.Header.Text("Authentication-Results")
+	body.ReplyTo, _ = mr.Header.Text("Reply-To")
+	body.ReturnPath, _ = mr.Header.Text("Return-Path")
+	body.From, _ = mr.Header.Text("From")
 	attachmentIndex := 0
 	for {
 		part, err := mr.NextPart()

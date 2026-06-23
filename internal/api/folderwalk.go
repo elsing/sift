@@ -2,8 +2,40 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"time"
 )
+
+// withTimeout bounds a blocking call that has no timeout/context support of its own —
+// every IMAP operation in this codebase, notably (dialIMAP/imapclient have no deadline
+// or context awareness at all). A stalled connection — a network blip, a server that
+// stops responding mid-command — would otherwise hang the calling goroutine forever,
+// which is exactly what froze a image-cache backfill or tag scan partway through with
+// no way to recover except restarting the whole server. The orphaned goroutine on a
+// real timeout leaks (Go has no way to forcibly abort a blocked network read), but
+// that's a single goroutine sitting on a connection that'll eventually error out on its
+// own — much better than the entire operation never progressing again.
+func withTimeout[T any](d time.Duration, fn func() (T, error)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := fn()
+		ch <- result{v, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-time.After(d):
+		var zero T
+		return zero, fmt.Errorf("timed out after %s", d)
+	}
+}
+
+const imapOpTimeout = 25 * time.Second
 
 // walkAccountFolders fetches up to `limit` recent mails from each of the given
 // folders, caching them locally (so anything found has a real mails.id other features
@@ -19,7 +51,9 @@ func (s *Store) walkAccountFolders(
 		if ctx.Err() != nil {
 			return ctx.Err() // client closed the connection (e.g. tapped Cancel) — stop burning IMAP round trips on a scan nobody's waiting for
 		}
-		mails, err := fetchFolderMail(acct, password, folder, limit, 0)
+		mails, err := withTimeout(imapOpTimeout, func() ([]Mail, error) {
+			return fetchFolderMail(acct, password, folder, limit, 0)
+		})
 		if err == nil {
 			// Without this, scanned mail was never cached locally at all — there was no
 			// mails.id to resolve, so a scan-derived suggestion (or, for the image

@@ -507,11 +507,43 @@ func (s *Store) handleMailBody(w http.ResponseWriter, r *http.Request) {
 	// Remote images (most commonly tracking pixels) load over the network the moment
 	// an HTML body renders — the client blocks them by default unless the sender's
 	// been explicitly trusted, which this tells it.
-	var ownerSubject, senderEmail string
-	s.db.QueryRow("SELECT a.owner_subject, coalesce(m.sender_email, '') FROM mails m JOIN accounts a ON a.id = m.account_id WHERE m.id = $1", id).Scan(&ownerSubject, &senderEmail)
+	var ownerSubject, senderEmail, messageID, subject string
+	s.db.QueryRow(
+		"SELECT a.owner_subject, coalesce(m.sender_email, ''), coalesce(m.message_id, ''), coalesce(m.subject, '') FROM mails m JOIN accounts a ON a.id = m.account_id WHERE m.id = $1", id,
+	).Scan(&ownerSubject, &senderEmail, &messageID, &subject)
 	body.SenderEmail = senderEmail
 	if ownerSubject != "" && senderEmail != "" {
 		s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM trusted_senders WHERE owner_subject = $1 AND sender_email = $2)", ownerSubject, senderEmail).Scan(&body.TrustedSender)
+	}
+	// Spam never auto-loads images regardless of the global setting or even a
+	// normally-trusted sender — the client checks this flag ahead of trustedSender.
+	if messageID != "" {
+		s.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM message_tags mt JOIN tags t ON t.id = mt.tag_id WHERE mt.message_id = $1 AND t.name = 'Spam')",
+			messageID,
+		).Scan(&body.IsSpam)
+	}
+	// Read-only — the bottom-of-mail "what the spam engine thinks" readout (reader.js)
+	// shows whatever the last scan or new-mail sync already computed and stored here.
+	// Opening a mail must never itself trigger scoring; scoreSpam only ever runs from
+	// prefetchMailImages (new mail) or an explicit Smart Spam scan.
+	if messageID != "" {
+		row := s.db.QueryRow(
+			"SELECT score, reasons, spf, dkim, dmarc FROM spam_flags WHERE message_id = $1 ORDER BY created_at DESC LIMIT 1",
+			messageID,
+		)
+		var reasons string
+		if scanErr := row.Scan(&body.SpamScore, &reasons, &body.SpamSPF, &body.SpamDKIM, &body.SpamDMARC); scanErr != nil {
+			if scanErr != sql.ErrNoRows {
+				log.Printf("spam_flags lookup %s: %v", messageID, scanErr)
+			}
+			body.SpamChecked = false
+		} else {
+			if reasons != "" {
+				body.SpamReasons = strings.Split(reasons, "\n")
+			}
+			body.SpamChecked = true
+		}
 	}
 	writeJSON(w, body)
 }

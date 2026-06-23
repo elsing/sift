@@ -8,7 +8,12 @@ import { confirmModal, promptModal } from './confirmModal.js';
 // and throttled (FOLDER_CACHE_TTL) so a fresh-enough cache skips the network call
 // entirely rather than re-running an IMAP LIST against the remote server every single
 // time a folder picker opens, which adds up for something that almost never changes.
-const FOLDER_CACHE_TTL = 5 * 60 * 1000;
+// 5 minutes (the original value) meant almost every open outside of active back-to-back
+// browsing still paid the full live IMAP round trip — folder structure changing on its
+// own, unprompted by this app's own create/rename/delete (which already invalidate the
+// cache directly), is rare enough that a day is a perfectly safe bound, not a magic
+// number chosen to feel snappy in a demo.
+const FOLDER_CACHE_TTL = 24 * 60 * 60 * 1000;
 const FOLDERS_STORAGE_KEY = 'sift_folders_cache';
 const folderCache = new Map(); // accountId -> { folders, fetchedAt }
 try {
@@ -22,12 +27,25 @@ function persistFolderCache() {
   } catch {}
 }
 
+// Called from inbox.js's SSE "folders" listener — the server pushes this whenever a
+// folder's created/renamed/deleted, whether through this app or (every 2 hours, caught
+// by a background IMAP recheck) through some other mail client entirely. The next
+// picker open just fetches fresh since there's nothing left to find here.
+export function invalidateAllFolderCaches() {
+  folderCache.clear();
+  try {
+    localStorage.removeItem(FOLDERS_STORAGE_KEY);
+  } catch {}
+}
+
 export async function fetchFolders(accountId, force) {
   const entry = folderCache.get(accountId);
   if (!force && entry && Date.now() - entry.fetchedAt < FOLDER_CACHE_TTL) {
     return entry.folders;
   }
-  const res = await fetch(`/api/accounts/${accountId}/folders`);
+  // force also skips the server's own cache (?force=1) — without it, this would just
+  // ask the server, which would likely still answer from its own cache anyway.
+  const res = await fetch(`/api/accounts/${accountId}/folders${force ? '?force=1' : ''}`);
   if (!res.ok) throw new Error(await res.text());
   const folders = await res.json();
   folderCache.set(accountId, { folders, fetchedAt: Date.now() });
@@ -182,10 +200,58 @@ export function renderFolderTree(nodes, opts = {}) {
         onSelect(node.path);
       });
     } else if (onNavigate) {
+      // The whole row, not just the label span — a search result re-renders on every
+      // keystroke (renderCurrentTree), and a tap landing a few pixels outside the
+      // text itself (easy to do right after the keyboard's been open and the layout
+      // just shifted) used to silently do nothing instead of still navigating.
       label.classList.add('navigable');
-      label.addEventListener('click', (e) => {
+      row.classList.add('selectable');
+      let navigatedViaTouch = false;
+      let touchStart = null;
+      const navigate = () => onNavigate(node.path, node.name);
+      // The actual fix for "works on desktop, not on mobile, something to do with the
+      // keyboard": tapping a result while the search input is still focused is, on
+      // iOS Safari, two things happening on the same touch — the keyboard dismissing
+      // AND a tap on a new target — and the regular synthetic 'click' that follows a
+      // touch can be suppressed entirely when that happens, not just delayed.
+      // touchend fires unconditionally; preventDefault on it stops that now-redundant
+      // trailing click from double-firing navigate.
+      //
+      // But touchend alone fired on *any* touch release inside the row, including the
+      // end of a scroll gesture that happened to start or land on a row — scrolling a
+      // long folder list became impossible without accidentally entering whatever
+      // folder you scrolled across. Tracking the touch's start position and only
+      // treating it as a tap if the finger barely moved is the same distinction a
+      // native click already makes for free; touchend doesn't.
+      row.addEventListener('touchstart', (e) => {
+        const t = e.touches[0];
+        touchStart = { x: t.clientX, y: t.clientY };
+      }, { passive: true });
+      row.addEventListener('touchend', (e) => {
+        const start = touchStart;
+        touchStart = null;
+        if (!start) return;
+        // The expand/collapse arrow is a child of this same row — its own click
+        // handler stops propagation for 'click', but this listens for 'touchend',
+        // a different event that already bubbled past it before that ever runs.
+        // Without this check, tapping the toggle both expanded/collapsed it AND
+        // navigated straight into the folder at the same time.
+        if (e.target.closest('.folder-toggle')) return;
+        const t = e.changedTouches[0];
+        const moved = Math.hypot(t.clientX - start.x, t.clientY - start.y);
+        if (moved > 10) return; // a scroll/drag, not a tap — let it scroll, don't navigate
+        e.preventDefault();
         e.stopPropagation();
-        onNavigate(node.path, node.name);
+        navigatedViaTouch = true;
+        navigate();
+      });
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (navigatedViaTouch) {
+          navigatedViaTouch = false; // this click is touchend's own suppressed-but-not-always-actually-suppressed follow-up
+          return;
+        }
+        navigate();
       });
     }
 
@@ -225,7 +291,8 @@ export function renderFolderTree(nodes, opts = {}) {
   return ul;
 }
 
-let sheetModal, sheetBody, sheetError, sheetTitle, sheetSearch, sheetConfirm;
+let sheetModal, sheetBody, sheetError, sheetTitle, sheetSearch, sheetConfirm, sheetRefresh;
+let currentAccountId = null;
 
 export function setupFolderSheet() {
   sheetModal = document.getElementById('folderSheetModal');
@@ -234,12 +301,41 @@ export function setupFolderSheet() {
   sheetTitle = document.getElementById('folderSheetTitle');
   sheetSearch = document.getElementById('folderSheetSearch');
   sheetConfirm = document.getElementById('folderSheetConfirm');
+  sheetRefresh = document.getElementById('folderSheetRefresh');
   document.getElementById('folderSheetClose').addEventListener('click', closeFolderSheet);
   closeOnBackdropTap(sheetModal, closeFolderSheet);
   sheetSearch.addEventListener('input', () => renderCurrentTree());
+  sheetRefresh.addEventListener('click', async () => {
+    if (!currentAccountId) return;
+    sheetRefresh.disabled = true;
+    sheetError.textContent = '';
+    try {
+      // force=true here means what the user actually asked for: skip every cache
+      // (this client's, and the server's own) and ask IMAP directly, right now, on
+      // demand — not on every open, just when explicitly requested.
+      const folders = await fetchFolders(currentAccountId, true);
+      // Same "don't rebuild the DOM over nothing" reasoning as the open-time cache-hit
+      // skip above, just content-compared instead of reference-compared since a
+      // forced fetch always returns a fresh array even when nothing's actually
+      // different.
+      if (JSON.stringify(folders) !== JSON.stringify(lastFolders)) {
+        lastFolders = folders;
+        renderCurrentTree();
+      }
+    } catch (err) {
+      sheetError.textContent = err.message;
+    } finally {
+      sheetRefresh.disabled = false;
+    }
+  });
 }
 
 function closeFolderSheet() {
+  // Hiding the modal (a class toggle, not removing it from the DOM) doesn't blur
+  // whatever's still focused inside it — the on-screen keyboard stayed up after
+  // navigating away via a search result, with nothing left visible to even tap to
+  // dismiss it, until explicitly blurred here.
+  sheetSearch.blur();
   sheetModal.classList.add('hidden');
   sheetBody.innerHTML = '';
   sheetError.textContent = '';
@@ -295,6 +391,7 @@ function renderCurrentTree() {
 // checkSet+onCheck for multi-select). confirm, if given, shows a footer button — used by
 // checkSet mode, where there's no per-row action to close the sheet on.
 function showFolderSheet(accountId, title, treeOpts, confirm) {
+  currentAccountId = accountId; // for the refresh button — it has no other way to know which account's tree is open
   sheetModal.classList.remove('hidden');
   sheetTitle.textContent = title;
   sheetError.textContent = '';
@@ -323,6 +420,13 @@ function showFolderSheet(accountId, title, treeOpts, confirm) {
 
   fetchFolders(accountId)
     .then((folders) => {
+      // fetchFolders itself has a 24h TTL cache — most opens land well inside that
+      // window, so this resolves with the *exact same array* `cached` already pointed
+      // to, having made no network call at all. Re-rendering it anyway tore down and
+      // rebuilt the whole tree DOM a second time, immediately, on every single open —
+      // a visible flicker with nothing to show for it, which read as "reloading every
+      // time" even though nothing had actually changed (or even been re-fetched).
+      if (folders === cached) return;
       // still showing this same account's tree (not closed/switched while the fetch ran)
       if (!sheetModal.classList.contains('hidden') && sheetTitle.textContent === title) render(folders);
     })
@@ -633,12 +737,12 @@ export function setupFolderManager() {
   const tree = document.getElementById('folderManagerTree');
   const errorEl = document.getElementById('folderManagerError');
 
-  const render = async () => {
+  const render = async (force) => {
     errorEl.textContent = '';
     if (!folderManagerAccountId) return;
     setLoading(tree, true);
     try {
-      const folders = await fetchFolders(folderManagerAccountId);
+      const folders = await fetchFolders(folderManagerAccountId, force);
       // INBOX always exists and can't be renamed/deleted on any IMAP server worth
       // talking to — offering rename/delete buttons for it here would just be a
       // guaranteed-to-fail action sitting in the list for no reason.
@@ -731,7 +835,7 @@ export function setupFolderManager() {
     newRootBtn.classList.remove('hidden');
     if (accounts.length === 1) {
       folderManagerAccountId = accounts[0].id;
-      render();
+      render(true); // entering Manage Folders — get the genuine current state, not a cached one
       return;
     }
     tree.innerHTML = ''; // waiting on an account pick now, not actively loading anything
@@ -741,7 +845,7 @@ export function setupFolderManager() {
       btn.textContent = a.email;
       btn.addEventListener('click', () => {
         folderManagerAccountId = a.id;
-        render();
+        render(true);
       });
       accountPicker.appendChild(btn);
     }

@@ -62,6 +62,9 @@ func main() {
 	store.ImageCacheRoutes(protected, func(r *http.Request) string {
 		return auth.UserFromContext(r.Context()).Subject
 	})
+	store.SpamRoutes(protected, func(r *http.Request) string {
+		return auth.UserFromContext(r.Context()).Subject
+	})
 	store.PushRoutes(protected, func(r *http.Request) string {
 		return auth.UserFromContext(r.Context()).Subject
 	})
@@ -92,6 +95,7 @@ func main() {
 	indexHTML = []byte(strings.NewReplacer(
 		`href="style.css"`, `href="style.css?v=`+cssVersion+`"`,
 		`src="js/main.js"`, `src="js/main.js?v=`+cssVersion+`"`,
+		`src="js/vendor/pulltorefresh.js"`, `src="js/vendor/pulltorefresh.js?v=`+cssVersion+`"`,
 	).Replace(string(indexHTML)))
 
 	static := http.FileServer(http.Dir("web"))

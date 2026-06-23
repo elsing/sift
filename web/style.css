@@ -55,9 +55,14 @@
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 /* Three custom fonts (Fraunces, Lora, Source Serif 4) all missed in one way or
-   another — plain system default, no custom font-family at all, is what this app
-   looked best with the whole time. */
+   another. system-ui/-apple-system isn't a "custom font" — it's the actual mechanism
+   for requesting the OS's native UI font (San Francisco, Roboto, Segoe...), i.e.
+   "whatever my phone is" by definition. Leaving font-family unset entirely (an
+   earlier attempt) doesn't mean that — it means the browser's own generic fallback for
+   completely unstyled HTML, which on most engines is actually serif (the classic
+   "Times New Roman by default" behavior), the opposite of the intent. */
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   overscroll-behavior-y: contain;
   scrollbar-width: none; transition: background-color 0.25s ease, color 0.25s ease; }
 html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
@@ -125,20 +130,11 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .dry-run-banner.visible { height: 26px; line-height: 26px; opacity: 1; }
 
-.pull-indicator {
-  display: flex; align-items: center; justify-content: center; gap: 6px;
-  text-align: center; font-size: 13px; color: var(--text-dim);
-  height: 0; overflow: hidden; transition: height 0.15s;
-}
-.pull-indicator.refreshing { height: 36px; }
-
-.pull-icon { display: inline-block; font-size: 16px; transition: transform 0.3s var(--bounce); }
-.pull-icon.tilt { transform: rotate(-15deg) scale(1.25); }
-.pull-icon.spin { animation: pull-spin 0.8s var(--bounce) infinite; }
-@keyframes pull-spin {
-  0%, 100% { transform: rotate(0deg) scale(1); }
-  50% { transform: rotate(180deg) scale(1.35); }
-}
+/* pulltorefreshjs (web/js/vendor/pulltorefresh.js) injects its own <style> with
+   sensible layout defaults — these just retheme its text/icon color to match the
+   app instead of its library-default rgba(0,0,0,0.3), which read as barely visible
+   on a dark background. */
+.ptr--text, .ptr--icon { color: var(--text-dim) !important; }
 
 /* render() fully clears and rebuilds this list's contents on every call (entering/
    leaving a group, a folder, etc) — the browser's automatic scroll anchoring can react
@@ -270,7 +266,8 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .accounts-panel h2 { font-size: 18px; margin: 0 0 12px; }
 .panel-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .panel-header-row h2 { margin: 0; }
-.settings-subhead { font-size: 13px; font-weight: 700; color: var(--accent); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.settings-subhead { font-size: 13px; font-weight: 700; color: var(--accent); margin: 18px 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.settings-subhead:first-of-type { margin-top: 0; }
 
 .theme-options { display: flex; gap: 8px; margin: 10px 0 20px; flex-wrap: wrap; }
 .theme-option {
@@ -476,18 +473,45 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .move-modal.hidden { opacity: 0; pointer-events: none; }
 .move-modal-content {
-  width: 100%; max-height: 70vh; overflow-y: auto; background: var(--bg);
+  position: relative; width: 100%; max-height: 70vh; overflow-y: auto; background: var(--bg);
   overscroll-behavior: contain; /* stop scroll-chaining into the inbox behind it */
   border-radius: 24px 24px 0 0; padding: 16px;
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
-  transform: translateY(0); transition: transform 0.35s var(--bounce);
+  transform: translateY(0);
+  /* padding-bottom here is also where main.js's modalKeyboardPadding adds/removes
+     room for the on-screen keyboard. Tapping any in-content button while a text input
+     was focused blurs that input first (moving focus to the button) — the keyboard
+     starts closing, and this padding snaps back to its resting value the instant
+     that's detected. Bottom-anchored content (align-items: flex-end on .move-modal)
+     means removing that padding moves the whole sheet's visible top edge down — an
+     un-animated snap looked exactly like the sheet closing and a shorter one
+     reopening lower, when it's really the same sheet collapsing back to its normal
+     height. Covering padding in the same transition removes that jump. */
+  transition: transform 0.35s var(--bounce), padding-bottom 0.2s ease;
 }
 .move-modal.hidden .move-modal-content { transform: translateY(100%); }
+/* Several attempts at making the grabber bar and/or header itself the drag target kept
+   falling through to native scroll — relying on "which specific sibling/child did the
+   touch land on" turned out fragile in practice (DOM hit-testing edge cases, the
+   grabber being a sibling rather than a child of the header, etc). This is the
+   unambiguous version: one absolutely-positioned layer, explicitly sized, sitting on
+   top of the grabber+header area, and nothing else competing for that hit-test. Sized
+   to exclude the header actions column on the right (see main.js) so those buttons
+   stay tappable normally rather than being covered by this — wide enough for two
+   icon buttons (folderSheetModal's refresh + close), not just one. */
+.move-modal-drag-catcher {
+  position: absolute; top: 0; left: 0; right: 96px; height: 56px; z-index: 5; touch-action: none;
+}
+.move-modal-grabber {
+  width: 36px; height: 5px; border-radius: 999px; background: var(--border);
+  margin: 0 auto 10px;
+}
 .move-modal-header {
   display: flex; justify-content: space-between; align-items: center;
-  font-size: 15px; font-weight: 600; margin-bottom: 10px;
+  font-size: 15px; font-weight: 600; margin-bottom: 10px; padding: 6px 0;
 }
 .move-modal-header button { background: none; border: none; color: var(--text-dim); font-size: 16px; }
+.move-modal-header-actions { display: flex; align-items: center; gap: 14px; }
 
 /* Centered, not a bottom sheet like every other modal in this app — a yes/no
    confirmation is short enough that a small centered card reads better than a sheet
@@ -523,24 +547,36 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 10px;
 }
 
+/* Two rows, not one cramped one: Back plus whatever extra controls a given banner has
+   (auto-tag select + apply-to-all on the real folder banner, the tag-group's
+   go-to-folder button) on the first row, the folder/tag name on its own full-width
+   centered row below — was previously squeezed in among up to 3 other controls on a
+   single line with no room to breathe (or even show a long name unellipsized). Order-
+   based, not banner-specific, so it applies the same way to every .folder-banner
+   (#folderBanner and #tagGroupBanner) regardless of which extra buttons it has. */
 .folder-banner {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
   padding: 8px 16px; background: var(--input-bg); border-bottom: 1px solid var(--border);
   height: auto; overflow: hidden; animation: row-in 0.2s ease both;
 }
 .folder-banner.hidden { display: none; }
+.folder-banner button.hidden { display: none; }
 .folder-banner button {
   background: none; border: 2px solid var(--move); border-radius: 12px;
   color: var(--move); font-weight: 700; font-size: 12px; padding: 4px 10px;
 }
+.folder-banner > button:first-child { order: 1; }
+.folder-banner > *:not(span):not(:first-child) { order: 2; }
 .folder-banner span {
-  font-size: 14px; font-weight: 700; flex: 1;
+  order: 3; flex: 1 0 100%; text-align: center;
+  font-size: 14px; font-weight: 700;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .folder-auto-tag-select {
   flex: none; max-width: 40%; background: var(--bg); border: 2px solid var(--border);
   border-radius: 999px; color: var(--text-dim); font-size: 11px; font-weight: 700;
   padding: 4px 8px;
+  margin-left: auto; /* first of the row-1 "extra controls" group — pushes itself (and apply-to-all right after it) to the far right, away from Back */
 }
 /* .folder-banner button (above) sets every button in the banner to --move's color —
    needs the extra class-selector specificity here to actually override that. */
@@ -653,6 +689,10 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   background: none; border: 2px solid var(--border); border-radius: 12px;
   color: var(--text-dim); font-size: 13px; padding: 5px 10px;
 }
+/* Matches the action icons' own 40px tap target (bumped up there for the same
+   reason) — Back was left at the smaller default size, which read as undersized
+   sitting right next to them. */
+#mailReaderBack { height: 40px; padding: 0 14px; font-size: 14px; font-weight: 600; }
 /* Same semantic colors the swipe actions already use for these exact same actions —
    Archive/Delete/Move meant something specific by color there, and going flat accent
    pink for all of them here (the generic .icon-btn default) would've thrown that away. */
@@ -667,16 +707,19 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .mail-reader-header-actions {
   display: flex; gap: 6px; margin-left: auto; overflow-x: auto;
 }
+/* Bigger tap targets specifically here, not the generic .icon-btn used elsewhere
+   (topbar, panel headers) — these are the only icon-only actions a thumb has to hit
+   reliably while actually reading mail, packed close together in a row. */
+.mail-reader-header .icon-btn { width: 40px; height: 40px; flex: none; }
+.mail-reader-header .icon-btn svg { width: 20px; height: 20px; }
 #mailReaderDeleteBtn { border-color: var(--delete); color: var(--delete); }
 .mail-reader-meta { margin-bottom: 16px; }
 .mail-reader-subject { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
 .mail-reader-sender { font-size: 14px; font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; }
 .mail-reader-time { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
 .mail-reader-body {
-  /* Plain-text mail content, not the app's own UI voice — a sender's actual email
-     reads better in a neutral, fast-to-scan font than the app's branded serif, the
-     same reasoning HTML mail already gets via the sandboxed iframe never touching it. */
-  font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; line-height: 1.6; color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px; line-height: 1.6; color: var(--text);
   white-space: pre-wrap; word-wrap: break-word; margin: 0;
 }
 
@@ -723,6 +766,27 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .images-blocked-banner span { flex: 1; color: var(--text-dim); }
 .images-blocked-banner.hidden { display: none; }
 .images-blocked-banner .settings-row-btn { width: auto; margin: 0; padding: 5px 12px; font-size: 12px; }
+.spam-notice {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; margin-top: 8px; border-radius: 12px;
+  background: rgba(255, 61, 129, 0.1); border: 1px solid rgba(255, 61, 129, 0.35); font-size: 13px;
+}
+.spam-notice span { flex: 1; color: var(--text-dim); }
+.spam-notice.hidden { display: none; }
+.spam-notice .settings-row-btn { width: auto; margin: 0; padding: 5px 12px; font-size: 12px; }
+/* Low-key, always-present readout at the very bottom of every email — not a toggled
+   button/panel (that briefly showed the PREVIOUS mail's result before the new one
+   loaded), just plain content that renders fresh with the rest of the mail body. */
+.spam-check-footer {
+  margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border); font-size: 12px;
+}
+.spam-check-score { font-weight: 600; color: var(--text-dim); margin: 0 0 6px; }
+.spam-check-auth { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.spam-check-auth span { font-size: 12px; color: var(--text-dim); }
+.spam-check-auth .pass { color: var(--archive); }
+.spam-check-auth .fail { color: var(--delete); }
+.spam-check-reasons { margin: 0; padding-left: 18px; color: var(--text-dim); font-size: 12px; }
+.spam-check-reasons li { margin-bottom: 3px; }
 .mail-reader-attachments { margin-top: 12px; padding: 0; }
 .mail-reader-attachment {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -744,20 +808,10 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 
 .folder-empty-status { padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 14px; }
 
-/* Pinned to the top of #searchPanel's own scroll (sticky relative to it, not the page —
-   the panel itself is what scrolls), so it doesn't disappear upward once results push
-   the panel's content taller than the screen. Negative top margin + matching padding
-   cancels out the panel's own top padding (safe-area inset + 20px) for this one element,
-   so it sticks flush with zero gap instead of leaving a sliver of scrolled-past content
-   peeking above it. */
-.search-form {
-  margin: calc(-1 * (env(safe-area-inset-top, 0px) + 20px)) 0 10px;
-  padding-top: calc(env(safe-area-inset-top, 0px) + 20px);
-  position: sticky; top: 0; z-index: 5; background: var(--bg);
-}
+.search-form { margin-bottom: 10px; }
 .search-form-row { display: flex; align-items: center; gap: 8px; }
 .search-form input {
-  flex: 1; min-width: 0; background: var(--input-bg); border: 2px solid var(--border);
+  flex: 1; min-width: 0; width: 100%; background: var(--input-bg); border: 2px solid var(--border);
   border-radius: 999px; color: var(--text); padding: 10px 16px; font-size: 15px;
 }
 .search-form-row .icon-btn { flex: none; }
@@ -828,6 +882,28 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   0%, 100% { transform: translateY(0) rotate(-4deg); }
   50% { transform: translateY(-8px) rotate(4deg); }
 }
+
+.settings-checkbox-row {
+  display: flex; align-items: flex-start; gap: 10px; font-size: 14px;
+  padding: 8px 0; cursor: pointer;
+}
+.settings-checkbox-row input { margin-top: 3px; flex: none; }
+.settings-checkbox-row span { display: flex; flex-direction: column; gap: 2px; }
+.settings-checkbox-row small { color: var(--text-dim); font-size: 12px; font-weight: 400; line-height: 1.4; }
+
+.image-cache-card {
+  border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; margin: 4px 0 16px;
+}
+.image-cache-retention-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14px; margin-bottom: 10px;
+}
+.image-cache-retention-row input {
+  width: 56px; background: var(--input-bg); border: 2px solid var(--border);
+  border-radius: 999px; color: var(--text); padding: 4px 10px; font-size: 14px; text-align: center;
+}
+#imageBackfillStatus { margin: 0 0 10px; }
+#backfillImageCacheBtn { margin-bottom: 0; }
+#imageCacheProgress { margin: 10px 0 0; }
 
 .connect-google-btn, .show-add-account-btn {
   display: block; width: 100%; background: none; border: 2px dashed var(--border);

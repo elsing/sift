@@ -4,7 +4,7 @@ import { openMailReaderById, setReaderBack } from './reader.js';
 import { pickFolders } from './folders.js';
 import { fetchTags } from './tags.js';
 
-let panel, input, scopeBtn, accountScopeEl, errorEl, results;
+let panel, content, input, scopeBtn, accountScopeEl, errorEl, results;
 let progressWrap, progressFill, progressText, deepBtn, continueBtn;
 let advancedToggle, advancedPanel, fromInput, sinceInput, beforeInput, folderPickerToggle, tagFilterEl;
 let searchAllFolders = true; // toggled off via scopeBtn to restrict to the folder you opened search from
@@ -25,6 +25,7 @@ const chosenTags = new Set();
 
 export function setupSearch() {
   panel = document.getElementById('searchPanel');
+  content = panel.querySelector('.move-modal-content');
   input = document.getElementById('searchInput');
   scopeBtn = document.getElementById('searchFolderScope');
   accountScopeEl = document.getElementById('searchAccountScope');
@@ -43,36 +44,17 @@ export function setupSearch() {
   folderPickerToggle = document.getElementById('searchFolderPickerToggle');
   tagFilterEl = document.getElementById('searchTagFilter');
 
-  // Previous attempts resized #searchPanel itself (to visualViewport.height) — that's
-  // what caused the worse regressions (a stuck-short panel, jank from toolbar-driven
-  // resize events, a literal gap exposing the inbox underneath). The panel's own
-  // size/position is never touched now, full stop — still plain `position: fixed;
-  // inset: 0`, always fully covering the screen regardless of keyboard state.
-  //
-  // But that on its own left genuinely nothing to scroll for a short result list: the
-  // panel's box never shrinks, so its scrollable content (input + filters + a couple of
-  // results) can easily be shorter than that box even while the keyboard visually
-  // covers the bottom third of it — scrollBy/scrollIntoView have no effect when there's
-  // no overflow to scroll into in the first place. Padding the *results* element specif-
-  // ically (never the panel) by the actual keyboard height — window.innerHeight minus
-  // visualViewport.height, the one number iOS reports correctly — manufactures that
-  // room without changing what the panel itself covers.
-  if (window.visualViewport) {
-    const syncKeyboardPadding = () => {
-      if (document.activeElement !== input) {
-        results.style.paddingBottom = '';
-        return;
-      }
-      const keyboardHeight = Math.max(0, window.innerHeight - window.visualViewport.height);
-      results.style.paddingBottom = keyboardHeight > 0 ? `${keyboardHeight}px` : '';
-    };
-    window.visualViewport.addEventListener('resize', syncKeyboardPadding);
-    input.addEventListener('focus', syncKeyboardPadding);
-    input.addEventListener('blur', syncKeyboardPadding);
-  }
+  // Search now uses the same bottom-sheet shell as the folder picker (.move-modal) —
+  // main.js's modalKeyboardPadding already handles the on-screen-keyboard problem
+  // generically for every .move-modal-content, so the search-specific version of that
+  // same fix (which fought the panel's own sizing directly, a more fragile approach
+  // that caused its own mobile rendering regressions) isn't needed here anymore.
 
   document.getElementById('searchBtn').addEventListener('click', openSearch);
-  document.getElementById('closeSearchBtn').addEventListener('click', closeSearch);
+  document.getElementById('searchPanelClose').addEventListener('click', closeSearch);
+  panel.addEventListener('click', (e) => {
+    if (e.target === panel) closeSearch(); // tap the dimmed area above the sheet, same as the folder picker
+  });
   document.getElementById('searchForm').addEventListener('submit', (e) => {
     e.preventDefault();
     startSearch('light');
@@ -179,6 +161,12 @@ async function renderTagFilter() {
 
 function openSearch() {
   panel.classList.remove('hidden');
+  // .move-modal-content is its own scroll container — closing it (just a hidden
+  // toggle, the element and its scroll position both persist) and reopening later
+  // landed wherever it was last scrolled to instead of back at the top, which read
+  // as "the search bar isn't at the top" / filters missing when they were really
+  // just further down, off the visible reopen position.
+  content.scrollTop = 0;
   chosenTags.clear();
   // default to "this folder" if search was opened while browsing one — almost always
   // what you mean by searching from there, with the all-folders toggle one tap away
@@ -215,6 +203,7 @@ function openSearch() {
 function closeSearch() {
   stopSearch();
   panel.classList.add('hidden');
+  input.blur(); // same fix as the folder picker's close — hiding the sheet doesn't dismiss its keyboard on its own
 }
 
 function stopSearch() {
@@ -409,7 +398,7 @@ function renderResults(mails) {
       if (!last) return;
       const overflow = last.getBoundingClientRect().bottom - window.visualViewport.height;
       if (overflow > 0) {
-        panel.scrollBy({ top: overflow + 16, behavior: 'smooth' });
+        content.scrollBy({ top: overflow + 16, behavior: 'smooth' });
       }
     });
   }

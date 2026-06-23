@@ -5,6 +5,8 @@ import { openMoveModalForMail } from './folders.js';
 
 let mailReaderPanel, mailReaderScroll, mailReaderBody, mailReaderHtml, mailReaderHtmlWrap, mailReaderLoading, mailReaderLoadingQuip, mailReaderSubject, mailReaderSender, mailReaderTime, mailReaderTags;
 let imagesBlockedBanner, showImagesBtn, trustSenderBtn, mailReaderAttachments;
+let spamNotice, spamNoticeReasons, notSpamBtn;
+let spamCheckScore, spamCheckAuth, spamCheckReasons;
 
 // Shown while a mail's body is loading — every single email open hits this, however
 // briefly, so it's worth being a bit more fun than a bare spinner.
@@ -32,8 +34,15 @@ let currentMail = null;
 // frame-ancestors) actively block it, leaving Chrome's blank error page sitting where
 // the email used to be. Sandbox needs allow-popups too, or this has nothing to open
 // into — see the sandbox attribute on the iframe itself.
+// This iframe's srcdoc is a completely separate document — none of the main
+// stylesheet's font rules (or anything else) reach in here. Without an explicit
+// font-family, an unstyled HTML body falls back to the browser's own default for
+// plain HTML, which is a serif font (Times on most engines) — every font swap this
+// session changed style.css, which this was never affected by either way, so HTML
+// mail bodies kept looking like a leftover custom serif font regardless.
 const RESPONSIVE_RESET = `<base target="_blank"><style>
-  html, body { max-width: 100%; overflow-x: hidden; word-wrap: break-word; }
+  html, body { max-width: 100%; overflow-x: hidden; word-wrap: break-word;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
   * { max-width: 100% !important; box-sizing: border-box !important; }
   img, table { height: auto !important; }
   table { table-layout: auto !important; }
@@ -65,9 +74,28 @@ export function setupMailReader() {
   imagesBlockedBanner = document.getElementById('imagesBlockedBanner');
   showImagesBtn = document.getElementById('showImagesBtn');
   trustSenderBtn = document.getElementById('trustSenderBtn');
+  spamNotice = document.getElementById('spamNotice');
+  spamNoticeReasons = document.getElementById('spamNoticeReasons');
+  notSpamBtn = document.getElementById('notSpamBtn');
+  spamCheckScore = document.getElementById('spamCheckScore');
+  spamCheckAuth = document.getElementById('spamCheckAuth');
+  spamCheckReasons = document.getElementById('spamCheckReasons');
+  notSpamBtn.addEventListener('click', async () => {
+    notSpamBtn.disabled = true;
+    try {
+      const tags = await getMailTags(currentMailId);
+      await setMailTags(currentMailId, tags.filter((t) => t.name !== 'Spam').map((t) => t.id));
+      spamNotice.classList.add('hidden');
+      await loadMailBody(currentMailId); // re-evaluates isSpam fresh — restores normal auto-load/caching
+    } catch {
+      // best-effort — worst case the tag stays and the user can retry
+    } finally {
+      notSpamBtn.disabled = false;
+    }
+  });
   showImagesBtn.addEventListener('click', () => {
     imagesBlockedBanner.classList.add('hidden');
-    renderMailHtml(lastHtml, 'proxy');
+    renderMailHtml(lastHtml, 'proxy', lastMailId);
   });
   trustSenderBtn.addEventListener('click', async () => {
     trustSenderBtn.disabled = true;
@@ -81,7 +109,7 @@ export function setupMailReader() {
       // best-effort — worst case images stay blocked and "Show images" still works this time
     }
     imagesBlockedBanner.classList.add('hidden');
-    renderMailHtml(lastHtml, 'proxy');
+    renderMailHtml(lastHtml, 'proxy', lastMailId);
   });
   document.getElementById('mailReaderTagsBtn').addEventListener('click', () => openTagSheet(currentMailId));
   document.getElementById('mailReaderBack').addEventListener('click', () => closeReaderPanel());
@@ -242,6 +270,13 @@ function showMailMeta(mail) {
   mailReaderHtmlWrap.classList.add('hidden');
   imagesBlockedBanner.classList.add('hidden');
   mailReaderAttachments.innerHTML = '';
+  // Cleared synchronously here, not just inside loadMailBody after its fetch resolves
+  // — otherwise the PREVIOUS mail's score/spam-notice stayed visible on screen for the
+  // entire round trip before the new mail's own data arrived.
+  spamNotice.classList.add('hidden');
+  spamCheckScore.textContent = '';
+  spamCheckAuth.innerHTML = '';
+  spamCheckReasons.innerHTML = '';
   mailReaderPanel.classList.remove('hidden');
   mailReaderScroll.scrollTop = 0; // don't carry over scroll position from whatever was open before
 }
@@ -405,28 +440,33 @@ const IMAGE_PROXY_CSP = `<meta http-equiv="Content-Security-Policy" content="img
 
 let lastHtml = '';
 let lastSenderEmail = '';
+let lastMailId = null;
 
 // Rewrites <img src="http(s)://..."> to route through this server's image proxy
-// instead of fetching the sender's URL directly from the reader's own device/IP.
-function proxyImageSrcs(html) {
+// instead of fetching the sender's URL directly from the reader's own device/IP. mid
+// (the mail's message ID) lets the proxy know whether this image belongs to a
+// spam-flagged mail, so a flagged-but-explicitly-viewed image still loads through the
+// proxy but never gets written into the persistent cache (imageproxy.go).
+function proxyImageSrcs(html, mid) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   doc.querySelectorAll('img[src]').forEach((img) => {
     const src = img.getAttribute('src');
     if (/^https?:\/\//i.test(src)) {
-      img.setAttribute('src', `/api/image-proxy?u=${encodeURIComponent(src)}`);
+      const proxyUrl = `/api/image-proxy?u=${encodeURIComponent(src)}${mid ? `&mid=${encodeURIComponent(mid)}` : ''}`;
+      img.setAttribute('src', proxyUrl);
     }
   });
   return '<!doctype html>' + doc.documentElement.outerHTML;
 }
 
-function renderMailHtml(html, mode) {
+function renderMailHtml(html, mode, mid) {
   mailReaderBody.classList.add('hidden');
   mailReaderHtmlWrap.classList.remove('hidden');
   mailReaderHtml.style.width = '';
   mailReaderHtml.style.transform = '';
   mailReaderHtml.onload = resizeMailReaderIframe;
   const csp = mode === 'proxy' ? IMAGE_PROXY_CSP : IMAGE_BLOCK_CSP;
-  const body = mode === 'proxy' ? proxyImageSrcs(html) : html;
+  const body = mode === 'proxy' ? proxyImageSrcs(html, mid) : html;
   mailReaderHtml.srcdoc = csp + RESPONSIVE_RESET + body;
 }
 
@@ -446,18 +486,63 @@ async function loadMailBody(id) {
   const data = await res.json();
   lastHtml = data.html || '';
   lastSenderEmail = data.senderEmail || '';
+  lastMailId = id;
+  spamNotice.classList.toggle('hidden', !data.isSpam);
+  if (data.isSpam) {
+    spamNoticeReasons.textContent = (data.spamReasons || []).length
+      ? `Flagged as spam: ${data.spamReasons.join(', ')}`
+      : 'Flagged as spam';
+  }
   if (data.html) {
     // sandbox="allow-same-origin" only (no allow-scripts) — embedded scripts still
     // can't execute, but the parent can read the iframe's own DOM to size it to its
     // content instead of trapping the email in its own internally-scrolling box.
-    const proxied = data.trustedSender || autoLoadImagesEnabled();
+    // Spam never auto-loads, regardless of the global setting or even a normally
+    // trusted sender — it always falls through to the "tap to load" prompt below.
+    const proxied = !data.isSpam && (data.trustedSender || autoLoadImagesEnabled());
     if (!proxied) imagesBlockedBanner.classList.remove('hidden');
-    renderMailHtml(data.html, proxied ? 'proxy' : 'block');
+    renderMailHtml(data.html, proxied ? 'proxy' : 'block', id);
   } else {
     mailReaderBody.classList.remove('hidden');
     mailReaderBody.textContent = data.text || '(no readable body)';
   }
   renderAttachments(id, data.attachments);
+  renderSpamCheckFooter(data);
+}
+
+// Always-present, read-only "what the spam engine thinks" readout — every email, not
+// just ones already flagged. Plain content populated alongside the rest of the body,
+// not a separate fetch/toggle (that's what caused the previous mail's result to
+// flash briefly before this one's own data arrived).
+function renderSpamCheckFooter(data) {
+  if (!data.spamChecked) {
+    // Opening a mail never scores it itself — only the new-mail sync path and an
+    // explicit Smart Spam scan do. Nothing stored yet just means neither has touched
+    // this mail, not an error.
+    spamCheckScore.textContent = 'Not yet scanned for spam — run a scan from the Smart Spam menu.';
+    spamCheckAuth.innerHTML = '';
+    spamCheckReasons.innerHTML = '';
+    return;
+  }
+  spamCheckScore.textContent = `Spam score: ${Math.round((data.spamScore || 0) * 100)}%`;
+  spamCheckAuth.innerHTML = '';
+  for (const [label, verdict] of [['SPF', data.spamSpf], ['DKIM', data.spamDkim], ['DMARC', data.spamDmarc]]) {
+    const span = document.createElement('span');
+    const v = verdict || 'none';
+    span.className = v === 'pass' ? 'pass' : v.includes('fail') ? 'fail' : '';
+    span.textContent = `${label}: ${v}`;
+    spamCheckAuth.appendChild(span);
+  }
+  spamCheckReasons.innerHTML = '';
+  if (data.spamReasons && data.spamReasons.length) {
+    for (const reason of data.spamReasons) {
+      const li = document.createElement('li');
+      li.textContent = reason;
+      spamCheckReasons.appendChild(li);
+    }
+  } else {
+    spamCheckReasons.innerHTML = '<li>No spam signals found.</li>';
+  }
 }
 
 function formatBytes(n) {

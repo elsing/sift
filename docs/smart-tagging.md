@@ -188,14 +188,28 @@ over a backlog tags everything *today*, regardless of how old the underlying mai
 measuring from the tag event meant a multi-day delay could never fire on backlog mail
 at all, since it was always "tagged just now" by the time anyone checked.
 
-**This is not a real timer.** There's no cron/background-job infrastructure in this
-app — only the IMAP IDLE event loop. `autoMoveTaggedMail` is called opportunistically
-from `syncAccount` (every IDLE wake, manual pull-to-refresh, account sync), from
-accepting a suggestion, and from manual tagging — plus on demand via "Move tagged mail
-now" in Smart Tagging settings, which shows exactly what it moved (sender, subject,
-tag, destination), not just a bare count. In practice that's frequent enough to feel
-timely, but the actual move happens "the next time something causes a sync for that
-account after the delay has elapsed," not at the exact moment the delay expires.
+**Mostly opportunistic, plus a real periodic backstop.** `autoMoveTaggedMail` is called
+opportunistically from `syncAccount` (every IDLE wake, manual pull-to-refresh, account
+sync), from accepting a suggestion, and from manual tagging — plus on demand via "Move
+tagged mail now" in Smart Tagging settings, which shows exactly what it moved (sender,
+subject, tag, destination), not just a bare count. That alone was frequent enough to
+feel timely for most tags, but left a real gap for an `instant_move` tag (e.g. spam
+detection's auto-created Spam tag, see `docs/spam-detection.md`) sitting in an otherwise-
+quiet mailbox with no sync activity to opportunistically piggyback on.
+
+`watchAutoMove` (`smarttags.go`) closes that gap: a genuine periodic ticker, every
+`AUTO_MOVE_CHECK_INTERVAL_MINUTES` (default 10 min, env-overridable for testing), firing
+once immediately on startup too, that runs `autoMoveTaggedMail` for every owner
+regardless of any sync activity. So the actual move now happens "the next time something
+causes a sync for that account, *or* within `AUTO_MOVE_CHECK_INTERVAL_MINUTES`, whichever
+comes first" — still not at the exact instant the delay expires, but bounded now instead
+of indefinite.
+
+`autoMoveTaggedMail` also publishes the `"mail"` SSE event itself (not left to each
+caller to remember) whenever it actually moves something — `watchAutoMove`'s background
+runs have no interactive action of their own to hang a client refresh off otherwise, and
+without this, mail that had already moved server-side kept showing in an already-open
+inbox view until the next unrelated refresh.
 
 Because it's called from so many uncoordinated places, `autoMoveTaggedMail` is guarded
 by `Store.autoMoveMu` so only one run executes at a time — two overlapping runs could
