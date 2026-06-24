@@ -714,6 +714,7 @@ const scanFolderLimit = 200
 type scanSummary struct {
 	Applied          int               `json:"applied"`
 	Suggested        int               `json:"suggested"`
+	AlreadyTagged    int               `json:"alreadyTagged"`
 	NewTagCandidates []newTagCandidate `json:"newTagCandidates"`
 }
 
@@ -865,9 +866,20 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			// mail sitting in a folder with a rule got logged as "applied" (correctly
 			// feeding future scoring density) but never genuinely tagged, which read as
 			// "the scan found it but didn't actually tag it."
-			s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, tagID)
-			s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil)
-			summary.Applied++
+			res, err := s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, tagID)
+			// Only log a fresh history row when the tag was actually new — re-running a
+			// scan over mail a previous scan (or a live folder-rule move) already tagged
+			// otherwise re-logged an identical "applied" row every single time, inflating
+			// that sender/tag's count and skewing senderRatio/domainRatio scoring. Same
+			// fix as applyFolderTagRule (tags.go) for the same underlying mistake.
+			if err == nil {
+				if n, err := res.RowsAffected(); err == nil && n > 0 {
+					s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil)
+					summary.Applied++
+				} else {
+					summary.AlreadyTagged++
+				}
+			}
 			continue
 		}
 		if m.SenderEmail == "" {
@@ -882,6 +894,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			// mail on every single scan. Multi-tag mail that could've picked up one
 			// more suggestion is the accepted tradeoff for not re-scoring everything
 			// that's already sorted.
+			summary.AlreadyTagged++
 			continue
 		}
 		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject); len(scored) > 0 {

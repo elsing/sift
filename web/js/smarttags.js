@@ -534,7 +534,7 @@ function renderScanSummary(summary, accountId) {
   scanResults.innerHTML = '';
   const stats = document.createElement('p');
   stats.className = 'smart-history-meta';
-  stats.textContent = `Applied ${summary.applied}, suggested ${summary.suggested}.`;
+  stats.textContent = `Applied ${summary.applied}, suggested ${summary.suggested}, already tagged ${summary.alreadyTagged || 0}.`;
   scanResults.appendChild(stats);
   if (!summary.newTagCandidates || summary.newTagCandidates.length === 0) return;
 

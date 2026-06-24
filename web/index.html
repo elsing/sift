@@ -151,10 +151,30 @@
       <button id="closeBackupTopBtn" type="button" class="icon-btn" title="Close">✕</button>
     </div>
     <p class="smart-history-meta">Everything needed to stand this app back up elsewhere: connected accounts, tags, spam settings, and folder assignments. The exported file contains your account passwords/tokens — set a password below to encrypt it, or leave blank to export as plain text.</p>
+    <p class="smart-history-meta">Importing merges into what's already here — it never deletes anything. A tag, folder rule, or setting that exists in both gets overwritten with the file's version; tagging/spam history only ever adds.</p>
+    <p class="smart-history-meta">Choose what's included — applies to both export and import:</p>
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="backupIncludeAccounts" checked>
+      <span>Accounts<small>Host/port/username and the IMAP password or OAuth token — what's exported is in plain text in the file unless you set a password below.</small></span>
+    </label>
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="backupIncludeTags" checked>
+      <span>Tags &amp; folder rules<small>Tag definitions, per-mail tags, folder→tag rules, trusted senders, sender blocks.</small></span>
+    </label>
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="backupIncludeHistory" checked>
+      <span>Tagging &amp; spam history<small>What Smart Tagging/Spam have learned, and past spam scores. Skipping this on import means it starts cold.</small></span>
+    </label>
+    <label class="settings-checkbox-row">
+      <input type="checkbox" id="backupIncludeSettings" checked>
+      <span>Settings &amp; personalisation<small>Auto-tag/spam mode, image cache retention, theme, palette, swipe actions.</small></span>
+    </label>
     <input id="backupPasswordInput" class="panel-text-input" type="password" placeholder="Backup password (optional)" autocomplete="new-password">
-    <button id="exportDataBtn" class="settings-row-btn">📤 Export backup</button>
-    <button id="importDataBtn" class="settings-row-btn">📥 Import backup</button>
-    <input id="importDataFile" type="file" accept="application/json" class="hidden">
+    <div class="backup-actions">
+      <button id="exportDataBtn" class="settings-row-btn">📤 Export backup</button>
+      <button id="importDataBtn" class="settings-row-btn">📥 Import backup</button>
+    </div>
+    <input id="importDataFile" type="file" accept="application/json" class="visually-hidden">
     <p id="dataTransferError" class="form-error"></p>
     <button id="closeBackupBtn" class="close-panel-btn">Close</button>
   </div>

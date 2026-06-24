@@ -5,6 +5,24 @@ recovery — not just tags. The implementation lives in `internal/api/datatransf
 behind its own "Backup" menu in Settings (deliberately not folded into Advanced, and
 deliberately not named after tags/spam specifically — it covers the whole account).
 
+## Choosing what's included
+
+Four checkboxes in the Backup panel — Accounts, Tags & folder rules, Tagging & spam
+history, Settings & personalisation — drive both directions with the same control
+surface: which categories an export queries/writes to the file, and which categories
+an import actually applies from a file. Same four categories either end, since "what
+gets exported" and "what gets overwritten on import" are the same question asked at
+the other end (`backupInclude`, `datatransfer.go`).
+
+Export sends the choice as `include` in the JSON request body (alongside
+`localPreferences`); import sends it as a comma-separated `X-Backup-Include` header
+(its body is the file itself, so it can't also carry a JSON field). Absent on either
+endpoint means "all four" — an older client, or a plain `curl` call, gets today's
+full-bundle behavior without needing to know this exists. All four unchecked sends the
+literal string `none` rather than an empty header value, since an empty value is
+indistinguishable from the header being absent at all (which would mean the opposite —
+include everything).
+
 ## What's in the bundle
 
 - **Connected accounts** — host/port/username, the IMAP password or OAuth refresh
@@ -68,6 +86,34 @@ back apart in Go (tokens are always lowercased, punctuation-stripped words —
 The reverse direction has its own trap: a `nil` Go `[]string` (the zero value when a
 mail had no subject tokens at all) binds as SQL `NULL`, not `'{}'` — and
 `subject_tokens` is `NOT NULL`. Import coerces `nil` to `[]string{}` before the insert.
+
+## Import is a merge, never a replace — what happens on a clash
+
+Nothing already in the database is ever deleted by an import. Per table:
+
+- **Accounts** — matched by email. An existing account only gets `expanded_folders`
+  updated; host/port/username/password/OAuth token are left exactly as they are
+  (re-entering working credentials for an already-connected account isn't the point —
+  picking up a *new* account that wasn't connected here yet is). A new account is only
+  added after a live IMAP login test passes.
+- **Tags** — matched by name. An existing tag's color/notify/instant-move are
+  overwritten with the backup's values. A new name creates a new tag.
+- **`message_tags`** (per-mail tag assignments), **`trusted_senders`**,
+  **`tag_sender_blocks`** — additive only (`ON CONFLICT DO NOTHING`). A mail keeps
+  every tag it already had; the backup's tags are added on top, never removed.
+- **`folder_tag_rules`** — matched by (account, folder). An existing rule for that
+  exact folder is overwritten with the backup's tag.
+- **Owner settings** (auto-tag mode, spam mode, auto-move delay, image cache
+  retention) — fully overwritten with the backup's values, all-or-nothing.
+- **`localPreferences`** (theme, palette, swipe actions, etc.) — each key present in
+  the backup overwrites that `localStorage` key; keys absent from the backup are left
+  untouched.
+- **`tag_history` / `spam_flags`** — see below; always additive, never matched against
+  existing rows at all.
+
+The Backup panel's import button confirms this in plain language before doing
+anything, since "overwrites on a name/folder clash, otherwise just adds" isn't
+something to find out after the fact.
 
 ## No de-duplication on `tag_history` / `spam_flags`
 

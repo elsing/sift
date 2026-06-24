@@ -533,7 +533,19 @@ func (s *Store) applyFolderTagRule(accountID, destFolder, messageID string) {
 	if err != nil {
 		return // no rule for this folder — the common case, not an error
 	}
-	s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", messageID, tagID)
+	res, err := s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", messageID, tagID)
+	if err != nil {
+		return
+	}
+	// The ON CONFLICT above makes this idempotent for the tag assignment itself, but
+	// recordTagHistory below isn't — it always inserts a fresh row. Something
+	// upstream (autoMoveTaggedMail re-selecting a message that never actually leaves
+	// the inbox) can call this repeatedly for mail that's already tagged; without this
+	// check each repeat logged an identical history row, quietly inflating that
+	// sender/tag's applied count and skewing senderRatio/domainRatio scoring.
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return
+	}
 
 	// Best-effort history logging — a lookup failure here shouldn't undo the move/tag
 	// that already happened, it just means this particular application doesn't feed

@@ -534,6 +534,10 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   width: 100%; padding: 10px 12px; font-size: 15px; margin-bottom: 16px;
   border: 1px solid var(--border); border-radius: 10px; background: var(--input-bg); color: var(--text);
 }
+/* confirmModal() (plain yes/no) hides this via classList — promptModal() shows it.
+   Without this rule the JS toggle was a no-op and every confirm dialog in the app
+   showed a pointless empty text box alongside its message. */
+.confirm-modal-input.hidden { display: none; }
 .confirm-modal-actions { display: flex; gap: 10px; }
 .confirm-modal-cancel, .confirm-modal-confirm {
   flex: 1; padding: 10px; border-radius: 12px; font-weight: 600; font-size: 14px;
@@ -920,6 +924,12 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 #addAccountForm input:focus, .panel-text-input:focus { border-color: var(--accent); outline: none; }
 .panel-text-input { display: block; width: 100%; margin-bottom: 10px; box-sizing: border-box; }
+.backup-actions { margin-top: 8px; }
+.backup-actions .settings-row-btn:first-child { margin-top: 0; }
+/* Genuinely never shown — a click-proxy target for the styled Import button, not a
+   toggled state like .hidden elsewhere, so it gets its own permanent rule rather than
+   relying on a generic class that doesn't otherwise exist in this stylesheet. */
+.visually-hidden { display: none; }
 #addAccountForm button[type="submit"] {
   background: var(--accent); color: #fff; border: none; border-radius: 999px;
   padding: 11px; font-size: 14px; font-weight: 700; margin-top: 4px;

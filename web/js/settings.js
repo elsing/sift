@@ -564,12 +564,31 @@ export function setupDataTransfer() {
     return password ? { 'X-Backup-Password': password } : {};
   };
 
+  // Same four checkboxes drive both directions — "what gets exported" and "what gets
+  // overwritten on import" are the same question asked at the other end, so one
+  // shared control surface instead of two separate sets the user has to keep in sync.
+  const INCLUDE_CHECKBOXES = {
+    accounts: 'backupIncludeAccounts',
+    tags: 'backupIncludeTags',
+    history: 'backupIncludeHistory',
+    settings: 'backupIncludeSettings',
+  };
+  const gatherInclude = () => {
+    const include = {};
+    for (const [key, id] of Object.entries(INCLUDE_CHECKBOXES)) {
+      include[key] = document.getElementById(id).checked;
+    }
+    return include;
+  };
+
   exportBtn.addEventListener('click', () =>
     withBusyButton(exportBtn, 'Exporting…', async () => {
+      errorEl.textContent = ''; // clear up front, not just on success — a retry that fails the same way otherwise never visibly resets
+      const include = gatherInclude();
       const res = await fetch('/api/backup/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...passwordHeaders() },
-        body: JSON.stringify({ localPreferences: gatherLocalPreferences() }),
+        body: JSON.stringify({ include, localPreferences: include.settings ? gatherLocalPreferences() : {} }),
       });
       if (!res.ok) {
         errorEl.textContent = 'Export failed.';
@@ -590,18 +609,34 @@ export function setupDataTransfer() {
     const file = fileInput.files[0];
     fileInput.value = '';
     if (!file) return;
+    // Import merges, it never deletes — existing tags/rules/history aren't removed
+    // just because the backup doesn't mention them. But a tag/folder-rule/setting
+    // that DOES exist in both gets overwritten with the backup's version, which is
+    // surprising enough (and not undoable from here) to confirm before it happens.
+    const ok = await confirmModal(
+      "Import this backup? Existing tags, folder rules, and settings that also exist in the file will be overwritten with the file's version. Nothing already here gets deleted, and tagging/spam history only ever adds."
+    );
+    if (!ok) return;
     await withBusyButton(importBtn, 'Importing…', async () => {
+      errorEl.textContent = ''; // clear up front, not just on success — a retry that fails the same way otherwise never visibly resets
+      // "none" when every box is unchecked, not an empty string — an empty header
+      // value is indistinguishable from the header being absent entirely, which the
+      // server treats as "no filter, include everything" (so older/plain callers
+      // still get full-bundle behavior). "none" matches no real category, so the
+      // server's include-flags all end up false, same as actually unchecking them.
+      const checked = Object.entries(gatherInclude()).filter(([, v]) => v).map(([k]) => k);
+      const include = checked.length ? checked.join(',') : 'none';
       const res = await fetch('/api/backup/import', {
         method: 'POST',
         body: await file.text(),
-        headers: { 'Content-Type': 'application/json', ...passwordHeaders() },
+        headers: { 'Content-Type': 'application/json', 'X-Backup-Include': include, ...passwordHeaders() },
       });
       if (!res.ok) {
         errorEl.textContent = await res.text() || 'Import failed — make sure this is a Sift backup file.';
         return;
       }
-      errorEl.textContent = '';
-      applyLocalPreferences((await res.json()).localPreferences);
+      const { localPreferences } = await res.json();
+      if (localPreferences) applyLocalPreferences(localPreferences);
       location.reload(); // theme/palette/swipe settings only take effect on the next render pass
     });
   });
