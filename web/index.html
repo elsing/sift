@@ -309,6 +309,10 @@
       <strong>Review</strong> queues a flagged mail as a suggestion below; <strong>Full-auto</strong> applies the Spam tag and moves it to Junk without waiting for you. Review is the safer default — a spam false positive burying real mail is worse than a missed suggestion.
     </p>
     <div id="spamModeOptions" class="theme-options"></div>
+    <h3 class="settings-subhead">Restore wrongly-flagged mail</h3>
+    <p class="smart-history-meta">Dismissing a suggestion or undoing a full-auto decision now also moves the mail back to your inbox if it's sitting in Junk — but anything you dismissed before that existed is still stuck there. One-off catch-up, not something you'd need to run more than once.</p>
+    <button id="restoreStrandedSpamBtn" class="settings-row-btn">Restore mail stuck in Junk from past dismissals</button>
+    <p id="restoreStrandedSpamStatus" class="smart-history-meta"></p>
     <h3 class="settings-subhead">Scan existing mail for spam</h3>
     <p class="smart-history-meta">Retroactively scores mail already sitting in your mailbox — useful for anything that arrived before this existed. Junk/Trash mail is used as training data instead of being re-scored.</p>
     <div id="spamScanScopeOptions" class="theme-options"></div>

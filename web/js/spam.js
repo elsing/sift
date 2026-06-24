@@ -360,6 +360,25 @@ export function setupSmartSpamPanel() {
     setupScan();
   });
 
+  const restoreBtn = document.getElementById('restoreStrandedSpamBtn');
+  const restoreStatus = document.getElementById('restoreStrandedSpamStatus');
+  restoreBtn.addEventListener('click', () =>
+    withBusyButton(restoreBtn, 'Restoring…', async () => {
+      errorEl.textContent = '';
+      restoreStatus.textContent = '';
+      try {
+        const res = await fetch('/api/spam/restore-stranded', { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text() || 'Restore failed.');
+        const { restored } = await res.json();
+        restoreStatus.textContent = restored > 0
+          ? `Restored ${restored} mail${restored === 1 ? '' : 's'} to the inbox.`
+          : 'Nothing to restore — no past dismissals are still stuck in Junk.';
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    })
+  );
+
   document.getElementById('cancelSpamScanBtn').addEventListener('click', () => {
     if (activeScanSource) {
       activeScanSource.close(); // also tears down the server side — handleScanSpam checks ctx.Err() between folders

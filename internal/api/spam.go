@@ -17,6 +17,53 @@ import (
 // existing sync pipeline; this just covers mail that arrived before spam detection did.
 func (s *Store) SpamRoutes(mux *http.ServeMux, ownerSubject func(*http.Request) string) {
 	mux.HandleFunc("GET /api/accounts/{id}/scan-spam", s.handleScanSpam)
+	mux.HandleFunc("POST /api/spam/restore-stranded", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRestoreStrandedSpam(w, r, ownerSubject(r))
+	})
+}
+
+// handleRestoreStrandedSpam is the one-off catch-up for restoreFromJunkIfSpamDeclined
+// (smarttags.go) — that fix only takes effect for a decision made *after* it shipped,
+// so anything dismissed/undone before then is still sitting wherever it was when the
+// user said "not spam". Finds every spam_engine decision marked dismissed whose mail
+// is currently still sitting in that account's detected Junk folder, and moves each
+// one back to INBOX for real over IMAP.
+func (s *Store) handleRestoreStrandedSpam(w http.ResponseWriter, r *http.Request, owner string) {
+	rows, err := s.db.Query(`
+		SELECT m.id, m.account_id
+		FROM tag_history th
+		JOIN mails m ON m.message_id = th.message_id
+		JOIN accounts a ON a.id = m.account_id
+		WHERE th.owner_subject = $1 AND th.source = 'spam_engine' AND th.status = 'dismissed'
+		  AND a.junk_folder IS NOT NULL AND m.folder = a.junk_folder`,
+		owner,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type candidate struct{ mailID, accountID string }
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if rows.Scan(&c.mailID, &c.accountID) == nil {
+			candidates = append(candidates, c)
+		}
+	}
+	rows.Close()
+
+	restored := 0
+	for _, c := range candidates {
+		if err := s.moveMailToFolder(c.mailID, "INBOX"); err != nil {
+			continue // best-effort — one mail that's moved/expunged server-side since shouldn't block the rest
+		}
+		s.db.Exec("DELETE FROM mails WHERE id = $1", c.mailID)
+		restored++
+	}
+	if restored > 0 {
+		s.broadcaster.publish("mail")
+	}
+	writeJSON(w, map[string]int{"restored": restored})
 }
 
 // authResultVerdict pulls e.g. "pass"/"fail"/"softfail"/"neutral" out of a raw

@@ -574,11 +574,11 @@ func (s *Store) handleAcceptTagHistory(w http.ResponseWriter, r *http.Request, o
 // teaches the scorer not to repeat it, not just a one-time fix.
 func (s *Store) handleUndoTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
 	id := r.PathValue("id")
-	var messageID, tagID string
+	var messageID, tagID, source string
 	if err := s.db.QueryRow(
-		"SELECT message_id, tag_id FROM tag_history WHERE id = $1 AND owner_subject = $2 AND status = 'applied'",
+		"SELECT message_id, tag_id, source FROM tag_history WHERE id = $1 AND owner_subject = $2 AND status = 'applied'",
 		id, owner,
-	).Scan(&messageID, &tagID); err != nil {
+	).Scan(&messageID, &tagID, &source); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -587,6 +587,7 @@ func (s *Store) handleUndoTagHistory(w http.ResponseWriter, r *http.Request, own
 		return
 	}
 	s.db.Exec("UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1", id)
+	s.restoreFromJunkIfSpamDeclined(messageID, source)
 	s.broadcaster.publish("mail")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -597,19 +598,48 @@ func (s *Store) handleUndoTagHistory(w http.ResponseWriter, r *http.Request, own
 // opt-in version of that.
 func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
 	id := r.PathValue("id")
-	res, err := s.db.Exec(
-		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1 AND owner_subject = $2 AND status = 'suggested'",
+	var messageID, source string
+	if err := s.db.QueryRow(
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1 AND owner_subject = $2 AND status = 'suggested' RETURNING message_id, source",
 		id, owner,
-	)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	).Scan(&messageID, &source); err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	s.restoreFromJunkIfSpamDeclined(messageID, source)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// restoreFromJunkIfSpamDeclined undoes the one real-world side effect a spam verdict
+// can have once the user has explicitly overridden it (dismissing a suggestion, or
+// undoing a full-auto apply — Spam has instant_move=true, so an applied decision
+// likely already moved the mail for real). Whatever actually put the mail in Junk
+// might not even have been Sift (a server-side filter on the mail host is common) —
+// but once the user has said "no, this isn't spam" within Sift, leaving it stranded
+// in Junk contradicts that verdict regardless of how it got there. Scoped to the
+// account's detected Junk folder specifically, and to spam_engine decisions only —
+// undoing a *tagging* decision doesn't imply "this belongs in the inbox" the way
+// declining a spam verdict does.
+func (s *Store) restoreFromJunkIfSpamDeclined(messageID, source string) {
+	if source != "spam_engine" || messageID == "" {
+		return
+	}
+	var mailID, accountID, folder string
+	if err := s.db.QueryRow(
+		"SELECT id, coalesce(account_id, ''), folder FROM mails WHERE message_id = $1 LIMIT 1", messageID,
+	).Scan(&mailID, &accountID, &folder); err != nil || accountID == "" {
+		return
+	}
+	_, _, junk, err := s.resolveFolders(accountID)
+	if err != nil || junk == "" || folder != junk {
+		return
+	}
+	if err := s.moveMailToFolder(mailID, "INBOX"); err != nil {
+		log.Printf("restore from junk %s: %v", messageID, err)
+		return
+	}
+	s.db.Exec("DELETE FROM mails WHERE id = $1", mailID) // matches handleMove's own cleanup after a successful move
+	s.broadcaster.publish("mail")
 }
 
 // handleBlockSenderTagHistory is the broader, explicit-opt-in sibling of dismiss: not
@@ -617,14 +647,15 @@ func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, 
 // Dismisses the suggestion too (a block implies the immediate one was also wrong).
 func (s *Store) handleBlockSenderTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
 	id := r.PathValue("id")
-	var tagID, senderEmail string
+	var tagID, senderEmail, messageID, source string
 	if err := s.db.QueryRow(
-		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1 AND owner_subject = $2 AND status = 'suggested' RETURNING tag_id, sender_email",
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1 AND owner_subject = $2 AND status = 'suggested' RETURNING tag_id, sender_email, message_id, source",
 		id, owner,
-	).Scan(&tagID, &senderEmail); err != nil {
+	).Scan(&tagID, &senderEmail, &messageID, &source); err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	s.restoreFromJunkIfSpamDeclined(messageID, source)
 	if senderEmail == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
