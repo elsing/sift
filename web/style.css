@@ -914,11 +914,12 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 
 #addAccountForm { display: flex; flex-direction: column; gap: 10px; }
 #addAccountForm.hidden { display: none; }
-#addAccountForm input {
+#addAccountForm input, .panel-text-input {
   background: var(--input-bg); border: 2px solid var(--border); border-radius: 12px;
   color: var(--text); padding: 10px 12px; font-size: 14px;
 }
-#addAccountForm input:focus { border-color: var(--accent); outline: none; }
+#addAccountForm input:focus, .panel-text-input:focus { border-color: var(--accent); outline: none; }
+.panel-text-input { display: block; width: 100%; margin-bottom: 10px; box-sizing: border-box; }
 #addAccountForm button[type="submit"] {
   background: var(--accent); color: #fff; border: none; border-radius: 999px;
   padding: 11px; font-size: 14px; font-weight: 700; margin-top: 4px;

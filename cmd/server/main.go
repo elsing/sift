@@ -77,6 +77,9 @@ func main() {
 	store.TagHistoryRoutes(protected, func(r *http.Request) string {
 		return auth.UserFromContext(r.Context()).Subject
 	})
+	store.DataTransferRoutes(protected, func(r *http.Request) string {
+		return auth.UserFromContext(r.Context()).Subject
+	})
 	// no-cache (not no-store) so the browser always revalidates via ETag/Last-Modified
 	// instead of serving a stale copy outright — this app gets redeployed often, and a
 	// PWA on a home screen is especially prone to caching static assets aggressively.

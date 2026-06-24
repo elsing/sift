@@ -522,3 +522,87 @@ export function setupDryRunToggle() {
     apply(on);
   });
 }
+
+// localStorage-only personalisation — never reaches the server otherwise, so a
+// backup has to gather and restore these itself alongside the server-side bundle.
+const BACKUP_LOCAL_KEYS = ['theme', 'palette', 'swipeLeft', 'swipeRight', 'funDeleteAnimation', 'autoLoadImages'];
+
+function gatherLocalPreferences() {
+  const prefs = {};
+  for (const key of BACKUP_LOCAL_KEYS) {
+    const value = localStorage.getItem(key);
+    if (value !== null) prefs[key] = value;
+  }
+  return prefs;
+}
+
+function applyLocalPreferences(prefs) {
+  for (const [key, value] of Object.entries(prefs || {})) {
+    if (BACKUP_LOCAL_KEYS.includes(key)) localStorage.setItem(key, value);
+  }
+}
+
+export function setupDataTransfer() {
+  document.getElementById('openBackupBtn').addEventListener('click', () => {
+    document.getElementById('settingsPanel').classList.add('hidden');
+    document.getElementById('backupPanel').classList.remove('hidden');
+  });
+  const closeBackupPanel = () => {
+    document.getElementById('backupPanel').classList.add('hidden');
+    document.getElementById('settingsPanel').classList.remove('hidden');
+  };
+  document.getElementById('closeBackupBtn').addEventListener('click', closeBackupPanel);
+  document.getElementById('closeBackupTopBtn').addEventListener('click', closeBackupPanel);
+
+  const exportBtn = document.getElementById('exportDataBtn');
+  const importBtn = document.getElementById('importDataBtn');
+  const fileInput = document.getElementById('importDataFile');
+  const errorEl = document.getElementById('dataTransferError');
+  const passwordInput = document.getElementById('backupPasswordInput');
+  const passwordHeaders = () => {
+    const password = passwordInput.value;
+    return password ? { 'X-Backup-Password': password } : {};
+  };
+
+  exportBtn.addEventListener('click', () =>
+    withBusyButton(exportBtn, 'Exporting…', async () => {
+      const res = await fetch('/api/backup/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...passwordHeaders() },
+        body: JSON.stringify({ localPreferences: gatherLocalPreferences() }),
+      });
+      if (!res.ok) {
+        errorEl.textContent = 'Export failed.';
+        return;
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sift-backup.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      errorEl.textContent = '';
+    })
+  );
+
+  importBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    fileInput.value = '';
+    if (!file) return;
+    await withBusyButton(importBtn, 'Importing…', async () => {
+      const res = await fetch('/api/backup/import', {
+        method: 'POST',
+        body: await file.text(),
+        headers: { 'Content-Type': 'application/json', ...passwordHeaders() },
+      });
+      if (!res.ok) {
+        errorEl.textContent = await res.text() || 'Import failed — make sure this is a Sift backup file.';
+        return;
+      }
+      errorEl.textContent = '';
+      applyLocalPreferences((await res.json()).localPreferences);
+      location.reload(); // theme/palette/swipe settings only take effect on the next render pass
+    });
+  });
+}

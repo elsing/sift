@@ -20,6 +20,12 @@ services:
       retries: 10
 
   app:
+    # `image:` lets a deployment skip building from source entirely (`docker compose
+    # pull && docker compose up -d`, after a release from .github/workflows/docker-
+    # publish.yml). `build: .` stays alongside it so local dev/`task up`/`task restart`
+    # (which pass `--build`) keep working exactly as before — compose builds and tags
+    # the result as `image:` rather than ignoring it.
+    image: ghcr.io/elsing/sift:${SIFT_IMAGE_TAG:-latest}
     build: .
     env_file: .env
     environment:

@@ -57,6 +57,7 @@ backend, Postgres, your own IMAP accounts, your own self-hosted login.
 - Self-hosted OIDC login (built against Authentik, any standard OIDC provider should work)
 - Dry-run mode for testing without actually mutating anything on the server
 - Light/dark theme, accent color picker
+- **Backup** — one-tap export/import of everything needed for a copy-paste deployment or disaster recovery: connected accounts, tags, folder assignments, smart-tagging's learned history, spam history, settings, and personalisation — not just tags. Optional passphrase encrypts the file (it contains plaintext account credentials by necessity); see [docs/backup.md](docs/backup.md)
 
 ## Quick start
 
@@ -72,6 +73,12 @@ task up                # docker compose up -d --build
 
 Open `http://<host>:8080`. On iOS/Android, "Add to Home Screen" for the full PWA experience
 (push notifications require this on iOS).
+
+Every push to `main` (and every `vX.Y.Z` tag) builds and publishes the image to
+`ghcr.io/elsing/sift` via `.github/workflows/docker-publish.yml`. To run from that
+instead of building locally: set `SIFT_IMAGE_TAG` in `.env` (defaults to `latest`),
+then `docker compose pull && docker compose up -d` — `task up`/`task restart` always
+build from source regardless.
 
 Other useful commands (see `Taskfile.yml`):
 
