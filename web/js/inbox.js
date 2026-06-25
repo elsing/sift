@@ -591,7 +591,14 @@ function buildDisplayItems(mailList) {
       .map((mail) => ({ type: 'mail', mail, date: mail.date }))
       .sort((a, b) => (a.date < b.date ? 1 : -1));
   }
-  if (currentGroup) return currentGroup.mails.map((mail) => ({ type: 'mail', mail, date: mail.date }));
+  // Missing this sort meant a stepped-into tag group showed its mails in whatever
+  // order they happened to get collected while grouping (mailList's own order at that
+  // moment) rather than newest-first, unlike the other two branches here.
+  if (currentGroup) {
+    return currentGroup.mails
+      .map((mail) => ({ type: 'mail', mail, date: mail.date }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+  }
 
   // A mail with several tags joins whichever of its own tags has the most mail
   // overall, not just whichever was applied first — tally every tag's total count

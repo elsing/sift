@@ -524,6 +524,7 @@ func (s *Store) handleImportData(w http.ResponseWriter, r *http.Request, owner s
 			if _, err := s.syncAccount(id); err != nil {
 				log.Printf("backup import %s: initial sync failed: %v", a.Email, err)
 			}
+			s.cleanupMockMail()
 			s.watchAccount(id)
 		}
 	}

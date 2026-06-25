@@ -335,11 +335,24 @@ func (s *Store) recordManualTagChange(messageID string, before []Tag, afterIDs [
 		afterSet[id] = true
 	}
 
+	// Best-effort lookup, not a hard requirement — "" just means the tagID == spamTagID
+	// check below never matches, same as if this account had never touched spam at all.
+	spamTagID, _ := s.getOrCreateSpamTag(ownerSubject)
+
 	addedAny := false
 	for _, tagID := range afterIDs {
 		if !beforeIDs[tagID] {
-			s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "manual", "applied", nil)
+			s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "manual", "applied", nil, nil)
 			addedAny = true
+			if tagID == spamTagID {
+				// Manually marking something Spam should move it to Junk the same way
+				// the spam engine's own auto-apply already does — ensureSpamFolderRule
+				// otherwise only ever runs from the scoring paths (prefetchMailImages,
+				// scanAccountForSpam), so a manual tag with no prior scan/live-score on
+				// this account had no folder rule yet for autoMoveTaggedMail (below) to
+				// actually use, and silently moved nothing.
+				s.ensureSpamFolderRule(accountID, tagID)
+			}
 		}
 	}
 	if addedAny {
@@ -353,14 +366,13 @@ func (s *Store) recordManualTagChange(messageID string, before []Tag, afterIDs [
 		if afterSet[tagID] {
 			continue
 		}
-		var hadSmartHistory bool
-		s.db.QueryRow(
-			"SELECT EXISTS(SELECT 1 FROM tag_history WHERE sender_email = $1 AND tag_id = $2 AND source IN ('smart_auto', 'smart_suggested', 'scan_inferred'))",
-			senderEmail, tagID,
-		).Scan(&hadSmartHistory)
-		if hadSmartHistory {
-			s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "manual", "dismissed", nil)
-		}
+		// Always recorded, not just when smart-tagging already had prior history for
+		// this sender+tag — a manual removal (including the misplaced-mail panel's
+		// "Remove tag", which goes through this same path) is an explicit verdict
+		// either way. Skipping the record here used to mean nothing ever told
+		// suppressedTags this exact message shouldn't get this tag again, so a later
+		// scan or sync was free to silently reapply the very tag just removed.
+		s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "manual", "dismissed", nil, nil)
 	}
 }
 
@@ -391,6 +403,15 @@ func (s *Store) handleListFolderTagRules(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, rules)
 }
 
+// handleSetFolderTagRule is handleSetTagDestination's folder-first sibling (the folder
+// banner's own "auto-tag" dropdown, rather than the Tag Manager) — same row, same
+// table, just reached from the other side. It used to skip the "clear this tag's other
+// folder first" step that handleSetTagDestination already does, which let a tag end up
+// pointed at two folders at once: autoMoveTaggedMail refuses to guess when that happens
+// (more than one destination is ambiguous, so it just silently moves nothing for that
+// tag), and the Tag Manager's "remove" action deletes a tag's destination by tag_id,
+// not by folder — so clearing what looked like "the second one" actually cleared both,
+// since from that action's own perspective a tag only ever has one destination to clear.
 func (s *Store) handleSetFolderTagRule(w http.ResponseWriter, r *http.Request) {
 	accountID := r.PathValue("id")
 	var req struct {
@@ -401,12 +422,28 @@ func (s *Store) handleSetFolderTagRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "folder and tagId are required", http.StatusBadRequest)
 		return
 	}
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		"DELETE FROM folder_tag_rules WHERE account_id = $1 AND tag_id = $2 AND folder != $3",
+		accountID, req.TagID, req.Folder,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec(`
 		INSERT INTO folder_tag_rules (account_id, folder, tag_id) VALUES ($1, $2, $3)
 		ON CONFLICT (account_id, folder) DO UPDATE SET tag_id = excluded.tag_id`,
 		accountID, req.Folder, req.TagID,
-	)
-	if err != nil {
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -560,7 +597,7 @@ func (s *Store) applyFolderTagRule(accountID, destFolder, messageID string) {
 	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&ownerSubject); err != nil {
 		return
 	}
-	s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "folder_rule", "applied", nil)
+	s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "folder_rule", "applied", nil, nil)
 }
 
 // filterByTags keeps only the mails tagged with at least one of tagIDs (an "any of"

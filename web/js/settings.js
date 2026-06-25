@@ -167,7 +167,7 @@ async function setupImageCacheSettings() {
     }
   });
 
-  backfillBtn.addEventListener('click', () => {
+  function runBackfill() {
     backfillBtn.disabled = true;
     progressWrap.classList.remove('hidden');
     progressFill.style.width = '0%';
@@ -190,18 +190,28 @@ async function setupImageCacheSettings() {
       renderStatus();
       finish();
     });
-    // EventSource fires the generic 'error' event both for a real failure and for the
-    // browser's own auto-retry attempts — by the time this runs the source is already
-    // closed either way (we just closed it ourselves on 'complete', or it died on its
-    // own), so there's nothing left worth distinguishing (same reasoning as the Smart
-    // Tagging scan's own SSE error handling).
+    // EventSource fires 'error' both for a real, final failure and for its own
+    // automatic reconnect attempts (the job runs server-side on its own lifetime now,
+    // independent of this one connection — see handleOwnerJobSSE's own comment,
+    // scanjobs.go). CONNECTING means the browser's about to retry on its own, which
+    // just needs waiting out, not treating as final.
     source.addEventListener('error', () => {
-      if (source.readyState === EventSource.CLOSED) {
-        progressText.textContent = "Didn't finish — try again.";
+      if (source.readyState === EventSource.CONNECTING) {
+        progressText.textContent = 'Reconnecting…';
+        return;
       }
+      progressText.textContent = "Didn't finish — try again.";
       finish();
     });
-  });
+  }
+
+  backfillBtn.addEventListener('click', runBackfill);
+
+  // Reattaches if a previous page load started this and reloaded/navigated away — the
+  // job keeps running server-side regardless.
+  fetch('/api/scan-jobs/running?kind=image-backfill').then((res) => {
+    if (res.status === 200) runBackfill();
+  }).catch(() => {});
 }
 
 function setupSwipeSide(containerId, storageKey, fallback) {

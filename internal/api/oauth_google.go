@@ -159,6 +159,7 @@ func (s *Store) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request
 		log.Printf("add google account %s: initial sync failed: %v", email, err)
 		s.db.Exec("UPDATE accounts SET last_sync_error = $1 WHERE id = $2", err.Error(), id)
 	}
+	s.cleanupMockMail()
 	s.watchAccount(id)
 	http.Redirect(w, r, "/", http.StatusFound)
 }

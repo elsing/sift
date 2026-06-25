@@ -47,6 +47,13 @@ const RESPONSIVE_RESET = `<base target="_blank"><style>
   img, table { height: auto !important; }
   table { table-layout: auto !important; }
   td, th { white-space: normal !important; }
+  /* Applied by markFailedImages (reader.js) once an image's load genuinely fails —
+     distinct from "blocked" (the tap-to-load banner case), which never gets this far
+     since the browser never attempts the request at all. Without this, a dead link
+     and a deliberately-blocked image looked identical: the same bare broken-icon
+     glyph, no way to tell "this isn't loading" from "this hasn't been asked to". */
+  img.sift-img-failed { min-width: 120px; min-height: 60px; border: 1px dashed #999;
+    background: #f4f4f4; color: #777; font-size: 12px; }
 </style>`;
 
 // One-shot hook for "where did opening this mail come from". Defaults to nothing extra
@@ -293,6 +300,12 @@ async function loadSuggestionChips() {
     return; // best-effort — no suggestions shown is a safe fallback, not an error to surface
   }
   if (id !== currentMailId) return; // the reader moved on to a different mail while this was in flight
+  // Removes any suggestion chips a previous call already appended, rather than
+  // trusting every caller to have cleared mailReaderTags first — two overlapping
+  // calls for the same still-open mail (e.g. a live "mail" event re-triggering a
+  // re-render while a slow fetch from the first call was still in flight) otherwise
+  // stacked a second identical set of chips on top of the first.
+  mailReaderTags.querySelector('.suggestion-chips')?.remove();
   const chips = renderSuggestionChips(suggestions, () => {
     if (id === currentMailId) {
       getMailTags(id).then((tags) => {
@@ -304,7 +317,10 @@ async function loadSuggestionChips() {
       });
     }
   });
-  if (chips) mailReaderTags.appendChild(chips);
+  if (chips) {
+    chips.classList.add('suggestion-chips');
+    mailReaderTags.appendChild(chips);
+  }
 }
 
 let tagSheetModal, tagSheetList, tagSheetError, tagNameInput;
@@ -436,7 +452,14 @@ function refreshReaderTags(tags) {
 // the visual result of "images loaded" while the sender only ever sees this server's
 // IP, not yours — so "allow images" now always means "proxy them", never raw passthrough.
 const IMAGE_BLOCK_CSP = `<meta http-equiv="Content-Security-Policy" content="img-src data: cid:;">`;
-const IMAGE_PROXY_CSP = `<meta http-equiv="Content-Security-Policy" content="img-src data: cid: 'self';">`;
+// 'self' here, instead of the page's actual origin, was unreliable in practice — this
+// iframe is srcdoc + sandbox="allow-same-origin", and CSP's 'self' keyword resolving
+// correctly inside a sandboxed srcdoc context is exactly the kind of niche combination
+// browsers disagree on (confirmed: every single proxied image request showing as
+// CSP-blocked in Firefox, despite the proxy itself working fine when hit directly).
+// Spelling out the real origin instead of the keyword can only ever match correctly —
+// it's exactly what 'self' is supposed to mean anyway, just without the ambiguity.
+const IMAGE_PROXY_CSP = `<meta http-equiv="Content-Security-Policy" content="img-src data: cid: ${location.origin};">`;
 
 let lastHtml = '';
 let lastSenderEmail = '';
@@ -529,7 +552,7 @@ function renderSpamCheckFooter(data) {
   for (const [label, verdict] of [['SPF', data.spamSpf], ['DKIM', data.spamDkim], ['DMARC', data.spamDmarc]]) {
     const span = document.createElement('span');
     const v = verdict || 'none';
-    span.className = v === 'pass' ? 'pass' : v.includes('fail') ? 'fail' : '';
+    span.className = v.startsWith('pass') ? 'pass' : v.includes('fail') ? 'fail' : '';
     span.textContent = `${label}: ${v}`;
     spamCheckAuth.appendChild(span);
   }
@@ -568,6 +591,24 @@ function renderAttachments(mailId, attachments) {
   }
 }
 
+// The iframe is sandboxed with no allow-scripts, so the email's own content can't run
+// an onerror handler to flag its own broken images — this does it from the parent
+// page instead, which allow-same-origin permits (same trick resizeMailReaderIframe
+// already relies on to read the iframe's DOM at all).
+function markFailedImages(doc) {
+  for (const img of doc.querySelectorAll('img')) {
+    const flagIfFailed = () => {
+      if (img.naturalWidth === 0 && img.naturalHeight === 0) {
+        img.classList.add('sift-img-failed');
+        img.alt = "Image didn't load";
+        img.title = "This image couldn't be loaded — the link may be dead, not a blocked image.";
+      }
+    };
+    if (img.complete) flagIfFailed();
+    else img.addEventListener('error', flagIfFailed);
+  }
+}
+
 let mailReaderResizeObserver = null;
 
 function resizeMailReaderIframe() {
@@ -578,6 +619,7 @@ function resizeMailReaderIframe() {
     return; // shouldn't happen with allow-same-origin, but fall back to internal scroll if it does
   }
   if (!doc || !doc.documentElement) return;
+  markFailedImages(doc);
   const root = doc.documentElement;
 
   // Measured once, while the iframe is still at the wrapper's (cramped, mobile) width —

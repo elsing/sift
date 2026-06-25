@@ -129,5 +129,34 @@ func main() {
 	store.StartWatching(ctx)
 
 	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(http.ListenAndServe(":8080", withRequestTiming(mux)))
+}
+
+// requestTimingWarnThreshold is how long a request has to take before it's worth a log
+// line on its own — a real example that prompted this: a bulk-accept reported as 7.5s
+// in the browser's own network panel, but every direct, server-side timing test (raw
+// SQL at full scale, a direct curl bypassing the tunnel) came back well under 200ms —
+// meaning there was no way to tell, after the fact, whether that 7.5s was really spent
+// in this server or somewhere in the network path in between. This logs the server's
+// own measured duration for every request so the next occurrence has a real answer
+// instead of a reconstruction.
+const requestTimingWarnThreshold = 500 * time.Millisecond
+
+func withRequestTiming(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		dur := time.Since(start)
+		if dur <= requestTimingWarnThreshold {
+			return
+		}
+		// SSE endpoints are long-lived by design (a scan can run for minutes) —
+		// logging every one of those as "slow" would just be noise on top of real
+		// signal. Checked by reading the Content-Type the handler already set, not by
+		// path — every job/scan endpoint shares this same response type.
+		if w.Header().Get("Content-Type") == "text/event-stream" {
+			return
+		}
+		log.Printf("slow request: %s %s took %s", r.Method, r.URL.Path, dur)
+	})
 }

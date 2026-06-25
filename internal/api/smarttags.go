@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 // Tunable thresholds for the smart-tagging scorer (Phase 2 reads these too — defined
@@ -26,8 +30,11 @@ const (
 // recordTagHistory is the single insert path for every tag decision — manual tagging,
 // folder rules, and smart-tagging (live, suggested, or scan-inferred) all funnel
 // through this so tag_history stays one consistent shape. score is nil for anything
-// that isn't a scored smart-tagging decision (manual, folder_rule).
-func (s *Store) recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, source, status string, score *float64) error {
+// that isn't a scored smart-tagging decision (manual, folder_rule). bodyTokens is nil
+// wherever no body was fetched for this decision (manual, folder_rule, the live
+// new-mail path) — only scan-time decisions that already fetched a body populate it,
+// which is also exactly what feeds rebuildWordProfiles later.
+func (s *Store) recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, source, status string, score *float64, bodyTokens []string) error {
 	domain := ""
 	if at := strings.LastIndex(senderEmail, "@"); at >= 0 {
 		domain = senderEmail[at+1:]
@@ -36,10 +43,14 @@ func (s *Store) recordTagHistory(ownerSubject, accountID, messageID, tagID, send
 	if accountID != "" {
 		accountIDArg = accountID
 	}
+	var bodyTokensArg any
+	if len(bodyTokens) > 0 {
+		bodyTokensArg = bodyTokens
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO tag_history (id, owner_subject, account_id, message_id, tag_id, sender_email, sender_domain, subject_tokens, source, status, score, resolved_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CASE WHEN $10 != 'suggested' THEN now() END)`,
-		randomID(), ownerSubject, accountIDArg, messageID, tagID, senderEmail, domain, tokenizeSubject(subject), source, status, score,
+		INSERT INTO tag_history (id, owner_subject, account_id, message_id, tag_id, sender_email, sender_domain, subject_tokens, body_tokens, source, status, score, resolved_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CASE WHEN $11 != 'suggested' THEN now() END)`,
+		randomID(), ownerSubject, accountIDArg, messageID, tagID, senderEmail, domain, tokenizeSubject(subject), bodyTokensArg, source, status, score,
 	)
 	if err != nil {
 		return err
@@ -70,20 +81,35 @@ var (
 	}
 )
 
-// tokenizeSubject lowercases, strips punctuation, and drops stopwords/short tokens —
-// just enough normalization for the subject-overlap signal to mean something, without
-// pulling in a real NLP dependency for what's ultimately a coarse heuristic.
-func tokenizeSubject(subject string) []string {
-	cleaned := subjectPunctuation.ReplaceAllString(strings.ToLower(subject), " ")
+// maxBodyTokensPerMail bounds how much of a long mail's body actually feeds a tag's
+// word profile — a profile only needs enough words to be a meaningful signature, not
+// every word in a 10,000-word newsletter.
+const maxBodyTokensPerMail = 300
+
+// tokenizeText is tokenizeSubject/tokenizeBody's shared core — lowercases, strips
+// punctuation, and drops stopwords/short tokens, just enough normalization for either
+// signal to mean something without pulling in a real NLP dependency. max caps the
+// token count (0 = unlimited); a subject is short enough not to need one.
+func tokenizeText(text string, max int) []string {
+	cleaned := subjectPunctuation.ReplaceAllString(strings.ToLower(text), " ")
 	var tokens []string
 	for _, tok := range strings.Fields(cleaned) {
 		if len(tok) < 3 || subjectStopwords[tok] {
 			continue
 		}
 		tokens = append(tokens, tok)
+		if max > 0 && len(tokens) >= max {
+			break
+		}
 	}
 	return tokens
 }
+
+func tokenizeSubject(subject string) []string { return tokenizeText(subject, 0) }
+
+// tokenizeBody feeds a tag's word profile (rebuildWordProfiles) — the body-text
+// counterpart to tokenizeSubject, which only ever feeds subjectRatio.
+func tokenizeBody(text string) []string { return tokenizeText(text, maxBodyTokensPerMail) }
 
 // tagScore is one candidate tag for a mail, with its computed confidence.
 type tagScore struct {
@@ -99,27 +125,91 @@ func ratio(applied, dismissed int) float64 {
 	return float64(applied) / (float64(applied) + float64(dismissed) + tagHistorySampleDamper)
 }
 
+// looksLikeRelayAddress catches a privacy mail-relay's generated alias address —
+// Apple's "Hide My Email", Firefox Relay, DuckDuckGo Email Protection, SimpleLogin,
+// Fastmail/Proton's masked addresses, and others all work the same way: every alias
+// gets its own synthetic, effectively-random local part, often with the real address's
+// "@"/"." spelled out inside it for routing (the literal shape that surfaced this:
+// "thedailyjames_at_m_jamessmithacademy_com_<random>@icloud.com"). Neither that address
+// nor its domain says anything real about the sender in that case — the domain isn't
+// even necessarily the sender's at all, it's the *relay's* (the receiving side's own
+// privacy feature, not anything the sender chose) — so this is a shape check on the
+// local part, deliberately not a list of known relay services/domains: a list only
+// ever covers relays already seen, where this generalizes to the next one too.
+func looksLikeRelayAddress(email string) bool {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return false
+	}
+	local := strings.ToLower(email[:at])
+	if strings.Contains(local, "_at_") || strings.Contains(local, "_dot_") {
+		return true
+	}
+	return len(local) > 32 // a real, human-chosen local part is essentially never this long; a generated alias routinely is
+}
+
 // senderRatio/domainRatio score a tag purely off how often it's been applied vs
 // dismissed for that exact sender/domain, pooled across every account the owner has
-// (owner_subject, not account_id — tags sit above individual IMAP accounts).
-func (s *Store) senderRatio(ownerSubject, senderEmail, tagID string) float64 {
-	return s.historyRatio("sender_email", ownerSubject, senderEmail, tagID)
-}
-
-func (s *Store) domainRatio(ownerSubject, senderDomain, tagID string) float64 {
-	if senderDomain == "" {
+// (owner_subject, not account_id — tags sit above individual IMAP accounts). Both
+// return 0 outright for a relay-generated address (looksLikeRelayAddress) — there's
+// nothing real to pool history against. senderRatio's own per-address history would
+// just be "this one never-reused alias, seen once"; domainRatio's domain-wide history
+// is exactly what let an unrelated relay alias's spam history leak onto this one (see
+// looksLikeRelayAddress's own comment for the real example that surfaced it).
+// excludeFolderRule, when true, leaves out tag_history rows whose source is
+// 'folder_rule' — a real example that surfaced why: the Spam tag's own folder rule
+// (Junk → Spam, ensureSpamFolderRule) applied Spam to a Morning Brew newsletter purely
+// because one copy of it once sat in Junk for unrelated reasons, with zero actual spam
+// judgment involved. That single artifact then reinforced *every future* Morning Brew
+// mail as "previously flagged spam" — a folder a message happens to sit in isn't a
+// verdict on whether it's spam, the way an actual accept/dismiss or scored auto-apply
+// is. Spam's own reinforcement signal (scoreSpam) sets this true; ordinary tag scoring
+// (scoreTagsForMail) leaves it false, since folder-filing is a perfectly legitimate
+// signal for what an ordinary tag means.
+func (s *Store) senderRatio(ownerSubject, senderEmail, tagID string, excludeFolderRule bool) float64 {
+	if looksLikeRelayAddress(senderEmail) {
 		return 0
 	}
-	return s.historyRatio("sender_domain", ownerSubject, senderDomain, tagID)
+	return s.historyRatio("sender_email", ownerSubject, senderEmail, tagID, excludeFolderRule)
 }
 
-func (s *Store) historyRatio(column, ownerSubject, value, tagID string) float64 {
+// sharedFreemailDomains are ordinary providers used by millions of unrelated senders —
+// a domain (as opposed to the exact address) having spam history there means almost
+// nothing, the same problem as looksLikeRelayAddress but for a normal-looking address
+// that just happens to sit on a huge shared domain (the everyday "someone else's
+// gmail.com" case, distinct from a relay alias's address being synthetic too).
+var sharedFreemailDomains = map[string]bool{
+	"gmail.com": true, "googlemail.com": true, "outlook.com": true, "hotmail.com": true,
+	"hotmail.co.uk": true, "live.com": true, "msn.com": true, "yahoo.com": true,
+	"yahoo.co.uk": true, "aol.com": true, "icloud.com": true, "me.com": true, "mac.com": true,
+	"protonmail.com": true, "proton.me": true, "gmx.com": true, "gmx.net": true,
+	"zoho.com": true, "mail.com": true, "yandex.com": true,
+}
+
+func (s *Store) domainRatio(ownerSubject, senderDomain, tagID string, excludeFolderRule bool) float64 {
+	if senderDomain == "" || sharedFreemailDomains[strings.ToLower(senderDomain)] {
+		return 0
+	}
+	return s.historyRatio("sender_domain", ownerSubject, senderDomain, tagID, excludeFolderRule)
+}
+
+func (s *Store) historyRatio(column, ownerSubject, value, tagID string, excludeFolderRule bool) float64 {
+	if value == "" {
+		// An empty sender/domain isn't "no history", it's "we don't actually know who
+		// this is" — usually a one-off bad envelope fetch (a flaky IMAP server
+		// returning no From for one message). Querying on "" pools this mail in with
+		// every other unrelated mail that's ever hit the same gap, which is its own
+		// real bug: a completely unrelated history surfacing on this mail, swinging
+		// its score around for reasons that have nothing to do with it.
+		return 0
+	}
+	query := "SELECT count(*) FILTER (WHERE status = 'applied'), count(*) FILTER (WHERE status = 'dismissed') " +
+		"FROM tag_history WHERE owner_subject = $1 AND " + column + " = $2 AND tag_id = $3"
+	if excludeFolderRule {
+		query += " AND source != 'folder_rule'"
+	}
 	var applied, dismissed int
-	s.db.QueryRow(
-		"SELECT count(*) FILTER (WHERE status = 'applied'), count(*) FILTER (WHERE status = 'dismissed') "+
-			"FROM tag_history WHERE owner_subject = $1 AND "+column+" = $2 AND tag_id = $3",
-		ownerSubject, value, tagID,
-	).Scan(&applied, &dismissed)
+	s.db.QueryRow(query, ownerSubject, value, tagID).Scan(&applied, &dismissed)
 	return ratio(applied, dismissed)
 }
 
@@ -179,6 +269,130 @@ func (s *Store) subjectRatio(ownerSubject string, tokens []string, tagID string)
 	return ratio(applied, dismissed)
 }
 
+// bodyProfileRatio scores how well a mail's own body tokens overlap with a tag's
+// precomputed word profile (rebuildWordProfiles) — sum of the profile's weights for
+// every distinct token the new mail actually contains, capped at 1. Unlike
+// subjectRatio, this is one row read against a single aggregate, not a pairwise scan
+// over every past mail — the whole point of building the profile ahead of time.
+func (s *Store) bodyProfileRatio(tokens []string, tagID string) float64 {
+	if len(tokens) == 0 || tagID == "" {
+		return 0
+	}
+	var raw []byte
+	if err := s.db.QueryRow("SELECT words FROM tag_word_profiles WHERE tag_id = $1", tagID).Scan(&raw); err != nil {
+		return 0
+	}
+	var weights map[string]float64
+	if json.Unmarshal(raw, &weights) != nil {
+		return 0
+	}
+	seen := map[string]bool{}
+	score := 0.0
+	for _, t := range tokens {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		score += weights[t]
+	}
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+// ownerWordProfileWeighting defaults to "plain" both when no owner_settings row exists
+// yet and on any lookup error.
+func (s *Store) ownerWordProfileWeighting(ownerSubject string) string {
+	var weighting string
+	if err := s.db.QueryRow("SELECT word_profile_weighting FROM owner_settings WHERE owner_subject = $1", ownerSubject).Scan(&weighting); err != nil {
+		return "plain"
+	}
+	return weighting
+}
+
+// rebuildWordProfiles rebuilds every one of this owner's tags' word→weight profiles
+// from scratch, from that tag's own applied tag_history.body_tokens. Called once at the
+// end of a scan (scanAccountForTags/scanAccountForSpam) — never from the live per-mail
+// path — matching the "this only needs to be done once, and rarely" design: a profile
+// is a periodically-rebuilt aggregate, not something recomputed on every scoring call.
+// Always rebuilds every tag with any applied+body_tokens history, not just whatever
+// this particular scan touched — 'distinctive' weighting needs every tag's word counts
+// at once (to know how many tags a word shows up in at all), so there's no cheaper
+// "just the touched subset" version of this query anyway.
+func (s *Store) rebuildWordProfiles(ownerSubject string) {
+	weighting := s.ownerWordProfileWeighting(ownerSubject)
+
+	rows, err := s.db.Query(
+		"SELECT tag_id, body_tokens FROM tag_history WHERE owner_subject = $1 AND status = 'applied' AND body_tokens IS NOT NULL",
+		ownerSubject,
+	)
+	if err != nil {
+		return
+	}
+	counts := map[string]map[string]int{} // tag_id -> word -> count
+	for rows.Next() {
+		var tagID string
+		var tokens []string
+		if rows.Scan(&tagID, &tokens) != nil {
+			continue
+		}
+		words, ok := counts[tagID]
+		if !ok {
+			words = map[string]int{}
+			counts[tagID] = words
+		}
+		for _, t := range tokens {
+			words[t]++
+		}
+	}
+	rows.Close()
+	if len(counts) == 0 {
+		return
+	}
+
+	// Document frequency per word across tags — only meaningful for 'distinctive'
+	// weighting (a word common to every tag is a weak discriminator for any of them);
+	// skipped entirely for 'plain', which never reads it.
+	docFreq := map[string]int{}
+	if weighting == "distinctive" {
+		for _, words := range counts {
+			for w := range words {
+				docFreq[w]++
+			}
+		}
+	}
+	totalTags := float64(len(counts))
+
+	for tagID, words := range counts {
+		total := 0
+		for _, c := range words {
+			total += c
+		}
+		if total == 0 {
+			continue
+		}
+		weights := make(map[string]float64, len(words))
+		for w, c := range words {
+			weight := float64(c) / float64(total) // this tag's own term frequency
+			if weighting == "distinctive" {
+				// +1 inside the log so a word present in every tag still gets a small
+				// non-zero weight rather than dropping to exactly 0.
+				weight *= math.Log(totalTags/float64(docFreq[w]) + 1)
+			}
+			weights[w] = weight
+		}
+		b, err := json.Marshal(weights)
+		if err != nil {
+			continue
+		}
+		s.db.Exec(
+			"INSERT INTO tag_word_profiles (tag_id, words, built_at) VALUES ($1, $2, now()) ON CONFLICT (tag_id) DO UPDATE SET words = excluded.words, built_at = excluded.built_at",
+			tagID, b,
+		)
+	}
+}
+
 // suppressedTags returns tag IDs that shouldn't be re-suggested for this exact mail —
 // dismissing is purely "this tag is wrong for this email", not a verdict on the sender
 // (broader, sender-wide suppression turned out to silence legitimate matches too
@@ -228,8 +442,10 @@ func (s *Store) blockedSenderTags(ownerSubject, senderEmail string) map[string]b
 }
 
 // scoreTagsForMail returns every tag scoring >= suggestScore for this sender/subject,
-// sorted descending, capped at maxSuggestionsPerMail.
-func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject string) []tagScore {
+// sorted descending, capped at maxSuggestionsPerMail. bodyTokens is nil from any caller
+// that hasn't fetched this mail's body (the live new-mail path, today) — bodyProfileRatio
+// just contributes 0 in that case, same as a tag with no profile built yet.
+func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject string, bodyTokens []string) []tagScore {
 	if senderEmail == "" {
 		return nil
 	}
@@ -269,18 +485,44 @@ func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject s
 	suppressed := s.suppressedTags(ownerSubject, messageID)
 	blocked := s.blockedSenderTags(ownerSubject, senderEmail)
 	tokens := tokenizeSubject(subject)
+	// A relay alias's domain isn't necessarily on sharedFreemailDomains (any relay
+	// service with its own dedicated domain wouldn't be) — checking the address shape
+	// once here, rather than leaving domainRatio to rely solely on its own fixed list,
+	// is what actually generalizes to a relay service that list doesn't know about.
+	relayLike := looksLikeRelayAddress(senderEmail)
 
 	var results []tagScore
 	for _, tagID := range tagIDs {
 		if suppressed[tagID] || blocked[tagID] {
 			continue
 		}
-		senderScore := s.senderRatio(ownerSubject, senderEmail, tagID)
+		senderScore := s.senderRatio(ownerSubject, senderEmail, tagID, false)
 		score := 0.6 * senderScore
 		if score < autoApplyScore {
 			// Cheap path: sender alone already clears the bar, no need for the more
-			// expensive domain/subject queries.
-			score = 0.6*senderScore + 0.25*s.domainRatio(ownerSubject, domain, tagID) + 0.15*s.subjectRatio(ownerSubject, tokens, tagID)
+			// expensive domain/subject/body queries.
+			domainScore := 0.0
+			if !relayLike {
+				domainScore = s.domainRatio(ownerSubject, domain, tagID, false)
+			}
+			subjectScore := s.subjectRatio(ownerSubject, tokens, tagID)
+			if len(bodyTokens) > 0 {
+				score = 0.5*senderScore + 0.2*domainScore + 0.1*subjectScore + 0.2*s.bodyProfileRatio(bodyTokens, tagID)
+			} else {
+				// No body available — the live new-mail path (evaluateNewMailForSmartTags)
+				// never fetches one, by design, so this runs before notifyNewMail decides
+				// whether to push. Scoring this exactly as weak as the body-aware case
+				// above, just with the body term zeroed out, would silently make this
+				// path strictly weaker than it used to be — a sender/domain match
+				// confident enough to auto-apply before body scoring existed could now
+				// fall just short here, only to clear the bar moments later once the
+				// slower body-aware re-evaluation (prefetchMailImages) runs — by which
+				// point a notification for a tag marked "no notify" had already gone
+				// out, with no way to recall it. Same weights as before body scoring
+				// existed, so this path's own strength doesn't regress just because a
+				// signal it can't use got added elsewhere.
+				score = 0.6*senderScore + 0.25*domainScore + 0.15*subjectScore
+			}
 		}
 		if score >= suggestScore {
 			results = append(results, tagScore{TagID: tagID, Score: score})
@@ -323,35 +565,60 @@ func (s *Store) existingTagIDs(messageID string) map[string]bool {
 	return existing
 }
 
+// evaluateOneMailForSmartTags scores a single mail and, per the owner's auto_tag_mode,
+// either auto-applies a confident match or queues it for review — the per-mail body of
+// evaluateNewMailForSmartTags, factored out so prefetchMailImages (imageproxy.go) can
+// run this same scoring again once it has a body in hand. bodyTokens is nil from the
+// fast, body-less sync-time pass; the existing/alreadySuggested guards below mean
+// running this twice for the same mail never double-logs anything — a second pass with
+// a body just gives bodyProfileRatio something to actually contribute.
+func (s *Store) evaluateOneMailForSmartTags(ownerSubject, accountID, mode string, m Mail, bodyTokens []string) {
+	if m.MessageID == "" || m.SenderEmail == "" {
+		return
+	}
+	existing := s.existingTagIDs(m.MessageID)
+	for _, c := range s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens) {
+		if existing[c.TagID] {
+			continue // already has this tag — nothing to suggest or apply
+		}
+		score := c.Score
+		if mode == "full_auto" && score >= autoApplyScore {
+			s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
+			s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "smart_auto", "applied", &score, bodyTokens)
+			continue
+		}
+		// A mail that gets a fresh UID without genuinely being new (moved by auto-move,
+		// a folder rule, or anything else outside this sync) can reach this path more
+		// than once for the same underlying message — skip if a suggestion for this
+		// exact (message, tag) is already pending rather than stacking another.
+		var alreadySuggested bool
+		s.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'suggested')",
+			m.MessageID, c.TagID,
+		).Scan(&alreadySuggested)
+		if alreadySuggested {
+			continue
+		}
+		s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "smart_suggested", "suggested", &score, bodyTokens)
+	}
+}
+
 // evaluateNewMailForSmartTags scores each newly-synced mail and, per the owner's
 // auto_tag_mode, either auto-applies a confident match (full_auto only, score >=
 // autoApplyScore) or queues it for review. Best-effort throughout: a failure scoring
 // or logging one mail doesn't fail the sync that's waiting on this, and never has —
-// every call here is fire-and-forget by design.
+// every call here is fire-and-forget by design. Runs with no body (syncAccount only
+// hands over envelope/flags) — prefetchMailImages' own background pass (imageproxy.go)
+// re-evaluates each of these mails again once it has fetched a body, so the heatmap
+// signal isn't lost, just delayed by however long that background fetch takes.
 func (s *Store) evaluateNewMailForSmartTags(accountID string, mails []Mail) {
 	var ownerSubject string
 	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&ownerSubject); err != nil {
 		return
 	}
 	mode := s.ownerAutoTagMode(ownerSubject)
-
 	for _, m := range mails {
-		if m.MessageID == "" || m.SenderEmail == "" {
-			continue
-		}
-		existing := s.existingTagIDs(m.MessageID)
-		for _, c := range s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject) {
-			if existing[c.TagID] {
-				continue // already has this tag — nothing to suggest or apply
-			}
-			score := c.Score
-			if mode == "full_auto" && score >= autoApplyScore {
-				s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
-				s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "smart_auto", "applied", &score)
-			} else {
-				s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "smart_suggested", "suggested", &score)
-			}
-		}
+		s.evaluateOneMailForSmartTags(ownerSubject, accountID, mode, m, nil)
 	}
 }
 
@@ -364,15 +631,46 @@ func (s *Store) TagHistoryRoutes(mux *http.ServeMux, ownerSubject func(*http.Req
 	mux.HandleFunc("GET /api/misplaced-mail", func(w http.ResponseWriter, r *http.Request) {
 		s.handleListMisplacedMail(w, r, ownerSubject(r))
 	})
+	// Job-backed (handleOwnerJobSSE, scanjobs.go) — "Move all" used to be one IMAP
+	// move request per mail from the client (Promise.all over the whole list); each
+	// move is real, possibly-slow IMAP work, easily enough at once to need
+	// persistence and progress rather than a client-side fan-out.
+	mux.HandleFunc("GET /api/misplaced-mail/move-all", func(w http.ResponseWriter, r *http.Request) {
+		s.handleMoveAllMisplacedMail(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("POST /api/misplaced-mail/move-all/cancel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelOwnerJob(w, r, ownerSubject(r), "move-misplaced-mail")
+	})
 	mux.HandleFunc("POST /api/tag-history/{id}/accept", func(w http.ResponseWriter, r *http.Request) {
 		s.handleAcceptTagHistory(w, r, ownerSubject(r))
 	})
 	mux.HandleFunc("POST /api/tag-history/{id}/dismiss", func(w http.ResponseWriter, r *http.Request) {
 		s.handleDismissTagHistory(w, r, ownerSubject(r))
 	})
+	// Not a verdict either way, just "stop showing me this" — unlike dismiss, doesn't
+	// feed suppressedTags (so it can resurface on a future scan/sync) and doesn't touch
+	// Junk restoration.
+	mux.HandleFunc("POST /api/tag-history/{id}/clear", func(w http.ResponseWriter, r *http.Request) {
+		s.handleClearTagHistory(w, r, ownerSubject(r))
+	})
+	// Bulk counterparts of accept/dismiss/clear above — "Accept all"/"Dismiss
+	// all"/"Clear list" used to be one HTTP request per suggestion; see
+	// bulkTagHistoryIDs' own comment.
+	mux.HandleFunc("POST /api/tag-history/bulk-accept", func(w http.ResponseWriter, r *http.Request) {
+		s.handleBulkAcceptTagHistory(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("POST /api/tag-history/bulk-dismiss", func(w http.ResponseWriter, r *http.Request) {
+		s.handleBulkDismissTagHistory(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("POST /api/tag-history/bulk-clear", func(w http.ResponseWriter, r *http.Request) {
+		s.handleBulkClearTagHistory(w, r, ownerSubject(r))
+	})
 	// The undo half of full-auto mode — see Auto-tag activity in settings.
 	mux.HandleFunc("POST /api/tag-history/{id}/undo", func(w http.ResponseWriter, r *http.Request) {
 		s.handleUndoTagHistory(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("POST /api/tag-history/bulk-undo", func(w http.ResponseWriter, r *http.Request) {
+		s.handleBulkUndoTagHistory(w, r, ownerSubject(r))
 	})
 	// Separate from plain dismiss — the user's explicit choice to also stop this tag
 	// being suggested for this sender at all, not something dismiss implies on its own.
@@ -387,9 +685,25 @@ func (s *Store) TagHistoryRoutes(mux *http.ServeMux, ownerSubject func(*http.Req
 	})
 	// GET, not POST — EventSource (used client-side for the SSE progress stream) can
 	// only ever issue GET requests, same constraint /api/search already works under.
-	mux.HandleFunc("GET /api/accounts/{id}/scan-tags", s.handleScanTags)
+	mux.HandleFunc("GET /api/accounts/{id}/scan-tags", func(w http.ResponseWriter, r *http.Request) {
+		s.handleScanTags(w, r, ownerSubject(r))
+	})
+	// The scan itself now runs on a server-lifetime context (scanjobs.go), not this
+	// request's — closing the SSE connection no longer stops it, so cancelling needs
+	// its own explicit action.
+	mux.HandleFunc("POST /api/accounts/{id}/scan-tags/cancel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelScanJob(w, r, ownerSubject(r), "tags")
+	})
+	// What a panel reopening after a reload uses to find a still-running scan without
+	// already knowing which account it was started against.
+	mux.HandleFunc("GET /api/scan-jobs/running", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRunningScanJob(w, r, ownerSubject(r))
+	})
 	// GET, not POST — same EventSource constraint as scan-tags above.
 	mux.HandleFunc("GET /api/accounts/{id}/folders/apply-tag", s.handleApplyTagToFolder)
+	mux.HandleFunc("POST /api/accounts/{id}/folders/apply-tag/cancel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelScanJob(w, r, ownerSubject(r), "apply-tag-folder")
+	})
 	mux.HandleFunc("POST /api/auto-move/run", func(w http.ResponseWriter, r *http.Request) {
 		s.handleRunAutoMove(w, r, ownerSubject(r))
 	})
@@ -432,12 +746,11 @@ type MisplacedMail struct {
 // ago isn't "misplaced" yet, it just hasn't had a chance to be moved). Purely DB-side
 // against whatever's currently cached (no fresh IMAP listing) — same cache the scan
 // and regular sync already populate, so coverage improves the more those run.
-func (s *Store) handleListMisplacedMail(w http.ResponseWriter, r *http.Request, owner string) {
-	// No age delay here, deliberately — that's specific to autoMoveTaggedMail's "give
-	// inbox mail a grace period before whisking it away" rationale, which doesn't
-	// apply to mail that's already filed somewhere else. A mail sitting in the wrong
-	// non-inbox folder is just wrong, regardless of how recently it was tagged —
-	// there's no equivalent reason to wait.
+// misplacedMail is the query both handleListMisplacedMail (the review list) and
+// moveMisplacedMail (the "Move all" job) share — see handleListMisplacedMail's own
+// comment for why INBOX/Sent are excluded and why a tag needs exactly one folder rule
+// to qualify.
+func (s *Store) misplacedMail(owner string) ([]MisplacedMail, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, m.sender, m.subject, m.folder, dest.folder, t.id, t.name, t.color
 		FROM mails m
@@ -448,14 +761,14 @@ func (s *Store) handleListMisplacedMail(w http.ResponseWriter, r *http.Request, 
 		WHERE a.owner_subject = $1
 		  AND m.folder != dest.folder
 		  AND m.folder != 'INBOX'
+		  AND m.folder NOT ILIKE '%sent%'
 		  AND (SELECT count(*) FROM folder_tag_rules f2 WHERE f2.tag_id = t.id AND f2.account_id = m.account_id) = 1
 		ORDER BY m.sent_at DESC
 		LIMIT 200`,
 		owner,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -463,12 +776,54 @@ func (s *Store) handleListMisplacedMail(w http.ResponseWriter, r *http.Request, 
 	for rows.Next() {
 		var m MisplacedMail
 		if err := rows.Scan(&m.MailID, &m.Sender, &m.Subject, &m.CurrentFolder, &m.DestinationFolder, &m.TagID, &m.TagName, &m.TagColor); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		misplaced = append(misplaced, m)
 	}
+	return misplaced, nil
+}
+
+func (s *Store) handleListMisplacedMail(w http.ResponseWriter, r *http.Request, owner string) {
+	// No age delay here, deliberately — that's specific to autoMoveTaggedMail's "give
+	// inbox mail a grace period before whisking it away" rationale, which doesn't
+	// apply to mail that's already filed somewhere else. A mail sitting in the wrong
+	// non-inbox folder is just wrong, regardless of how recently it was tagged —
+	// there's no equivalent reason to wait.
+	misplaced, err := s.misplacedMail(owner)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, misplaced)
+}
+
+func (s *Store) handleMoveAllMisplacedMail(w http.ResponseWriter, r *http.Request, owner string) {
+	s.handleOwnerJobSSE(w, r, owner, "move-misplaced-mail", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
+		return s.moveAllMisplacedMail(ctx, owner, onProgress)
+	})
+}
+
+func (s *Store) moveAllMisplacedMail(ctx context.Context, owner string, onProgress func(done, total int)) (any, error) {
+	misplaced, err := s.misplacedMail(owner)
+	if err != nil {
+		return nil, err
+	}
+	moved := 0
+	for i, m := range misplaced {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := s.moveMailToFolder(m.MailID, m.DestinationFolder); err == nil {
+			moved++
+		}
+		if onProgress != nil {
+			onProgress(i+1, len(misplaced))
+		}
+	}
+	if moved > 0 {
+		s.broadcaster.publish("mail")
+	}
+	return map[string]int{"moved": moved}, nil
 }
 
 // handleListTagHistory serves both the pending-suggestions list (status=suggested,
@@ -481,10 +836,20 @@ func (s *Store) handleListTagHistory(w http.ResponseWriter, r *http.Request, own
 	// The client only ever knows a mail's ephemeral cache id, not its stable
 	// Message-ID — resolve the same way handleGetMailTags does, rather than exposing
 	// MessageID (deliberately hidden, json:"-") just for this one lookup.
+	mailID := r.URL.Query().Get("mailId")
 	messageID := ""
-	if mailID := r.URL.Query().Get("mailId"); mailID != "" {
+	if mailID != "" {
 		if resolved, err := s.resolveMessageID(mailID); err == nil {
 			messageID = resolved
+		} else {
+			// A mailId was explicitly asked for but doesn't resolve to a real Message-ID
+			// (mock/demo mail, most often) — that mail can have no history, full stop.
+			// Falling through with the filter silently dropped instead returned every
+			// pending suggestion in the whole mailbox, misattributed to this one mail —
+			// which is exactly what made a single demo email look like it had 100+
+			// duplicated spam suggestions on it.
+			writeJSON(w, []TagHistoryEntry{})
+			return
 		}
 	}
 
@@ -510,10 +875,21 @@ func (s *Store) handleListTagHistory(w http.ResponseWriter, r *http.Request, own
 		args = append(args, source)
 		query += fmt.Sprintf(" AND th.source = $%d", len(args))
 	}
+	// Mail date, not when the row was logged — a scan logs every decision in whatever
+	// order it happened to walk folders/messages in, which read as "not sorted by date"
+	// when that order doesn't line up with the mail's own sent date. Falls back to
+	// th.created_at for anything no longer cached in mails (an old/evicted mail still
+	// needs some deterministic order).
+	orderBy := " ORDER BY coalesce((SELECT sent_at FROM mails WHERE message_id = th.message_id LIMIT 1), th.created_at) DESC"
 	if status == "suggested" {
 		query += " AND th.created_at > now() - interval '30 days'"
+		// No LIMIT here — the 30-day window above is the only cap. A flat LIMIT 200 used
+		// to silently cut off whole senders' worth of suggestions once a scan produced
+		// more pending rows than that, before the client ever got a chance to group them.
+		query += orderBy
+	} else {
+		query += orderBy + " LIMIT 500"
 	}
-	query += " ORDER BY th.created_at DESC LIMIT 200"
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -557,7 +933,11 @@ func (s *Store) handleAcceptTagHistory(w http.ResponseWriter, r *http.Request, o
 	// that's sat unaccepted for longer than the delay already qualifies and moves
 	// right now, but one accepted the same day it was suggested is still "younger
 	// than N days" by autoMoveTaggedMail's own check and stays put until it isn't.
-	s.autoMoveTaggedMail(owner)
+	// Backgrounded: this can mean a real IMAP move (instant_move tags, e.g. Spam, skip
+	// the delay entirely), which made every single accept visibly hang on the actual
+	// network round trip — the tag itself is already applied above by this point, so
+	// the response doesn't need to wait for the move too.
+	go s.autoMoveTaggedMail(owner)
 	// Without this, the tag chip (and any grouping it forms) didn't show up in the
 	// inbox until something else happened to trigger a refresh — accepting looked
 	// like it silently did nothing client-side even though the tag really had been
@@ -587,7 +967,73 @@ func (s *Store) handleUndoTagHistory(w http.ResponseWriter, r *http.Request, own
 		return
 	}
 	s.db.Exec("UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = $1", id)
-	s.restoreFromJunkIfSpamDeclined(messageID, source)
+	// Backgrounded — its slow path is a live IMAP search across every account on a
+	// cache miss, which made undo visibly hang on the network round trip even though
+	// the dismiss itself (above) had already gone through. No publish needed from this
+	// call specifically — the unconditional one below already covers refreshing for the
+	// undo itself, regardless of whether this restore finds anything to do.
+	go s.restoreFromJunkIfSpamDeclined(owner, messageID, source)
+	s.broadcaster.publish("mail")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBulkUndoTagHistory is "Undo all" (Auto-tag activity) — see bulkTagHistoryIDs'
+// own comment on why this exists at all (one request instead of one per row).
+func (s *Store) handleBulkUndoTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	ids, ok := bulkTagHistoryIDs(r)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	rows, err := s.db.Query(
+		"SELECT message_id, tag_id, source FROM tag_history WHERE id = ANY($1) AND owner_subject = $2 AND status = 'applied'",
+		ids, owner,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type triple struct{ messageID, tagID, source string }
+	var triples []triple
+	for rows.Next() {
+		var t triple
+		if rows.Scan(&t.messageID, &t.tagID, &t.source) == nil {
+			triples = append(triples, t)
+		}
+	}
+	rows.Close()
+	if len(triples) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	for _, t := range triples {
+		if _, err := tx.Exec("DELETE FROM message_tags WHERE message_id = $1 AND tag_id = $2", t.messageID, t.tagID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if _, err := tx.Exec(
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'applied'",
+		ids, owner,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// One goroutine per affected message, same as handleBulkDismissTagHistory.
+	for _, t := range triples {
+		go s.restoreFromJunkIfSpamDeclined(owner, t.messageID, t.source)
+	}
 	s.broadcaster.publish("mail")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -606,7 +1052,161 @@ func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, 
 		http.NotFound(w, r)
 		return
 	}
-	s.restoreFromJunkIfSpamDeclined(messageID, source)
+	// Backgrounded — see handleUndoTagHistory's identical comment above. The dismiss
+	// itself is already durable by the time this returns; restoring from Junk (if it
+	// even applies) doesn't need to hold up the response. Unlike undo, plain dismiss
+	// has no unconditional publish of its own (it doesn't touch message_tags), so this
+	// one does need to publish itself — but only if it actually moved something.
+	go func() {
+		if s.restoreFromJunkIfSpamDeclined(owner, messageID, source) {
+			s.broadcaster.publish("mail")
+		}
+	}()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleClearTagHistory removes a pending suggestion from the queue with no judgment
+// recorded at all — deleted outright, not marked dismissed. Dismissing is a real
+// verdict ("this tag is wrong for this mail") that feeds suppressedTags and can
+// restore mail from Junk; clearing is just "I don't want to look at this anymore",
+// which means the exact same suggestion is free to resurface on a future scan or sync
+// if it still scores the same way, same as if it had never been cleared.
+func (s *Store) handleClearTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	id := r.PathValue("id")
+	if _, err := s.db.Exec(
+		"DELETE FROM tag_history WHERE id = $1 AND owner_subject = $2 AND status = 'suggested'",
+		id, owner,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// bulkTagHistoryIDs decodes the {"ids": [...]} body the three bulk-action handlers
+// below all share — "Accept all"/"Dismiss all"/"Clear list" used to mean one HTTP
+// request per suggestion (Promise.all over the whole list client-side), which on an
+// uncapped pending-suggestions list could mean thousands of round trips for one tap.
+// One request with every id, handled in one or two queries server-side instead.
+func bulkTagHistoryIDs(r *http.Request) ([]string, bool) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || len(req.IDs) == 0 {
+		return nil, false
+	}
+	return req.IDs, true
+}
+
+// handleBulkAcceptTagHistory is "Accept all" — see bulkTagHistoryIDs' own comment.
+func (s *Store) handleBulkAcceptTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	ids, ok := bulkTagHistoryIDs(r)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT INTO message_tags (message_id, tag_id)
+		SELECT message_id, tag_id FROM tag_history WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'
+		ON CONFLICT DO NOTHING`,
+		ids, owner,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec(
+		"UPDATE tag_history SET status = 'applied', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'",
+		ids, owner,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Same immediate check a single accept does — one call covers every newly-applied
+	// tag from this batch, not one call per row.
+	go s.autoMoveTaggedMail(owner)
+	s.broadcaster.publish("mail")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBulkDismissTagHistory is "Dismiss all" — see bulkTagHistoryIDs' own comment.
+func (s *Store) handleBulkDismissTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	ids, ok := bulkTagHistoryIDs(r)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	rows, err := s.db.Query(
+		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested' RETURNING message_id, source",
+		ids, owner,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type pair struct{ messageID, source string }
+	var pairs []pair
+	for rows.Next() {
+		var p pair
+		if rows.Scan(&p.messageID, &p.source) == nil {
+			pairs = append(pairs, p)
+		}
+	}
+	rows.Close()
+	// One goroutine per affected message (restoreFromJunkIfSpamDeclined's own
+	// fast/slow path split is what keeps any one of them reasonable even at real bulk
+	// size), but exactly one "mail" publish for the whole batch once they've all
+	// finished — not one per message, which is what turned a 15-message restore into
+	// 15 separate full-view refetches on every connected client (see
+	// restoreFromJunkIfSpamDeclined's own comment on why it doesn't publish itself).
+	go func() {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		anyRestored := false
+		for _, p := range pairs {
+			wg.Add(1)
+			go func(p pair) {
+				defer wg.Done()
+				if s.restoreFromJunkIfSpamDeclined(owner, p.messageID, p.source) {
+					mu.Lock()
+					anyRestored = true
+					mu.Unlock()
+				}
+			}(p)
+		}
+		wg.Wait()
+		if anyRestored {
+			s.broadcaster.publish("mail")
+		}
+	}()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBulkClearTagHistory is "Clear list" — see bulkTagHistoryIDs' own comment. No
+// side effects beyond the delete itself (see handleClearTagHistory's own comment on
+// why clearing doesn't touch suppressedTags or Junk restoration).
+func (s *Store) handleBulkClearTagHistory(w http.ResponseWriter, r *http.Request, owner string) {
+	ids, ok := bulkTagHistoryIDs(r)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if _, err := s.db.Exec(
+		"DELETE FROM tag_history WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'",
+		ids, owner,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -620,26 +1220,84 @@ func (s *Store) handleDismissTagHistory(w http.ResponseWriter, r *http.Request, 
 // account's detected Junk folder specifically, and to spam_engine decisions only —
 // undoing a *tagging* decision doesn't imply "this belongs in the inbox" the way
 // declining a spam verdict does.
-func (s *Store) restoreFromJunkIfSpamDeclined(messageID, source string) {
+//
+// Deliberately does NOT publish "mail" itself, even though every single-action caller
+// used to rely on it doing exactly that — a real run of the bulk callers (the
+// restore-stranded/cleanup-unconfirmed jobs, bulk dismiss/undo) calls this once per
+// message, and a "mail" publish fans out to every connected client's live-update
+// listener, which refetches its entire current view — 15 real restores meant 15 full
+// refetches of whatever the client happened to be looking at, which is exactly the
+// "almost 1000 requests" pattern this was mistaken for at first. Every caller now
+// publishes its own single event once its whole batch (one message, or many) is done.
+func (s *Store) restoreFromJunkIfSpamDeclined(owner, messageID, source string) bool {
 	if source != "spam_engine" || messageID == "" {
-		return
+		return false
 	}
+
+	// Fast path: the local mails cache already has a row for this message, so its
+	// current folder and cache id are right there — the common case once an account's
+	// been running a while.
 	var mailID, accountID, folder string
-	if err := s.db.QueryRow(
+	err := s.db.QueryRow(
 		"SELECT id, coalesce(account_id, ''), folder FROM mails WHERE message_id = $1 LIMIT 1", messageID,
-	).Scan(&mailID, &accountID, &folder); err != nil || accountID == "" {
-		return
+	).Scan(&mailID, &accountID, &folder)
+	if err == nil && accountID != "" {
+		if _, _, junk, err := s.resolveFolders(accountID); err == nil && junk != "" && folder == junk {
+			if err := s.moveMailToFolder(mailID, "INBOX"); err != nil {
+				log.Printf("restore from junk %s: %v", messageID, err)
+				return false
+			}
+			s.db.Exec("DELETE FROM mails WHERE id = $1", mailID) // matches handleMove's own cleanup after a successful move
+			return true
+		}
+		return false
 	}
-	_, _, junk, err := s.resolveFolders(accountID)
-	if err != nil || junk == "" || folder != junk {
-		return
+
+	// Slow path: no local cache row for this message at all — syncAccount only ever
+	// populates INBOX, every other folder (Junk included) is filled in by the periodic
+	// background walk, which a freshly connected or just-restored-from-backup account
+	// hasn't necessarily reached yet. Relying on the cache here meant declining a
+	// suggestion silently did nothing on a fresh account — no error, the dismiss itself
+	// still succeeded, just no actual move, which is worse than a visible failure.
+	// Search every one of the owner's accounts directly over IMAP instead.
+	rows, err := s.db.Query("SELECT id, host, port, username, oauth_provider FROM accounts WHERE owner_subject = $1", owner)
+	if err != nil {
+		return false
 	}
-	if err := s.moveMailToFolder(mailID, "INBOX"); err != nil {
-		log.Printf("restore from junk %s: %v", messageID, err)
-		return
+	type acctRow struct {
+		id, host, username, oauthProvider string
+		port                              int
 	}
-	s.db.Exec("DELETE FROM mails WHERE id = $1", mailID) // matches handleMove's own cleanup after a successful move
-	s.broadcaster.publish("mail")
+	var accts []acctRow
+	for rows.Next() {
+		var a acctRow
+		if rows.Scan(&a.id, &a.host, &a.port, &a.username, &a.oauthProvider) == nil {
+			accts = append(accts, a)
+		}
+	}
+	rows.Close()
+
+	for _, a := range accts {
+		_, _, junk, err := s.resolveFolders(a.id)
+		if err != nil || junk == "" {
+			continue
+		}
+		_, password, err := s.loadAccountCreds(a.id)
+		if err != nil {
+			continue
+		}
+		uid, err := findUIDByMessageID(a.host, a.port, a.username, password, a.oauthProvider, junk, messageID)
+		if err != nil || uid == 0 {
+			continue
+		}
+		if err := moveMail(a.host, a.port, a.username, password, a.oauthProvider, uid, junk, "INBOX"); err != nil {
+			log.Printf("restore from junk (live search) %s: %v", messageID, err)
+			return false
+		}
+		s.markSelfMovedIntoInbox(a.id) // same suppression a cache-path move gets via moveMailToFolder
+		return true
+	}
+	return false
 }
 
 // handleBlockSenderTagHistory is the broader, explicit-opt-in sibling of dismiss: not
@@ -655,7 +1313,13 @@ func (s *Store) handleBlockSenderTagHistory(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
-	s.restoreFromJunkIfSpamDeclined(messageID, source)
+	// Backgrounded — see handleDismissTagHistory's identical comment on why this one
+	// needs its own conditional publish (no unconditional one elsewhere in this handler).
+	go func() {
+		if s.restoreFromJunkIfSpamDeclined(owner, messageID, source) {
+			s.broadcaster.publish("mail")
+		}
+	}()
 	if senderEmail == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -683,13 +1347,15 @@ func (s *Store) handleGetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	spamMode := "review"
 	delay := 3
 	imageRetention := 90
+	wordWeighting := "plain"
 	var backfillCompletedAt *time.Time
 	s.db.QueryRow(
-		"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at FROM owner_settings WHERE owner_subject = $1", owner,
-	).Scan(&mode, &spamMode, &delay, &imageRetention, &backfillCompletedAt)
+		"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at, word_profile_weighting FROM owner_settings WHERE owner_subject = $1", owner,
+	).Scan(&mode, &spamMode, &delay, &imageRetention, &backfillCompletedAt, &wordWeighting)
 	writeJSON(w, map[string]any{
 		"autoTagMode": mode, "spamMode": spamMode, "autoMoveDelayDays": delay,
 		"imageCacheRetentionDays": imageRetention, "imageBackfillCompletedAt": backfillCompletedAt,
+		"wordProfileWeighting": wordWeighting,
 	})
 }
 
@@ -699,6 +1365,7 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 		SpamMode                string `json:"spamMode"`
 		AutoMoveDelayDays       int    `json:"autoMoveDelayDays"`
 		ImageCacheRetentionDays int    `json:"imageCacheRetentionDays"`
+		WordProfileWeighting    string `json:"wordProfileWeighting"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
@@ -715,6 +1382,13 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 		http.Error(w, "spamMode must be full_auto or review", http.StatusBadRequest)
 		return
 	}
+	if req.WordProfileWeighting == "" {
+		req.WordProfileWeighting = s.ownerWordProfileWeighting(owner) // same "keep untouched if not sent" pattern as spamMode above
+	}
+	if req.WordProfileWeighting != "plain" && req.WordProfileWeighting != "distinctive" {
+		http.Error(w, "wordProfileWeighting must be plain or distinctive", http.StatusBadRequest)
+		return
+	}
 	if req.AutoMoveDelayDays < 0 {
 		req.AutoMoveDelayDays = 0
 	}
@@ -725,10 +1399,11 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 		req.ImageCacheRetentionDays = imageBackfillMaxDays
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days) VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, word_profile_weighting) VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, spam_mode = excluded.spam_mode,
-			auto_move_delay_days = excluded.auto_move_delay_days, image_cache_retention_days = excluded.image_cache_retention_days`,
-		owner, req.AutoTagMode, req.SpamMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays,
+			auto_move_delay_days = excluded.auto_move_delay_days, image_cache_retention_days = excluded.image_cache_retention_days,
+			word_profile_weighting = excluded.word_profile_weighting`,
+		owner, req.AutoTagMode, req.SpamMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays, req.WordProfileWeighting,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -737,9 +1412,9 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// scanFolderLimit is deliberately higher than the live inbox page size (pageSize) —
-// this is meant to capture enough of a folder's real history for the
-// folder-concentration signal to mean something, not just the most recent page.
+// scanFolderLimit is the IMAP page size walkAccountFolders pages through a folder
+// with — not a cap on how much of the folder gets scanned (a full scan pages until
+// each folder is exhausted), just how many messages it fetches per round trip.
 const scanFolderLimit = 200
 
 type scanSummary struct {
@@ -852,10 +1527,18 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 	type mailInFolder struct {
 		mail   Mail
 		folder string
+		body   MailBody
 	}
+	var allMu sync.Mutex // onMail now runs concurrently (folderwalk.go) — append isn't safe without this
 	var all []mailInFolder
-	err = s.walkAccountFolders(ctx, acct, password, accountID, names, scanFolderLimit, func(m Mail, folder string) {
-		all = append(all, mailInFolder{m, folder})
+	// needBodies=true (was false) — Signal A/B below now also tokenizes each mail's body
+	// into tag_history.body_tokens, which is what rebuildWordProfiles later aggregates
+	// into each tag's word profile. Same body-fetch cost scanAccountForSpam already pays.
+	err = s.walkAccountFolders(ctx, acct, password, accountID, names, scanFolderLimit, true, nil, func(_ *imapclient.Client, m Mail, body MailBody, folder string) bool {
+		allMu.Lock()
+		all = append(all, mailInFolder{m, folder, body})
+		allMu.Unlock()
+		return true // a real "scan everything" scan, not just the newest page of each folder
 	}, onProgress)
 	if err != nil {
 		return summary, err
@@ -882,7 +1565,16 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 	// once per scan; without this, each extra copy logged its own redundant suggestion for the
 	// identical (message, tag) pair, which is what made a single dismissed/blocked suggestion look
 	// like it kept "coming back" on the next scan — it wasn't coming back, a sibling copy was scoring fresh.
-	for _, mf := range all {
+	for i, mf := range all {
+		// The folder-walk phase's done/total counts folders; this is a second,
+		// later stretch of the exact same SSE connection counting mails instead, which
+		// the client tells apart by remembering it already saw the done=-1 switch
+		// signal above. Throttled to every 100 — granular enough to look alive on a
+		// mailbox in the tens of thousands without making this loop's bottleneck (DB
+		// round trips per mail) noticeably worse from the extra scan_jobs row writes.
+		if onProgress != nil && i%100 == 0 {
+			onProgress(i, len(all))
+		}
 		m, folder := mf.mail, mf.folder
 		if m.MessageID == "" {
 			continue
@@ -891,6 +1583,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			continue
 		}
 		seenMessageIDs[m.MessageID] = true
+		bodyTokens := tokenizeBody(bodyPlainText(mf.body))
 		if tagID, ok := rules[folder]; ok {
 			// recordTagHistory only logs the audit row — it never touches message_tags,
 			// the table that actually drives the visible tag chip. Without this insert,
@@ -905,7 +1598,7 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			// fix as applyFolderTagRule (tags.go) for the same underlying mistake.
 			if err == nil {
 				if n, err := res.RowsAffected(); err == nil && n > 0 {
-					s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil)
+					s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil, bodyTokens)
 					summary.Applied++
 				} else {
 					summary.AlreadyTagged++
@@ -928,17 +1621,33 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			summary.AlreadyTagged++
 			continue
 		}
-		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject); len(scored) > 0 {
+		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens); len(scored) > 0 {
 			for _, c := range scored {
 				score := c.Score
 				if mode == "full_auto" && score >= autoApplyScore {
 					s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
-					s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "scan_inferred", "applied", &score)
+					// Resolves any pending 'suggested' row for this pair to 'applied' too —
+					// covers a mode switch (review then later full_auto) promoting an old
+					// suggestion, not just a fresh apply.
+					s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "scan_inferred", "applied", &score, bodyTokens)
 					summary.Applied++
-				} else {
-					s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "scan_inferred", "suggested", &score)
-					summary.Suggested++
+					continue
 				}
+				// A pending suggestion for this exact (message, tag) already exists —
+				// recording another one every time a scan re-touches mail still sitting
+				// unresolved from a previous scan is what put multiple identical
+				// "Suggest: X" chips on one mail (the reader shows every pending
+				// suggestion, with no de-dup of its own).
+				var alreadySuggested bool
+				s.db.QueryRow(
+					"SELECT EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'suggested')",
+					m.MessageID, c.TagID,
+				).Scan(&alreadySuggested)
+				if alreadySuggested {
+					continue
+				}
+				s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "scan_inferred", "suggested", &score, bodyTokens)
+				summary.Suggested++
 			}
 			// Scored against existing history at all (even if every match turned out
 			// already-applied) still means this sender's "handled" — not eligible for
@@ -985,14 +1694,21 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 		}
 		summary.NewTagCandidates = append(summary.NewTagCandidates, newTagCandidate{SenderOrDomain: label, Folder: folder, Count: len(mails)})
 	}
+	// Once, at the end of the scan, not per-mail — see rebuildWordProfiles' own comment
+	// on why this is the "rarely" trigger rather than something the live path also does.
+	s.rebuildWordProfiles(ownerSubject)
 	return summary, nil
 }
 
 // handleScanTags streams progress over SSE the same way handleSearch does — scanning
 // every folder in an account is a multi-IMAP-round-trip operation that can take a
 // while, and a blocking response left search in the same position before this pattern
-// was adopted there.
-func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
+// was adopted there. Unlike before, this connection doesn't own the scan: it either
+// starts a new scan_jobs-tracked run or attaches to one already running (the
+// account+kind already has a job), then just polls that job's row (subscribeScanJob,
+// scanjobs.go) until it stops — a reload reconnects here and gets the real current
+// progress immediately rather than nothing.
+func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request, owner string) {
 	accountID := r.PathValue("id")
 	scope := r.URL.Query().Get("scope") // "inbox" or "" (all folders) — ignored if folders is set
 	folders := r.URL.Query()["folders"] // optional: scan exactly these folders instead of scope
@@ -1003,26 +1719,84 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	var sendMu sync.Mutex
 	sendEvent := func(event string, data any) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		b, _ := json.Marshal(data)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		flusher.Flush()
 	}
 
-	summary, err := s.scanAccountForTags(r.Context(), accountID, scope, folders, func(done, total int) {
-		sendEvent("progress", map[string]int{"done": done, "total": total})
+	jobID, alreadyRunning := s.findRunningScanJob(accountID, "tags")
+	if !alreadyRunning {
+		var err error
+		jobID, err = s.startScanJob(owner, accountID, "tags")
+		if err != nil {
+			sendEvent("error", map[string]string{"message": err.Error()})
+			return
+		}
+		go s.runScanJob(jobID, "tags", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
+			summary, err := s.scanAccountForTags(ctx, accountID, scope, folders, onProgress)
+			if err == nil && summary.Applied > 0 {
+				// full_auto mode can apply tags directly during a scan — same gap as accept:
+				// without this, those wouldn't show up in the inbox until something else
+				// happened to trigger a refresh.
+				s.broadcaster.publish("mail")
+			}
+			return summary, err
+		})
+	}
+	sendEvent("job", map[string]string{"jobId": jobID})
+
+	err := s.subscribeScanJob(r.Context(), jobID, func(snap scanJobSnapshot) {
+		switch snap.Status {
+		case "running":
+			sendEvent("progress", map[string]int{"done": snap.Done, "total": snap.Total})
+		case "done":
+			sendEvent("complete", snap.Summary)
+		case "error":
+			sendEvent("error", map[string]string{"message": snap.Error})
+		default: // cancelled, interrupted
+			sendEvent("cancelled", map[string]string{})
+		}
 	})
-	if err != nil {
+	if err != nil && r.Context().Err() == nil {
 		sendEvent("error", map[string]string{"message": err.Error()})
+	}
+}
+
+// handleCancelScanJob stops the running job for this account+kind, if any — a no-op,
+// not an error, if nothing's running (the button can't always know whether the job
+// finished a moment before the click landed).
+func (s *Store) handleCancelScanJob(w http.ResponseWriter, r *http.Request, owner, kind string) {
+	accountID := r.PathValue("id")
+	if jobID, ok := s.findRunningScanJob(accountID, kind); ok {
+		s.cancelScanJob(jobID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCancelOwnerJob is handleCancelScanJob's owner-wide counterpart — for a job
+// with no single account in its lookup key (handleOwnerJobSSE, scanjobs.go).
+func (s *Store) handleCancelOwnerJob(w http.ResponseWriter, r *http.Request, owner, kind string) {
+	if jobID, _, ok := s.findRunningScanJobForOwner(owner, kind); ok {
+		s.cancelScanJob(jobID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRunningScanJob is what a panel reopening after a reload calls first — finding
+// a running job (and which account it belongs to) before assuming none exists, so a
+// reload mid-scan doesn't quietly forget about it.
+func (s *Store) handleRunningScanJob(w http.ResponseWriter, r *http.Request, owner string) {
+	kind := r.URL.Query().Get("kind")
+	jobID, accountID, found := s.findRunningScanJobForOwner(owner, kind)
+	if !found {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if summary.Applied > 0 {
-		// full_auto mode can apply tags directly during a scan — same gap as accept:
-		// without this, those wouldn't show up in the inbox until something else
-		// happened to trigger a refresh.
-		s.broadcaster.publish("mail")
-	}
-	sendEvent("complete", summary)
+	writeJSON(w, map[string]string{"jobId": jobID, "accountId": accountID})
 }
 
 // autoMoveTaggedMail is the inverse of the existing folder_tag_rules use (move into a
@@ -1062,6 +1836,10 @@ func (s *Store) autoMoveTaggedMail(ownerSubject string) (int, []movedMailDetail)
 	defer s.autoMoveMu.Unlock()
 
 	delayDays := s.ownerAutoMoveDelayDays(ownerSubject)
+	// Best-effort — "" on failure just means the t.id = $3 comparison below never
+	// matches, same as if this owner had no Spam tag at all (falls through to normal
+	// instant_move behavior for every tag, spam included).
+	spamTagID, _ := s.getOrCreateSpamTag(ownerSubject)
 
 	// The delay is meant to be "how long this mail has sat in the inbox", not "how
 	// long ago it got tagged" — those are very different clocks for mail tagged well
@@ -1073,15 +1851,30 @@ func (s *Store) autoMoveTaggedMail(ownerSubject string) (int, []movedMailDetail)
 	// instant_move tags (e.g. "Receipts" — always file it right now, no waiting) skip
 	// the global delay entirely rather than just using a smaller number — off by
 	// default per-tag, so this only ever kicks in where explicitly turned on.
+	//
+	// The Spam tag's own instant_move gets one further carve-out: a score confident
+	// enough to auto-apply at all (spamAutoApplyScore) isn't necessarily confident
+	// enough to disappear into Junk with no human ever seeing it — only a score at or
+	// above spamInstantJunkScore skips the delay; anything between the two still gets
+	// tagged right away (so it's visible, searchable, filtered out of view) but waits
+	// out the normal delay like any non-instant tag, giving a real window to notice and
+	// undo a false positive before it's gone. coalesce(...,1) treats a manually-applied
+	// Spam tag (score is NULL — a human's own deliberate decision, not the scorer's) as
+	// maximally confident, so it still moves instantly like today.
 	rows, err := s.db.Query(`
 		SELECT DISTINCT th.message_id, th.tag_id, m.id, coalesce(m.account_id, ''), m.sender, m.subject
 		FROM tag_history th
 		JOIN mails m ON m.message_id = th.message_id AND m.folder = 'INBOX'
 		JOIN tags t ON t.id = th.tag_id
 		WHERE th.owner_subject = $1 AND th.status = 'applied'
-		  AND coalesce(m.sent_at, th.created_at) < now() - ((CASE WHEN t.instant_move THEN 0 ELSE $2 END) * interval '1 day')
+		  AND coalesce(m.sent_at, th.created_at) < now() - (
+		    (CASE
+		       WHEN t.instant_move AND NOT (t.id = $3 AND coalesce(th.score, 1) < $4) THEN 0
+		       ELSE $2
+		     END) * interval '1 day'
+		  )
 		LIMIT 50`,
-		ownerSubject, delayDays,
+		ownerSubject, delayDays, spamTagID, spamInstantJunkScore,
 	)
 	if err != nil {
 		// Was silently swallowed before — a query bug here (the $2*interval encoding
@@ -1210,17 +2003,21 @@ func (s *Store) handleRunAutoMove(w http.ResponseWriter, r *http.Request, owner 
 // handleApplyTagToFolder backfills a tag onto every mail already sitting in a folder —
 // the folder→tag rule (folder_tag_rules) only ever applies going forward, to mail
 // moved in *after* the rule is set, so there was no way to retroactively tag what was
-// already there short of moving every mail out and back in.
-// handleApplyTagToFolder streams progress over SSE (GET, not POST — see the same
-// EventSource constraint noted on handleScanTags) and broadcasts a refresh once done,
-// so every connected client (including the one that triggered it) picks up the new
-// tags without a manual reload.
+// already there short of moving every mail out and back in. Job-backed
+// (account-scoped, like the folder scans — findRunningScanJob/startScanJob, not
+// handleOwnerJobSSE's owner-wide variant) since "all" can mean paging an entire
+// folder's history, real IMAP work that can outlast one SSE connection.
 func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 	accountID := r.PathValue("id")
 	folder := r.URL.Query().Get("folder")
 	tagID := r.URL.Query().Get("tagId")
 	if folder == "" || tagID == "" {
 		http.Error(w, "folder and tagId are required", http.StatusBadRequest)
+		return
+	}
+	var owner string
+	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&owner); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -1231,33 +2028,62 @@ func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	var sendMu sync.Mutex
 	sendEvent := func(event string, data any) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		b, _ := json.Marshal(data)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		flusher.Flush()
 	}
 
+	kind := "apply-tag-folder"
+	jobID, alreadyRunning := s.findRunningScanJob(accountID, kind)
+	if !alreadyRunning {
+		var err error
+		jobID, err = s.startScanJob(owner, accountID, kind)
+		if err != nil {
+			sendEvent("error", map[string]string{"message": err.Error()})
+			return
+		}
+		go s.runScanJob(jobID, kind, func(ctx context.Context, onProgress func(done, total int)) (any, error) {
+			return s.applyTagToFolder(ctx, accountID, owner, folder, tagID, onProgress)
+		})
+	}
+	sendEvent("job", map[string]string{"jobId": jobID})
+
+	err := s.subscribeScanJob(r.Context(), jobID, func(snap scanJobSnapshot) {
+		switch snap.Status {
+		case "running":
+			// No real "total" here — "all" means paging until the folder's exhausted,
+			// not a known count up front — done doubles as "page N" instead.
+			sendEvent("progress", map[string]int{"page": snap.Done})
+		case "done":
+			sendEvent("complete", snap.Summary)
+		case "error":
+			sendEvent("error", map[string]string{"message": snap.Error})
+		default:
+			sendEvent("cancelled", map[string]string{})
+		}
+	})
+	if err != nil && r.Context().Err() == nil {
+		sendEvent("error", map[string]string{"message": err.Error()})
+	}
+}
+
+func (s *Store) applyTagToFolder(ctx context.Context, accountID, ownerSubject, folder, tagID string, onProgress func(done, total int)) (any, error) {
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
+		return nil, err
 	}
-	var ownerSubject string
-	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&ownerSubject); err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
-	}
-
 	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
+		return nil, err
 	}
 	defer c.Close()
 	mbox, err := c.Select(folder, nil).Wait()
 	if err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
+		return nil, err
 	}
 
 	// "All" means all — page back with the same UID cursor infinite scroll uses, on
@@ -1265,10 +2091,12 @@ func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 	applied := 0
 	var beforeUID uint32
 	for page := 1; ; page++ {
+		if ctx.Err() != nil {
+			break
+		}
 		mails, err := fetchFolderMailPage(c, accountID, mbox, folder, scanFolderLimit, beforeUID)
 		if err != nil {
-			sendEvent("error", map[string]string{"message": err.Error()})
-			return
+			return nil, err
 		}
 		if len(mails) == 0 {
 			break
@@ -1277,16 +2105,25 @@ func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 			if m.MessageID == "" {
 				continue
 			}
-			if _, err := s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, tagID); err != nil {
+			res, err := s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, tagID)
+			if err != nil {
 				continue
 			}
-			s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil)
+			// ON CONFLICT DO NOTHING means err is nil even when this mail already had the
+			// tag — re-running "Apply to folder" (or it covering the same mail across
+			// pages/runs) would otherwise log an identical "applied" row every time.
+			if n, err := res.RowsAffected(); err != nil || n == 0 {
+				continue
+			}
+			s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil, nil)
 			applied++
 			if m.UID > 0 && (beforeUID == 0 || m.UID < beforeUID) {
 				beforeUID = m.UID
 			}
 		}
-		sendEvent("progress", map[string]int{"page": page, "applied": applied})
+		if onProgress != nil {
+			onProgress(page, 0)
+		}
 		if len(mails) < scanFolderLimit {
 			break // last (oldest) page was short of a full batch — nothing left before it
 		}
@@ -1295,5 +2132,5 @@ func (s *Store) handleApplyTagToFolder(w http.ResponseWriter, r *http.Request) {
 	if applied > 0 {
 		s.broadcaster.publish("mail") // same signal a new-mail push uses — tells every connected client to refresh
 	}
-	sendEvent("complete", map[string]int{"applied": applied})
+	return map[string]int{"applied": applied}, nil
 }

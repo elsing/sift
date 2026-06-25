@@ -16,6 +16,7 @@ import (
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-sasl"
 )
@@ -184,11 +185,16 @@ func mailsFromFetch(accountID, folder string, msgs []*imapclient.FetchMessageBuf
 			// matching, so even percent-encoding the slash client-side can't fix this,
 			// it has to never be a literal "/" in the first place. The ID is otherwise
 			// opaque (nothing parses it back apart elsewhere), so this is safe.
-			ID:             fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
-			Sender:         toValidUTF8(envelopeSender(m.Envelope)),
-			SenderEmail:    toValidUTF8(envelopeSenderEmail(m.Envelope)),
-			Subject:        toValidUTF8(m.Envelope.Subject),
-			Snippet:        "", // ponytail: body snippet needs a BODY[] fetch (extra round trip), add when needed
+			ID:          fmt.Sprintf("%s|%s|%d", accountID, base64.RawURLEncoding.EncodeToString([]byte(folder)), m.UID),
+			Sender:      toValidUTF8(envelopeSender(m.Envelope)),
+			SenderEmail: toValidUTF8(envelopeSenderEmail(m.Envelope)),
+			Subject:     toValidUTF8(m.Envelope.Subject),
+			// Blank here (envelope-only fetch, no body) — backfilled separately, for
+			// free, by prefetchMailImages (imageproxy.go) and scanAccountForSpam
+			// (spam.go), both of which already fetch the full body for every mail
+			// they touch anyway. Still blank for mail neither has reached yet (the
+			// very first sync's backlog, or a folder browsed but never scanned).
+			Snippet:        "",
 			Time:           formatMailTime(m.Envelope.Date),
 			Date:           m.Envelope.Date.Format(time.RFC3339),
 			Unread:         !slices.Contains(m.Flags, imap.FlagSeen),
@@ -334,6 +340,27 @@ func fetchFolderMailPage(c *imapclient.Client, accountID string, mbox *imap.Sele
 	return mails, nil
 }
 
+// fetchFolderMailRange fetches every message in [seqStart, seqEnd] (inclusive IMAP
+// sequence numbers) on an already-selected connection — the building block for walking
+// one folder across several connections in parallel (folderwalk.go's lanes), each
+// covering its own slice, instead of one connection paging the whole thing back to
+// front. Unlike fetchFolderMailPage's beforeUID cursor, this needs no
+// overfetch-then-sort trick: that exists specifically to find "the newest N by Date"
+// when UID order doesn't track Date order (moved-in mail) — not a concern here, since a
+// lane's whole point is "fetch this exact slice", not "find the newest N".
+func fetchFolderMailRange(c *imapclient.Client, accountID, folder string, seqStart, seqEnd uint32) ([]Mail, error) {
+	seqSet := imap.SeqSetNum()
+	seqSet.AddRange(seqStart, seqEnd)
+	fetchCmd := c.Fetch(seqSet, &imap.FetchOptions{Envelope: true, Flags: true, UID: true, BodyStructure: &imap.FetchItemBodyStructure{Extended: true}})
+	defer fetchCmd.Close()
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		return nil, fmt.Errorf("fetch range: %w", err)
+	}
+	mails, _ := mailsFromFetch(accountID, folder, msgs)
+	return mails, nil
+}
+
 // folderPageOverfetchFactor/Cap bound the wider-than-`limit` UID window fetched per
 // page when paging backward — see fetchFolderMailPage's own comment. ponytail: a
 // fixed multiplier/cap, not an adaptive widen-until-correct loop; revisit if a folder
@@ -344,7 +371,13 @@ const (
 )
 
 // formatMailTime shows a bare time for today's mail, and a date for anything older.
+// Normalized to this server's own timezone first — t otherwise keeps whatever offset
+// the sending mail server happened to stamp the Date header with, so two mails from
+// senders in different timezones displayed clock times that didn't match their real
+// (correctly sorted, by the separate UTC-comparable Date/sent_at field) order — the
+// inbox could look scrambled while actually being sorted exactly right.
 func formatMailTime(t time.Time) string {
+	t = t.Local()
 	now := time.Now()
 	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
 		return t.Format("3:04 PM")
@@ -411,7 +444,7 @@ type folderNode struct {
 func buildFolderTree(names []string, delim rune) []*folderNode {
 	sep := string(delim)
 	if sep == "" {
-		sep = "/" // ponytail: fallback if the server reports no delimiter; flat namespace either way
+		sep = "/" // no delimiter reported means a flat namespace anyway — this never actually gets used to split anything
 	}
 
 	type builder struct {
@@ -541,6 +574,38 @@ func moveMail(host string, port int, username, password, oauthProvider string, u
 	return nil
 }
 
+// findUIDByMessageID looks up a message's current UID within one folder directly over
+// IMAP, by its Message-ID header — independent of whatever the local mails cache
+// currently has (or doesn't have) for it. Needed because the cache isn't guaranteed
+// complete: syncAccount only ever populates INBOX, every other folder is filled in by
+// the periodic background walk, which a freshly connected/imported account hasn't
+// necessarily reached yet. Returns 0, nil if genuinely not found (not an error — the
+// mail might just not be in this folder).
+func findUIDByMessageID(host string, port int, username, password, oauthProvider, folder, messageID string) (uint32, error) {
+	c, err := dialIMAP(host, port, username, password, oauthProvider)
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+	if _, err := c.Select(folder, nil).Wait(); err != nil {
+		return 0, fmt.Errorf("select %s: %w", folder, err)
+	}
+	// IMAP HEADER search is substring, not exact — fine here since Message-IDs are
+	// unique enough in practice that a substring match against this exact value isn't
+	// going to collide with some other message's header.
+	data, err := c.UIDSearch(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: messageID}},
+	}, nil).Wait()
+	if err != nil {
+		return 0, fmt.Errorf("search: %w", err)
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		return 0, nil
+	}
+	return uint32(uids[0]), nil
+}
+
 // createFolder makes a new IMAP mailbox. path is the full path (e.g.
 // "Archives/Newsletters/New Folder") — the caller is responsible for using the
 // account's own hierarchy delimiter when building nested paths.
@@ -588,9 +653,8 @@ func deleteFolder(host string, port int, username, password, oauthProvider, path
 
 // MailBody holds whichever parts of a message we could extract. The client renders
 // HTML (sandboxed, scripts disabled) when present, falling back to plain text.
-// ponytail: attachments are listed and downloadable but not resolved inline into the
-// HTML body — a cid: reference (an image embedded inline rather than attached) will
-// still show as broken. Add a cid:->data-URI rewrite pass if that's needed.
+// cid:-referenced attachments are rewritten to data: URIs in place — see
+// fetchMailBodyOnConn's cidImages handling.
 type MailBody struct {
 	Text          string       `json:"text,omitempty"`
 	HTML          string       `json:"html,omitempty"`
@@ -617,6 +681,11 @@ type MailBody struct {
 	ReplyTo               string `json:"-"`
 	ReturnPath            string `json:"-"`
 	From                  string `json:"-"`
+	// Only kept when DKIM came back temperror — scoreSpam's live recheck (spam.go)
+	// needs the raw signed bytes, but holding onto a full message body for every
+	// mail in a batch scan just in case would be wasteful; this is already in hand
+	// from the same fetch, just not discarded for the rare case it's needed.
+	RawMessage []byte `json:"-"`
 }
 
 type Attachment struct {
@@ -627,9 +696,16 @@ type Attachment struct {
 }
 
 // fetchMailBody fetches the raw message and extracts its text/plain and text/html
-// parts (whichever exist — a message may have one, both, or neither).
-// ponytail: no inline images/attachments resolved into the HTML yet — cid: references
-// will show as broken images. Add a part-fetching pass if that's needed.
+// parts (whichever exist — a message may have one, both, or neither). cid:-referenced
+// images (common in marketing mail, which ships them as attachment/inline parts
+// rather than http(s) URLs) get inlined as data: URIs straight from the bytes already
+// in this same fetch — see cidImages below.
+// fetchMailBody dials a fresh connection just for this one message — fine for the
+// "open a single mail" callers (the reader, a push-notification preview, a one-off
+// image fetch), but anything fetching many bodies in a row (a spam/tag scan, the
+// image backfill) should use fetchMailBodyOnConn on a connection it's already holding
+// open instead — see walkOneFolder, which now never closes its connection between
+// messages specifically so those callers can do that.
 func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBody, error) {
 	c, err := dialIMAP(acct.Host, acct.Port, acct.Username, password, acct.OAuthProvider)
 	if err != nil {
@@ -639,7 +715,15 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 	if _, err := c.Select(folder, nil).Wait(); err != nil {
 		return MailBody{}, fmt.Errorf("select %s: %w", folder, err)
 	}
+	return fetchMailBodyOnConn(c, uid)
+}
 
+// fetchMailBodyOnConn fetches and parses one message's body on a connection that's
+// already dialed and SELECTed on the right folder — no dial, no TLS handshake, no
+// login, just the FETCH itself. A scan re-dialing per message (the original version
+// of this split) paid a full connection setup for every single mail it scored, which
+// dominated a large-folder scan's total time far more than the actual fetch did.
+func fetchMailBodyOnConn(c *imapclient.Client, uid uint32) (MailBody, error) {
 	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
 		BodySection: []*imap.FetchItemBodySection{{}},
 	})
@@ -651,18 +735,69 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 	if len(msgs) == 0 || len(msgs[0].BodySection) == 0 {
 		return MailBody{}, fmt.Errorf("message not found")
 	}
+	return parseMailBody(msgs[0].BodySection[0].Bytes)
+}
 
-	mr, err := mail.CreateReader(bytes.NewReader(msgs[0].BodySection[0].Bytes))
+// fetchMailBodiesOnConn is fetchMailBodyOnConn's batch sibling — one FETCH command
+// for every uid instead of one per message. A page of N messages used to cost N
+// round trips here (the actual byte transfer is the same either way; what's saved is
+// N-1 round-trip latencies, which is what dominated a scan's total time far more than
+// transfer size ever did). Missing/unparseable messages are just absent from the
+// returned map rather than failing the whole batch.
+func fetchMailBodiesOnConn(c *imapclient.Client, uids []uint32) map[uint32]MailBody {
+	imapUIDs := make([]imap.UID, len(uids))
+	for i, u := range uids {
+		imapUIDs[i] = imap.UID(u)
+	}
+	fetchCmd := c.Fetch(imap.UIDSetNum(imapUIDs...), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{{}},
+	})
+	defer fetchCmd.Close()
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		return nil // best-effort — callers already treat a missing body as "couldn't fetch this one"
+	}
+	bodies := make(map[uint32]MailBody, len(msgs))
+	for _, msg := range msgs {
+		if len(msg.BodySection) == 0 {
+			continue
+		}
+		if body, err := parseMailBody(msg.BodySection[0].Bytes); err == nil {
+			bodies[uint32(msg.UID)] = body
+		}
+	}
+	return bodies
+}
+
+// parseMailBody extracts text/HTML/attachments/auth headers from one raw fetched
+// message — shared by the single-message and batch fetch paths above.
+func parseMailBody(raw []byte) (MailBody, error) {
+	mr, err := mail.CreateReader(bytes.NewReader(raw))
 	if mr == nil {
 		return MailBody{}, fmt.Errorf("parse message: %w", err)
 	}
 
 	var body MailBody
 	body.AuthenticationResults, _ = mr.Header.Text("Authentication-Results")
+	if authResultVerdict(body.AuthenticationResults, "dkim") == "temperror" {
+		body.RawMessage = raw
+	}
 	body.ReplyTo, _ = mr.Header.Text("Reply-To")
 	body.ReturnPath, _ = mr.Header.Text("Return-Path")
 	body.From, _ = mr.Header.Text("From")
 	attachmentIndex := 0
+	// Marketing mail commonly ships its images as MIME parts referenced from the HTML
+	// by cid: (Content-ID), not as plain http(s) URLs — extractImageSrcs only ever
+	// recognized http(s) src values, so these rendered as plain broken images with no
+	// "blocked, tap to load" banner either: nothing ever flagged them as proxyable in
+	// the first place. The bytes are already right here in the same fetch (no separate
+	// request needed, no spam-blocking concern either — it's part of this exact
+	// message, not a remote tracker), so inline them as data: URIs directly.
+	cidImages := map[string]struct {
+		contentType string
+		bytes       []byte
+	}{}
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -686,24 +821,50 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 				Index: attachmentIndex, Filename: filename, Size: len(raw), ContentType: contentType,
 			})
 			attachmentIndex++
+			if cid := normalizeContentID(attHeader.Header); cid != "" && strings.HasPrefix(contentType, "image/") {
+				cidImages[cid] = struct {
+					contentType string
+					bytes       []byte
+				}{contentType, raw}
+			}
 			continue
 		}
-		if _, ok := part.Header.(*mail.InlineHeader); !ok {
+		inlineHeader, ok := part.Header.(*mail.InlineHeader)
+		if !ok {
 			continue
 		}
-		contentType, _, _ := part.Header.(*mail.InlineHeader).ContentType()
+		contentType, _, _ := inlineHeader.ContentType()
 		raw, _ := io.ReadAll(part.Body)
 		switch {
 		case contentType == "text/plain" && body.Text == "":
 			body.Text = string(raw)
 		case contentType == "text/html" && body.HTML == "":
 			body.HTML = string(raw)
+		default:
+			if cid := normalizeContentID(inlineHeader.Header); cid != "" && strings.HasPrefix(contentType, "image/") {
+				cidImages[cid] = struct {
+					contentType string
+					bytes       []byte
+				}{contentType, raw}
+			}
 		}
 	}
 	if body.Text == "" && body.HTML == "" {
 		body.Text = "(no readable body)"
 	}
+	for cid, img := range cidImages {
+		dataURI := "data:" + img.contentType + ";base64," + base64.StdEncoding.EncodeToString(img.bytes)
+		body.HTML = strings.ReplaceAll(body.HTML, "cid:"+cid, dataURI)
+	}
 	return body, nil
+}
+
+// normalizeContentID strips the angle brackets a Content-Id header always wraps its
+// value in (RFC 2392 — "<value>"), so it matches the bare form an HTML cid: src
+// reference uses ("cid:value", no brackets).
+func normalizeContentID(h message.Header) string {
+	cid, _ := h.Text("Content-Id")
+	return strings.Trim(cid, "<>")
 }
 
 // fetchMailAttachment re-fetches the message and walks its parts again, returning the
@@ -768,8 +929,9 @@ func fetchMailAttachment(acct dbAccount, password, folder string, uid uint32, in
 }
 
 var (
-	htmlTagPattern    = regexp.MustCompile(`<[^>]*>`)
-	whitespacePattern = regexp.MustCompile(`\s+`)
+	htmlStyleScriptPattern = regexp.MustCompile(`(?is)<(style|script)[^>]*>.*?</(style|script)>`)
+	htmlTagPattern         = regexp.MustCompile(`<[^>]*>`)
+	whitespacePattern      = regexp.MustCompile(`\s+`)
 )
 
 // snippetFromBody collapses a fetched body down to a short plain-text preview — for
@@ -779,7 +941,12 @@ var (
 func snippetFromBody(body MailBody, maxLen int) string {
 	text := body.Text
 	if text == "" && body.HTML != "" {
-		text = html.UnescapeString(htmlTagPattern.ReplaceAllString(body.HTML, " "))
+		// htmlTagPattern only strips the tags themselves — a <style>/<script> block's
+		// inner text isn't wrapped in its own tags, so without removing the whole
+		// element first, marketing mail's embedded CSS ("a {text-decoration:none;}...")
+		// leaked straight into the snippet as if it were the visible message text.
+		withoutStyleScript := htmlStyleScriptPattern.ReplaceAllString(body.HTML, " ")
+		text = html.UnescapeString(htmlTagPattern.ReplaceAllString(withoutStyleScript, " "))
 	}
 	text = strings.TrimSpace(whitespacePattern.ReplaceAllString(text, " "))
 	runes := []rune(text)

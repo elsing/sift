@@ -2,7 +2,7 @@
 // review), the auto-move delay, the live pending-suggestions queue, and a read-only
 // history/audit list — see docs/smart-tagging.md for how the scoring underneath this
 // actually works.
-import { fetchTagHistory, acceptSuggestion, dismissSuggestion, blockSenderForSuggestion, createTag, setFolderTagRule, fetchMisplacedMail, moveMail, getMailTags, setMailTags } from './tags.js';
+import { fetchTagHistory, acceptSuggestion, dismissSuggestion, clearSuggestion, acceptSuggestions, dismissSuggestions, clearSuggestions, blockSenderForSuggestion, createTag, setFolderTagRule, fetchMisplacedMail, moveMail, getMailTags, setMailTags } from './tags.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
 import { withBusyButton } from './util.js';
 import { pickFolders } from './folders.js';
@@ -11,6 +11,11 @@ import { confirmModal } from './confirmModal.js';
 const MODES = [
   { id: 'review', name: 'Review', icon: '👀' },
   { id: 'full_auto', name: 'Full-auto', icon: '⚡' },
+];
+
+const WORD_PROFILE_WEIGHTINGS = [
+  { id: 'plain', name: 'Plain', icon: '📊' },
+  { id: 'distinctive', name: 'Distinctive', icon: '🎯' },
 ];
 
 const SCAN_SCOPES = [
@@ -23,9 +28,10 @@ const chosenScanFolders = new Set(); // only used when scanScope === 'folders'
 let scanFoldersAccountId = null; // which account chosenScanFolders belongs to
 
 let modeOptions, delayInput, errorEl, suggestionsList, historyList, historySearch, misplacedList;
-let scanBtn, scanScopeOptions, scanAccountPicker, scanProgress, scanProgressFill, scanProgressText, scanResults;
+let scanBtn, scanScopeOptions, scanChosenFoldersSummary, scanAccountPicker, scanProgress, scanProgressFill, scanProgressText, scanResults;
 let runAutoMoveBtn, autoMoveResults;
-let currentSettings = { autoTagMode: 'review', autoMoveDelayDays: 3 };
+let currentSettings = { autoTagMode: 'review', autoMoveDelayDays: 3, wordProfileWeighting: 'plain' };
+let wordWeightingOptions;
 
 async function fetchSettings() {
   const res = await fetch('/api/owner-settings');
@@ -69,6 +75,38 @@ function renderModeOptions() {
   }
 }
 
+function renderWordWeightingOptions() {
+  wordWeightingOptions.innerHTML = '';
+  for (const w of WORD_PROFILE_WEIGHTINGS) {
+    const btn = document.createElement('button');
+    btn.className = 'theme-option' + (currentSettings.wordProfileWeighting === w.id ? ' selected' : '');
+    btn.innerHTML = `<span class="theme-option-icon">${w.icon}</span><span>${w.name}</span>`;
+    btn.addEventListener('click', async () => {
+      for (const b of wordWeightingOptions.children) b.disabled = true;
+      errorEl.textContent = '';
+      try {
+        await saveSettings({ wordProfileWeighting: w.id });
+        renderWordWeightingOptions();
+      } catch (err) {
+        errorEl.textContent = err.message;
+        for (const b of wordWeightingOptions.children) b.disabled = false;
+      }
+    });
+    wordWeightingOptions.appendChild(btn);
+  }
+}
+
+// "Choose folders" only ever highlighted the scope button itself — nothing showed
+// which folders had actually been picked, so re-opening the picker (or just trying to
+// remember) was the only way to check before hitting Scan.
+function renderChosenFoldersSummary() {
+  if (scanScope !== 'folders' || chosenScanFolders.size === 0) {
+    scanChosenFoldersSummary.textContent = '';
+    return;
+  }
+  scanChosenFoldersSummary.textContent = `Scanning: ${[...chosenScanFolders].join(', ')}`;
+}
+
 function renderScanScopeOptions() {
   scanScopeOptions.innerHTML = '';
   for (const s of SCAN_SCOPES) {
@@ -86,11 +124,13 @@ function renderScanScopeOptions() {
         scanFoldersAccountId = null;
         pickFolders('Folders to scan', chosenScanFolders, (accountId) => {
           scanFoldersAccountId = accountId;
+          renderChosenFoldersSummary();
         });
       } else {
         chosenScanFolders.clear();
         scanFoldersAccountId = null;
       }
+      renderChosenFoldersSummary();
     });
     scanScopeOptions.appendChild(btn);
   }
@@ -199,7 +239,18 @@ function renderSuggestionRow(entry, onResolved) {
 // that mail's still in the local cache; if it's been archived/deleted/moved since, the
 // row just isn't clickable rather than opening to an error.
 function makeRowOpenable(li, clickTarget, entry) {
-  if (!entry.mailId) return;
+  if (!entry.mailId) {
+    // No local cache row for this message (common right after a backup import, or any
+    // time the background folder sync hasn't reached it yet) — leaving this silently
+    // unclickable looked identical to a real row, just unresponsive, with nothing
+    // telling you why tapping did nothing.
+    clickTarget.classList.add('openable');
+    clickTarget.title = "This mail isn't cached locally yet — open it from its folder, or run a scan/search to refresh the cache.";
+    clickTarget.addEventListener('click', () => {
+      errorEl.textContent = "Can't open this one yet — it's not cached locally. Try finding it in its folder, or run a scan again.";
+    });
+    return;
+  }
   clickTarget.classList.add('openable');
   clickTarget.addEventListener('click', () => {
     const panel = document.getElementById('smartTaggingPanel');
@@ -215,25 +266,55 @@ function makeRowOpenable(li, clickTarget, entry) {
 // Tracked at module scope so "Accept all" (a scan can easily leave dozens of these,
 // and accepting them one at a time was the only option) doesn't need its own fetch.
 let pendingSuggestions = [];
-// Persists across renderSuggestions() calls (e.g. after accepting one row) — without
+// Persists across renderSuggestionsFromCache() calls (e.g. after accepting one row) — without
 // this, expanding a noisy tag's group just to work through it, then accepting one,
 // re-collapsed the group out from under you on every single accept.
 const expandedTagGroups = new Set();
 
-async function renderSuggestions() {
-  const acceptAllBtn = document.getElementById('acceptAllSuggestionsBtn');
-  const dismissAllBtn = document.getElementById('dismissAllSuggestionsBtn');
+// loadSuggestions does the actual network fetch — only needed when the list might
+// have genuinely changed server-side (panel open, a scan completing), not after every
+// single accept/dismiss. resolveSuggestion(s) below handle that far more common case
+// by updating the already-loaded cache directly, no round trip at all — accepting or
+// dismissing one suggestion never changes any of the others, so refetching the whole
+// (possibly very large, since there's no hard cap on pending suggestions) list just to
+// remove one row was a real, needless cost on every single click.
+async function loadSuggestions() {
+  // Same loading placeholder reader.js/autoTagActivity.js already use elsewhere — this
+  // fetch can take a real moment (no hard cap on how many pending suggestions there
+  // can be), and an empty list with nothing happening looked indistinguishable from
+  // "there's nothing to show" while it was still loading.
+  suggestionsList.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
   try {
     // Spam gets its own dedicated queue (spam.js's Smart Spam panel) — excluded here
     // so it isn't suggested twice in two different places.
     pendingSuggestions = (await fetchTagHistory('suggested')).filter((e) => e.source !== 'spam_engine');
   } catch (err) {
     errorEl.textContent = err.message;
+    suggestionsList.innerHTML = ''; // don't leave the loading placeholder stuck forever on a failed fetch
     return;
   }
+  renderSuggestionsFromCache();
+}
+
+function resolveSuggestion(id) {
+  pendingSuggestions = pendingSuggestions.filter((e) => e.id !== id);
+  renderSuggestionsFromCache();
+}
+
+function resolveSuggestions(ids) {
+  const idSet = new Set(ids);
+  pendingSuggestions = pendingSuggestions.filter((e) => !idSet.has(e.id));
+  renderSuggestionsFromCache();
+}
+
+function renderSuggestionsFromCache() {
+  const acceptAllBtn = document.getElementById('acceptAllSuggestionsBtn');
+  const dismissAllBtn = document.getElementById('dismissAllSuggestionsBtn');
+  const clearAllBtn = document.getElementById('clearAllSuggestionsBtn');
   suggestionsList.innerHTML = '';
   acceptAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2); // not worth a bulk button for just one
   dismissAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
+  clearAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
   if (pendingSuggestions.length === 0) {
     suggestionsList.innerHTML = '<li class="folder-empty-status">No pending suggestions.</li>';
     return;
@@ -275,13 +356,13 @@ function renderSuggestionGroup(tagId, tagName, tagColor, entries) {
   acceptGroup.addEventListener('click', async () => {
     dismissGroup.disabled = true;
     try {
-      await withBusyButton(acceptGroup, '…', () => Promise.all(entries.map((e) => acceptSuggestion(e.id))));
+      await withBusyButton(acceptGroup, '…', () => acceptSuggestions(entries.map((e) => e.id)));
     } catch (err) {
       errorEl.textContent = err.message;
       dismissGroup.disabled = false;
       return;
     }
-    renderSuggestions();
+    resolveSuggestions(entries.map((e) => e.id));
     renderMisplaced();
   });
   const dismissGroup = document.createElement('button');
@@ -291,13 +372,13 @@ function renderSuggestionGroup(tagId, tagName, tagColor, entries) {
     if (entries.length > 1 && !(await confirmModal(`Dismiss all ${entries.length} "${tagName}" suggestions?`))) return;
     acceptGroup.disabled = true;
     try {
-      await withBusyButton(dismissGroup, '…', () => Promise.all(entries.map((e) => dismissSuggestion(e.id))));
+      await withBusyButton(dismissGroup, '…', () => dismissSuggestions(entries.map((e) => e.id)));
     } catch (err) {
       errorEl.textContent = err.message;
       acceptGroup.disabled = false;
       return;
     }
-    renderSuggestions();
+    resolveSuggestions(entries.map((e) => e.id));
   });
   actions.append(acceptGroup, dismissGroup);
   header.append(name, actions);
@@ -306,7 +387,7 @@ function renderSuggestionGroup(tagId, tagName, tagColor, entries) {
   const list = document.createElement('ul');
   list.className = 'accounts-list suggestion-group-rows';
   for (const entry of entries) {
-    list.appendChild(renderSuggestionRow(entry, renderSuggestions));
+    list.appendChild(renderSuggestionRow(entry, () => resolveSuggestion(entry.id)));
   }
 
   // Collapsed by default once a tag's pile is the actual problem (more than 3) — the
@@ -384,6 +465,10 @@ function renderMisplacedRow(entry, onResolved) {
   meta.className = 'smart-history-meta';
   meta.textContent = `${entry.sender}${entry.subject ? ' — ' + entry.subject : ''} (currently in ${entry.currentFolder})`;
   li.append(top, meta);
+  // Missing here entirely before — every other row in this panel (suggestions) can
+  // open the actual mail by tapping it; this one only ever offered Move/Remove tag,
+  // with no way to actually look at the mail those buttons act on first.
+  makeRowOpenable(li, meta, entry);
   return li;
 }
 
@@ -475,14 +560,34 @@ function renderHistory() {
 // the tag and the folder rule that goes with it, rather than two separate trips
 // through Settings).
 // Tracked at module scope so the Cancel button (wired in setupSmartTaggingPanel) can
-// reach whatever scan is currently running.
+// reach whatever scan is currently running. activeScanAccountId is what cancel posts
+// against — the scan itself now runs server-side independent of this connection (see
+// handleScanTags' own comment, smarttags.go), so cancelling needs the account id, not
+// just something to close client-side.
 let activeScanSource = null;
+let activeScanAccountId = null;
+
+// resumeRunningScan checks for a scan_jobs row already running for this owner (e.g.
+// one a previous page load started, then reloaded away from) and reattaches to it —
+// runScan/the server-side handler both treat "already running" and "just started" the
+// same way, so reattaching is just calling runScan again with the same account id.
+async function resumeRunningScan() {
+  try {
+    const res = await fetch('/api/scan-jobs/running?kind=tags');
+    if (res.status !== 200) return;
+    const { accountId } = await res.json();
+    runScan(accountId);
+  } catch {
+    // best-effort — worst case the user just doesn't see a scan they could've reattached to
+  }
+}
 
 function runScan(accountId) {
   scanResults.innerHTML = '';
   scanProgress.classList.remove('hidden');
   scanProgressFill.style.width = '0%';
   scanProgressText.textContent = 'Listing folders…';
+  activeScanAccountId = accountId;
 
   const params = new URLSearchParams();
   if (scanScope === 'inbox') params.set('scope', 'inbox');
@@ -492,15 +597,23 @@ function runScan(accountId) {
   const qs = params.toString();
   const source = new EventSource(`/api/accounts/${accountId}/scan-tags${qs ? '?' + qs : ''}`);
   activeScanSource = source;
+  // Two phases share this one done/total event: folders walked, then (once the server
+  // sends done=-1) mails scored against tag history — a separate, can-take-a-while
+  // stretch on a large mailbox that used to report no progress at all past that point.
+  // scoringTotal remembers which phase every later event in this same connection
+  // belongs to, since done starts back at 0 for the second phase too.
+  let scoringTotal = null;
   source.addEventListener('progress', (e) => {
     const { done, total } = JSON.parse(e.data);
     if (done < 0) {
-      // done = -1 is the server's signal it's moved on to scoring everything it found
-      // against tag history — a separate, can-take-a-while phase with no per-item
-      // progress of its own, but still needs *something* on screen so it doesn't look
-      // stuck at 100%.
-      scanProgressFill.style.width = '100%';
-      scanProgressText.textContent = `Scoring ${total} mail${total === 1 ? '' : 's'}…`;
+      scoringTotal = total;
+      scanProgressFill.style.width = '0%';
+      scanProgressText.textContent = `Scoring 0 of ${total} mails…`;
+      return;
+    }
+    if (scoringTotal !== null) {
+      scanProgressFill.style.width = (scoringTotal ? Math.round((done / scoringTotal) * 100) : 100) + '%';
+      scanProgressText.textContent = `Scoring ${done} of ${scoringTotal} mails…`;
       return;
     }
     scanProgressFill.style.width = (total ? Math.round((done / total) * 100) : 100) + '%';
@@ -511,22 +624,38 @@ function runScan(accountId) {
     scanProgress.classList.add('hidden');
     source.close();
     activeScanSource = null;
+    activeScanAccountId = null;
     renderScanSummary(summary, accountId);
     renderMisplaced();
-    renderSuggestions();
+    loadSuggestions(); // a scan can genuinely add new ones — this one does need the real fetch
     loadHistory();
   });
+  source.addEventListener('cancelled', () => {
+    scanProgress.classList.add('hidden');
+    source.close();
+    activeScanSource = null;
+    activeScanAccountId = null;
+  });
   source.addEventListener('error', () => {
-    // EventSource fires 'error' on the browser's own auto-retry attempts too, not just
-    // a hard failure — but closing it ourselves (Cancel, or here) means readyState is
-    // already CLOSED by the time this runs, so there's nothing left to distinguish; a
-    // closed source's error event is the end of the line either way.
+    // EventSource fires 'error' both for a real, final failure and for its own
+    // automatic reconnect attempts (a dropped connection through a VPN/proxy hop is
+    // common, and not the same thing as the scan itself failing — the scan runs
+    // server-side on its own lifetime now, independent of this one connection, see
+    // handleScanTags' own comment). readyState distinguishes the two: CONNECTING
+    // means the browser is about to retry on its own, in which case the right move is
+    // to just wait — reconnecting picks the job back up exactly where it left off,
+    // not from scratch. Only CLOSED means it's actually given up.
+    if (source.readyState === EventSource.CONNECTING) {
+      scanProgressText.textContent = 'Reconnecting…';
+      return;
+    }
     scanProgress.classList.add('hidden');
     source.close();
     if (activeScanSource === source) {
       errorEl.textContent = "Scan didn't complete — try again.";
     }
     activeScanSource = null;
+    activeScanAccountId = null;
   });
 }
 
@@ -632,6 +761,7 @@ async function setupScan() {
 
 export function setupSmartTaggingPanel() {
   modeOptions = document.getElementById('autoTagModeOptions');
+  wordWeightingOptions = document.getElementById('wordProfileWeightingOptions');
   delayInput = document.getElementById('autoMoveDelayInput');
   errorEl = document.getElementById('smartTaggingSettingsError');
   suggestionsList = document.getElementById('smartTaggingSuggestions');
@@ -639,6 +769,7 @@ export function setupSmartTaggingPanel() {
   misplacedList = document.getElementById('misplacedMailList');
   scanBtn = document.getElementById('scanForTagsBtn');
   scanScopeOptions = document.getElementById('scanScopeOptions');
+  scanChosenFoldersSummary = document.getElementById('scanChosenFoldersSummary');
   scanAccountPicker = document.getElementById('scanAccountPicker');
   scanProgress = document.getElementById('scanProgress');
   scanProgressFill = document.getElementById('scanProgressFill');
@@ -668,36 +799,58 @@ export function setupSmartTaggingPanel() {
   });
 
   document.getElementById('cancelScanBtn').addEventListener('click', () => {
+    // The scan now runs on a server-lifetime context, independent of this connection
+    // (see handleScanTags' own comment, smarttags.go) — closing the EventSource alone
+    // no longer stops it, so this has to actually ask the server to.
+    if (activeScanAccountId) {
+      fetch(`/api/accounts/${activeScanAccountId}/scan-tags/cancel`, { method: 'POST' });
+    }
     if (activeScanSource) {
-      activeScanSource.close(); // also tears down the server side — handleScanTags checks ctx.Err() between folders
+      activeScanSource.close();
       activeScanSource = null;
     }
+    activeScanAccountId = null;
     scanProgress.classList.add('hidden');
     scanProgressText.textContent = '';
   });
 
   document.getElementById('acceptAllSuggestionsBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
+    const ids = pendingSuggestions.map((s) => s.id);
     try {
-      await Promise.all(pendingSuggestions.map((s) => acceptSuggestion(s.id)));
+      await acceptSuggestions(ids);
     } catch (err) {
       errorEl.textContent = err.message;
     }
     e.target.disabled = false;
-    renderSuggestions();
+    resolveSuggestions(ids);
     renderMisplaced(); // accepting can tag mail that isn't in inbox — autoMoveTaggedMail won't touch that, so it shows up here instead
   });
 
   document.getElementById('dismissAllSuggestionsBtn').addEventListener('click', async (e) => {
     if (!(await confirmModal(`Dismiss all ${pendingSuggestions.length} pending suggestions?`))) return;
     e.target.disabled = true;
+    const ids = pendingSuggestions.map((s) => s.id);
     try {
-      await Promise.all(pendingSuggestions.map((s) => dismissSuggestion(s.id)));
+      await dismissSuggestions(ids);
     } catch (err) {
       errorEl.textContent = err.message;
     }
     e.target.disabled = false;
-    renderSuggestions();
+    resolveSuggestions(ids);
+  });
+
+  document.getElementById('clearAllSuggestionsBtn').addEventListener('click', async (e) => {
+    if (!(await confirmModal(`Clear all ${pendingSuggestions.length} pending suggestions? This isn't a verdict either way — any of them can resurface on a future scan.`))) return;
+    e.target.disabled = true;
+    const ids = pendingSuggestions.map((s) => s.id);
+    try {
+      await clearSuggestions(ids);
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+    e.target.disabled = false;
+    resolveSuggestions(ids);
   });
 
   // autoMoveTaggedMail normally only runs opportunistically, piggybacking on a sync —
@@ -755,19 +908,43 @@ export function setupSmartTaggingPanel() {
     }
     delayInput.value = currentSettings.autoMoveDelayDays;
     renderModeOptions();
+    renderWordWeightingOptions();
     renderMisplaced();
-    renderSuggestions();
+    loadSuggestions();
+    if (!activeScanSource) resumeRunningScan(); // pick back up a scan a previous page load started and left running
     // History stays collapsed until expanded (see historyToggleBtn) — no point
     // fetching/rendering a list nobody's asked to see yet.
   });
 
   document.getElementById('relocateAllBtn').addEventListener('click', async (e) => {
+    const btn = e.target;
+    const originalText = btn.textContent;
+    btn.disabled = true;
     try {
-      await withBusyButton(e.target, 'Moving…', () =>
-        Promise.all(misplacedMail.map((m) => moveMail(m.mailId, m.destinationFolder))));
+      // Job-backed (handleOwnerJobSSE, scanjobs.go) — one EventSource instead of one
+      // IMAP move request per mail; see the server-side comment on why.
+      await new Promise((resolve, reject) => {
+        const source = new EventSource('/api/misplaced-mail/move-all');
+        source.addEventListener('progress', (ev) => {
+          const { done, total } = JSON.parse(ev.data);
+          btn.textContent = total ? `Moving… (${done}/${total})` : 'Moving…';
+        });
+        source.addEventListener('complete', () => { source.close(); resolve(); });
+        source.addEventListener('cancelled', () => { source.close(); reject(new Error('Cancelled.')); });
+        source.addEventListener('error', () => {
+          if (source.readyState === EventSource.CONNECTING) {
+            btn.textContent = 'Reconnecting…';
+            return;
+          }
+          source.close();
+          reject(new Error("Didn't finish — try again."));
+        });
+      });
     } catch (err) {
       errorEl.textContent = err.message;
     }
+    btn.textContent = originalText;
+    btn.disabled = false;
     renderMisplaced();
   });
 

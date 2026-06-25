@@ -300,11 +300,25 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 }
 .smart-history-row { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .smart-history-row-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+/* A long sender address (or a big "(200)" group count) had no width limit, so it pushed
+   the Accept/Dismiss buttons straight off the edge of the panel instead of wrapping. */
+.smart-history-row-top > span:first-child { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .smart-history-meta { font-size: 12px; color: var(--text-dim); }
 .smart-history-badge {
   font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
   border: 1.5px solid var(--border); color: var(--text-dim); white-space: nowrap;
 }
+/* Self-contained base look, same pattern as .create-tag-btn — accept-btn/dismiss-btn
+   used to only look like anything inside .smart-suggestion-actions; a bare dismiss-btn
+   elsewhere (the misplaced-mail "Remove tag" button) rendered as an unstyled default
+   button, which read as broken rather than just unstyled. */
+.accept-btn, .dismiss-btn {
+  font-size: 12px; font-weight: 600; background: none; border: 2px solid var(--border);
+  border-radius: 12px; padding: 3px 10px; flex: none;
+}
+.accept-btn { border-color: var(--accent); color: var(--accent); }
+.dismiss-btn { border-color: var(--delete); color: var(--delete); }
+
 .smart-suggestion-actions { display: flex; gap: 6px; flex: none; }
 .smart-suggestion-actions button {
   font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px;

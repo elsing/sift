@@ -117,20 +117,30 @@ async function deleteFolderTagRule(accountId, folder) {
 // Streamed over SSE, not a single request-response — a large folder can take a while
 // (it pages through the whole thing, not just the most recent batch), and a plain
 // fetch() gave no sign anything was happening until it finally resolved. onProgress is
-// called after each page with { page, applied } so far.
+// called after each page with { page } — no live "applied so far" count (the job's
+// progress is just done/total, applied only comes back in the final result), unlike
+// before. Job-backed server-side now (handleApplyTagToFolder, smarttags.go), so a
+// dropped connection doesn't mean the run failed — readyState distinguishes the
+// browser's own automatic reconnect (CONNECTING) from an actually-final error (CLOSED).
 function applyTagToFolder(accountId, folder, tagId, onProgress) {
   return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({ folder, tagId });
-    const source = new EventSource(`/api/accounts/${accountId}/folders/apply-tag?${params}`);
+    const source = new EventSource(`/api/accounts/${accountId}/folders/apply-tag?${new URLSearchParams({ folder, tagId })}`);
     source.addEventListener('progress', (e) => onProgress && onProgress(JSON.parse(e.data)));
     source.addEventListener('complete', (e) => {
       source.close();
       resolve(JSON.parse(e.data));
     });
-    source.addEventListener('error', (e) => {
+    source.addEventListener('cancelled', () => {
       source.close();
-      const message = e.data ? JSON.parse(e.data).message : "Couldn't apply the tag — try again.";
-      reject(new Error(message));
+      reject(new Error('Cancelled.'));
+    });
+    source.addEventListener('error', () => {
+      if (source.readyState === EventSource.CONNECTING) {
+        onProgress && onProgress({ reconnecting: true });
+        return;
+      }
+      source.close();
+      reject(new Error("Couldn't apply the tag — try again."));
     });
   });
 }
@@ -181,8 +191,8 @@ export async function setupFolderAutoTagSelect(selectEl, applyBtn, accountId, fo
       applyBtn.disabled = true;
       applyBtn.textContent = 'Applying…';
       try {
-        const { applied } = await applyTagToFolder(accountId, folder, selectEl.value, ({ applied }) => {
-          applyBtn.textContent = `Applying… (${applied} so far)`;
+        const { applied } = await applyTagToFolder(accountId, folder, selectEl.value, (progress) => {
+          applyBtn.textContent = progress.reconnecting ? 'Reconnecting…' : `Applying… (page ${progress.page})`;
         });
         applyBtn.textContent = `Applied to ${applied}`;
         setTimeout(() => { applyBtn.textContent = 'Apply to all'; }, 2000);
@@ -231,6 +241,9 @@ export async function undoTagHistory(id) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+// Bulk counterpart — one request for the whole group instead of one per id.
+export const undoTagHistories = (ids) => bulkTagHistoryAction('undo', ids);
+
 export async function acceptSuggestion(id) {
   const res = await fetch(`/api/tag-history/${id}/accept`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
@@ -240,6 +253,28 @@ export async function dismissSuggestion(id) {
   const res = await fetch(`/api/tag-history/${id}/dismiss`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
 }
+
+// Not a verdict either way, just "stop showing me this" — see handleClearTagHistory's
+// own comment (smarttags.go) for how this differs from dismiss.
+export async function clearSuggestion(id) {
+  const res = await fetch(`/api/tag-history/${id}/clear`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+// Bulk counterparts — one request for the whole list instead of one per id (which an
+// uncapped pending-suggestions list could turn into thousands of round trips for a
+// single "Accept all"/"Dismiss all"/"Clear list" tap).
+async function bulkTagHistoryAction(action, ids) {
+  const res = await fetch(`/api/tag-history/bulk-${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+export const acceptSuggestions = (ids) => bulkTagHistoryAction('accept', ids);
+export const dismissSuggestions = (ids) => bulkTagHistoryAction('dismiss', ids);
+export const clearSuggestions = (ids) => bulkTagHistoryAction('clear', ids);
 
 // The broader, explicit-opt-in sibling of dismiss — "stop suggesting this tag for this
 // sender at all", not just "wrong for this one email". A separate user choice, not

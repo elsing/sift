@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,8 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/emersion/go-imap/v2/imapclient"
 	"golang.org/x/net/html"
 )
 
@@ -25,33 +26,23 @@ func (s *Store) ImageCacheRoutes(mux *http.ServeMux, ownerSubject func(*http.Req
 	mux.HandleFunc("GET /api/image-cache/backfill", func(w http.ResponseWriter, r *http.Request) {
 		s.handleBackfillImageCache(w, r, ownerSubject(r))
 	})
+	mux.HandleFunc("POST /api/image-cache/backfill/cancel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelOwnerJob(w, r, ownerSubject(r), "image-backfill")
+	})
 }
 
-// handleBackfillImageCache streams progress over SSE the same way handleScanTags/
-// handleSearch do — walking every already-cached mail within the retention window and
-// fetching its images is a multi-IMAP-round-trip operation that can take a while.
+// handleBackfillImageCache is job-backed (handleOwnerJobSSE, scanjobs.go) — walking
+// every already-cached mail within the retention window across every account and
+// fetching its images is real, multi-IMAP-round-trip work that can take a while,
+// easily long enough to outlast one SSE connection.
 func (s *Store) handleBackfillImageCache(w http.ResponseWriter, r *http.Request, owner string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	sendEvent := func(event string, data any) {
-		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
-		flusher.Flush()
-	}
-
-	cached, err := s.backfillImageCache(r.Context(), owner, func(done, total int) {
-		sendEvent("progress", map[string]int{"done": done, "total": total})
+	s.handleOwnerJobSSE(w, r, owner, "image-backfill", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
+		cached, err := s.backfillImageCache(ctx, owner, onProgress)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]int{"imagesCached": cached}, nil
 	})
-	if err != nil {
-		sendEvent("error", map[string]string{"message": err.Error()})
-		return
-	}
-	sendEvent("complete", map[string]int{"imagesCached": cached})
 }
 
 // imageBackfillMaxDays hard-caps how far back the backfill ever looks, regardless of
@@ -123,24 +114,31 @@ func (s *Store) backfillImageCache(ctx context.Context, ownerSubject string, pro
 	}
 
 	imagesCached := 0
+	var cacheMu sync.Mutex // onMail now runs concurrently (folderwalk.go) — the counter isn't safe without this
 	foldersDone := 0
 	for _, w := range work {
-		err := s.walkAccountFolders(ctx, w.acct, w.password, w.acct.ID, w.folders, scanFolderLimit, func(m Mail, folder string) {
+		// Folders are date-ordered newest-first, so the first message outside the
+		// retention window means nothing older in this folder is relevant either —
+		// this filter rejecting one stops the whole folder (see walkAccountFolders'
+		// own comment), not just that message. A busy folder with more than one
+		// page's worth of mail *inside* the window still needs every page up to that
+		// point, which capping at one page used to cut short.
+		withinRetention := func(m Mail) bool {
 			t, err := time.Parse(time.RFC3339, m.Date)
-			if err != nil || t.Before(cutoff) {
-				return
-			}
-			body, err := withTimeout(imapOpTimeout, func() (MailBody, error) {
-				return fetchMailBody(w.acct, w.password, folder, m.UID)
-			})
-			if err != nil || body.HTML == "" {
-				return
+			return err == nil && !t.Before(cutoff)
+		}
+		err := s.walkAccountFolders(ctx, w.acct, w.password, w.acct.ID, w.folders, scanFolderLimit, true, withinRetention, func(c *imapclient.Client, m Mail, body MailBody, folder string) bool {
+			if body.HTML == "" {
+				return true
 			}
 			for _, src := range extractImageSrcs(body.HTML) {
 				if _, err := s.cachedOrFetchImage(src, true); err == nil {
+					cacheMu.Lock()
 					imagesCached++
+					cacheMu.Unlock()
 				}
 			}
+			return true
 		}, func(done, _ int) {
 			progress(foldersDone+done, totalFolders)
 		})
@@ -322,19 +320,64 @@ func (s *Store) prefetchMailImages(acct dbAccount, password string, mails []Mail
 		s.ensureSpamFolderRule(acct.ID, spamTagID)
 	}
 	mode := s.ownerSpamMode(ownerSubject)
+	tagMode := s.ownerAutoTagMode(ownerSubject)
 
 	for _, m := range mails {
 		body, err := fetchMailBody(acct, password, m.Folder, m.UID)
 		if err != nil {
 			continue
 		}
+		// The inbox row's snippet preview — mailsFromFetch (imap.go) never had one
+		// (envelope-only, no body fetch there), so every real mail's snippet sat
+		// permanently blank. This is already fetching the full body for every new
+		// mail anyway (spam scoring, image extraction below), so deriving one here is
+		// free — no extra IMAP round trip.
+		s.db.Exec("UPDATE mails SET snippet = $1 WHERE id = $2", snippetFromBody(body, 200), m.ID)
+		bodyTokens := tokenizeBody(bodyPlainText(body))
 
 		if m.MessageID != "" && m.SenderEmail != "" {
-			score, reasons := s.scoreSpam(ownerSubject, spamTagID, m, body)
+			// The live new-mail sync (evaluateNewMailForSmartTags) already ran this same
+			// scoring with no body, so it can apply/suggest fast without waiting on this
+			// background fetch — this re-run is what gives bodyProfileRatio (the tag's
+			// own word profile) something to actually compare against for live mail, not
+			// just scan-time mail. Existing/alreadySuggested guards inside it mean this
+			// never double-logs whatever the fast pass already decided.
+			s.evaluateOneMailForSmartTags(ownerSubject, acct.ID, tagMode, m, bodyTokens)
+			score, reasons, spf, dkim, dmarc := s.scoreSpam(ownerSubject, spamTagID, m, body)
 			// Stored for every scored mail, not just ones that clear the suggest
 			// threshold — read back by the reader's bottom-of-mail diagnostic readout
 			// (mails.go), so a low-scoring mail still has something to show.
-			s.recordSpamFlags(m.MessageID, ownerSubject, score, reasons, body)
+			s.recordSpamFlags(m.MessageID, ownerSubject, m.SenderEmail, score, reasons, spf, dkim, dmarc)
+			// This runs on every sync, for every mail in the batch — a mail that gets a
+			// fresh UID without genuinely being new (auto-move, a folder rule, anything
+			// else outside this sync) can reach this path more than once for the same
+			// underlying message. Unlike scanAccountForSpam (which has had this guard all
+			// along), this path had no "already decided" check at all — a mail the user
+			// had explicitly dismissed got rescored and re-suggested on the very next
+			// sync that happened to touch it.
+			var alreadyDecided, alreadySuggested bool
+			s.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM message_tags WHERE message_id = $1 AND tag_id = $2) OR EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'dismissed'), EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'suggested')",
+				m.MessageID, spamTagID,
+			).Scan(&alreadyDecided, &alreadySuggested)
+			if alreadyDecided {
+				continue
+			}
+			if alreadySuggested {
+				// Same gap as scanAccountForSpam's own fix — a pending suggestion isn't a
+				// decision, and this path rescoring the same mail lower (sender history
+				// catching up, a temperror that resolved, anything else) means the original
+				// suggestion no longer holds. This is the only other place mail actually
+				// gets rescored after being suggested (besides an explicit "Scan for spam"
+				// run), so it needs the identical retraction, not just the same guard.
+				if score < spamSuggestScore {
+					s.db.Exec(
+						"DELETE FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'suggested'",
+						m.MessageID, spamTagID,
+					)
+				}
+				continue
+			}
 			if score >= spamSuggestScore {
 				status := "suggested"
 				// Review means review — a high score never overrides the mode on its own.
@@ -343,7 +386,7 @@ func (s *Store) prefetchMailImages(acct dbAccount, password string, mails []Mail
 					s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, spamTagID)
 					s.ensureSpamFolderRule(acct.ID, spamTagID)
 				}
-				s.recordTagHistory(ownerSubject, acct.ID, m.MessageID, spamTagID, m.SenderEmail, m.Subject, "spam_engine", status, &score)
+				s.recordTagHistory(ownerSubject, acct.ID, m.MessageID, spamTagID, m.SenderEmail, m.Subject, "spam_engine", status, &score, tokenizeBody(bodyPlainText(body)))
 				if status == "applied" {
 					// Flagged mail shouldn't have its images warmed into the persistent
 					// cache ahead of time — see imageproxy's cacheable handling for the
@@ -459,9 +502,21 @@ func (s *Store) maybeCleanupImageCache() {
 }
 
 // rejectPrivateHost resolves hostname and rejects it if any resolved address is
-// private, loopback, link-local, or otherwise not a normal public address.
+// private, loopback, link-local, or otherwise not a normal public address. This is the
+// only DNS lookup Sift itself performs (every auth check elsewhere — SPF/DKIM/DMARC —
+// reads a verdict the mail server already computed, nothing here to retry) — retried
+// up to 3 times since a single resolver hiccup shouldn't permanently block an image
+// that would resolve fine a moment later.
 func rejectPrivateHost(hostname string) error {
-	ips, err := net.LookupIP(hostname)
+	var ips []net.IP
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		ips, err = net.LookupIP(hostname)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", hostname, err)
 	}

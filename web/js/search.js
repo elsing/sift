@@ -179,12 +179,13 @@ function openSearch() {
   }
   input.value = '';
   fromInput.value = '';
-  // A blank date range looked like something had gone wrong rather than "no filter
-  // set yet" — defaulting to the last month gives it an obviously-intentional
-  // starting point instead, one tap away from being changed or cleared entirely.
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-  sinceInput.value = oneMonthAgo.toISOString().slice(0, 10);
+  // Genuinely blank, not defaulted to "last month" — that default used to apply
+  // silently on every search (the Advanced filters panel holding this field starts
+  // collapsed, so there was nothing on screen to suggest a date range was narrowing
+  // results at all), which made a real match outside the rolling window look like
+  // search just didn't work. Search means search everything unless you deliberately
+  // open Advanced filters and say otherwise.
+  sinceInput.value = '';
   beforeInput.value = '';
   chosenFolders.clear();
   folderPickerToggle.textContent = 'Choose folders…';

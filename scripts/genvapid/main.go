@@ -1,4 +1,4 @@
-// ponytail: one-shot CLI for setup-env.sh, not part of the server build. Prints
+// One-shot CLI for setup-env.sh, not part of the server build. Prints
 // "<public> <private>" on one line so the shell script can read both with one call.
 package main
 

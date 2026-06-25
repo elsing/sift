@@ -850,4 +850,58 @@ export function setupFolderManager() {
       accountPicker.appendChild(btn);
     }
   });
+
+  const cleanupBtn = document.getElementById('cleanupDuplicateFoldersBtn');
+  const cleanupProgress = document.getElementById('cleanupDuplicatesProgress');
+  const cleanupProgressFill = document.getElementById('cleanupDuplicatesProgressFill');
+  const cleanupProgressText = document.getElementById('cleanupDuplicatesProgressText');
+
+  function runCleanupDuplicates() {
+    cleanupBtn.disabled = true;
+    cleanupProgress.classList.remove('hidden');
+    cleanupProgressFill.style.width = '0%';
+    cleanupProgressText.textContent = 'Finding affected mail…';
+    const source = new EventSource('/api/folders/cleanup-duplicates');
+    const finish = () => {
+      source.close();
+      cleanupBtn.disabled = false;
+    };
+    source.addEventListener('progress', (e) => {
+      const { done, total } = JSON.parse(e.data);
+      cleanupProgressFill.style.width = (total ? Math.round((done / total) * 100) : 100) + '%';
+      cleanupProgressText.textContent = `Checked ${done} of ${total}…`;
+    });
+    source.addEventListener('complete', (e) => {
+      const { messagesChecked, ghostRowsRemoved } = JSON.parse(e.data);
+      cleanupProgressFill.style.width = '100%';
+      cleanupProgressText.textContent = messagesChecked === 0
+        ? 'Nothing to clean up — no duplicates found.'
+        : `Checked ${messagesChecked} mail — removed ${ghostRowsRemoved} stale ${ghostRowsRemoved === 1 ? 'copy' : 'copies'}.`;
+      finish();
+    });
+    // Fires both for a real failure and for EventSource's own auto-retry attempts — a
+    // dropped connection isn't the same as the job failing (it runs server-side on its
+    // own lifetime now, independent of this one connection, see handleOwnerJobSSE's own
+    // comment, scanjobs.go) — CONNECTING means the browser's about to retry on its own,
+    // which just needs waiting out, not treating as final.
+    source.addEventListener('error', () => {
+      if (source.readyState === EventSource.CONNECTING) {
+        cleanupProgressText.textContent = 'Reconnecting…';
+        return;
+      }
+      cleanupProgressText.textContent = "Didn't finish — try again.";
+      finish();
+    });
+  }
+
+  cleanupBtn.addEventListener('click', () => {
+    errorEl.textContent = '';
+    runCleanupDuplicates();
+  });
+
+  // Reattaches if a previous page load started this and reloaded/navigated away —
+  // the job keeps running server-side regardless.
+  fetch('/api/scan-jobs/running?kind=cleanup-duplicate-folders').then((res) => {
+    if (res.status === 200) runCleanupDuplicates();
+  }).catch(() => {});
 }

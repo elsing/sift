@@ -1,6 +1,5 @@
-// Package api serves the mock inbox data for Phase 1. There is no real mail
-// source yet — Archive/Delete/Refresh just mutate a Postgres table seeded
-// with fake data. Real IMAP/Gmail integration is a later phase.
+// Package api is the HTTP server: account/IMAP management, mail listing and actions,
+// search, smart tagging, and spam detection.
 package api
 
 import (
@@ -11,13 +10,29 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
+// demoMailEnabled gates the seeded fake inbox (senders/subjects/snippets below) shown
+// before any real account is connected — off by default. A first-time visitor (or
+// anyone testing a fresh deployment) seeing a populated-looking inbox full of mail
+// that isn't real, with no visual distinction from genuine synced mail, is more
+// confusing than a plain empty state ever was.
+func demoMailEnabled() bool {
+	return os.Getenv("DEMO_MAIL") == "1"
+}
+
 const pageSize = 30
+
+// ponytail: global lock, per-account locks if needed
+var (
+	autoSyncMu   sync.Mutex
+	lastAutoSync time.Time
+)
 
 type Mail struct {
 	ID             string `json:"id"`
@@ -87,6 +102,13 @@ type Store struct {
 	// new arrival.
 	selfMovedIntoInboxMu sync.Mutex
 	selfMovedIntoInboxAt map[string]time.Time
+
+	// scanJobCancels lets the explicit "Cancel scan" action stop a job that's running
+	// on a server-lifetime context (runScanJob, smarttags.go) — closing the SSE
+	// connection that started it no longer cancels anything, since the whole point of
+	// scan_jobs is that the job outlives that one connection.
+	scanJobMu      sync.Mutex
+	scanJobCancels map[string]context.CancelFunc
 }
 
 // NewStore assumes db.Migrate has already been run by the caller.
@@ -99,6 +121,14 @@ func NewStore(db *sql.DB) (*Store, error) {
 		db: db, crypto: crypto, broadcaster: newBroadcaster(), oauthStates: newOAuthStateStore(),
 		watchCancels:         make(map[string]context.CancelFunc),
 		selfMovedIntoInboxAt: make(map[string]time.Time),
+		scanJobCancels:       make(map[string]context.CancelFunc),
+	}
+	// Nothing in this fresh process is actually running any job a previous process left
+	// marked 'running' — there's no resume logic (deliberately: a scan is user-triggered
+	// and cheap to just restart by hand), so the honest state for those is "interrupted",
+	// not "still running" forever.
+	if _, err := db.Exec("UPDATE scan_jobs SET status = 'interrupted', updated_at = now() WHERE status = 'running'"); err != nil {
+		log.Printf("mark interrupted scan jobs: %v", err)
 	}
 
 	hasAccounts, err := s.hasAccounts()
@@ -106,11 +136,7 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("check accounts: %w", err)
 	}
 	if hasAccounts {
-		// a real account exists now; purge any mock rows seeded before it was added
-		// (account_id is only ever NULL for mock data, never for real IMAP-synced mail)
-		if _, err := db.Exec("DELETE FROM mails WHERE account_id IS NULL"); err != nil {
-			return nil, fmt.Errorf("clean up mock mail: %w", err)
-		}
+		s.cleanupMockMail()
 		return s, nil
 	}
 
@@ -118,12 +144,27 @@ func NewStore(db *sql.DB) (*Store, error) {
 	if err := db.QueryRow("SELECT count(*) FROM mails").Scan(&count); err != nil {
 		return nil, fmt.Errorf("count mails: %w", err)
 	}
-	if count == 0 {
+	if count == 0 && demoMailEnabled() {
 		if err := s.reseed(); err != nil {
 			return nil, fmt.Errorf("seed mails: %w", err)
 		}
 	}
 	return s, nil
+}
+
+// cleanupMockMail purges the seeded demo rows (account_id is only ever NULL for mock
+// data, never for real IMAP-synced mail) once a real account exists to show instead.
+// Originally only ran once, at NewStore startup — which covered a fresh deployment's
+// very first account being added before the server next restarted, but missed every
+// account added afterward on an already-running server (a manual add, an OAuth
+// connect, or a backup import), since the server is never restarted as part of those.
+// On a brand-new deployment that's exactly the common case: connect an account (or
+// restore a backup) right after first boot, with no restart in between, and the demo
+// mail seeded at that first boot sat there forever.
+func (s *Store) cleanupMockMail() {
+	if _, err := s.db.Exec("DELETE FROM mails WHERE account_id IS NULL"); err != nil {
+		log.Printf("clean up mock mail: %v", err)
+	}
 }
 
 func (s *Store) reseed() error {
@@ -223,13 +264,21 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	// has no mail," not "the cache is broken," and resyncing every account regardless
 	// of the filter would be pointless work.
 	if firstPage && len(mails) == 0 && len(accountIDs) == 0 {
-		if _, err := s.db.Exec("UPDATE accounts SET oldest_synced_uid = NULL"); err != nil {
-			log.Printf("reset backfill progress: %v", err)
+		autoSyncMu.Lock()
+		shouldSync := time.Since(lastAutoSync) > 30*time.Second
+		if shouldSync {
+			lastAutoSync = time.Now()
 		}
-		if err := s.syncAllAccounts(); err != nil {
-			log.Printf("auto-sync: %v", err)
-		} else if refreshed, err := s.list(pageSize, accountIDs, before, beforeID); err == nil {
-			mails = refreshed
+		autoSyncMu.Unlock()
+		if shouldSync {
+			if _, err := s.db.Exec("UPDATE accounts SET oldest_synced_uid = NULL"); err != nil {
+				log.Printf("reset backfill progress: %v", err)
+			}
+			if err := s.syncAllAccounts(); err != nil {
+				log.Printf("auto-sync: %v", err)
+			} else if refreshed, err := s.list(pageSize, accountIDs, before, beforeID); err == nil {
+				mails = refreshed
+			}
 		}
 	}
 	if len(mails) < pageSize {
@@ -378,9 +427,11 @@ func (s *Store) handleRefresh(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-	} else if err := s.reseed(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	} else if demoMailEnabled() {
+		if err := s.reseed(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	mails, err := s.list(pageSize, accountFilter(r), "", "")
 	if err != nil {

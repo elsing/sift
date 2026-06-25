@@ -16,6 +16,7 @@ import (
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 type dbAccount struct {
@@ -62,6 +63,12 @@ func (s *Store) AccountsRoutes(mux *http.ServeMux, ownerSubject func(*http.Reque
 	mux.HandleFunc("DELETE /api/accounts/{id}/folders", s.handleDeleteFolder)
 	mux.HandleFunc("GET /api/accounts/{id}/folder-mails", s.handleFolderMails)
 	mux.HandleFunc("PUT /api/accounts/{id}/expanded-folders", s.handleSetExpandedFolders)
+	mux.HandleFunc("GET /api/folders/cleanup-duplicates", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCleanupDuplicateFolderCache(w, r, ownerSubject(r))
+	})
+	mux.HandleFunc("POST /api/folders/cleanup-duplicates/cancel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelOwnerJob(w, r, ownerSubject(r), "cleanup-duplicate-folders")
+	})
 }
 
 // isDryRun reports whether the request asked to simulate a mutation rather than perform it.
@@ -211,6 +218,7 @@ func (s *Store) handleAddAccount(w http.ResponseWriter, r *http.Request, owner s
 	if _, trash, _, err := s.resolveFolders(id); err == nil {
 		out.TrashFolder = trash
 	}
+	s.cleanupMockMail()
 	s.watchAccount(id)
 	writeJSON(w, out)
 }
@@ -351,8 +359,12 @@ func (s *Store) syncAllFolderMail(ctx context.Context) {
 			continue
 		}
 		// walkAccountFolders upserts every mail it finds into the DB itself — nothing
-		// extra to do per mail here, this loop just needs to run.
-		if err := s.walkAccountFolders(ctx, acct, password, id, names, folderMailSyncLimit, func(Mail, string) {}, nil); err != nil {
+		// extra to do per mail here, this loop just needs to run. Stops after the first
+		// page (onMail returns false) — this runs every folderCheckInterval forever, so
+		// re-walking a folder's entire history on every tick just to keep "recent" fresh
+		// would be enormously wasteful; full-history callers (the scans, the image
+		// backfill) opt into that explicitly by returning true instead.
+		if err := s.walkAccountFolders(ctx, acct, password, id, names, folderMailSyncLimit, false, nil, func(*imapclient.Client, Mail, MailBody, string) bool { return false }, nil); err != nil {
 			log.Printf("folder mail sync %s: %v", acct.Email, err)
 		}
 	}
@@ -739,6 +751,108 @@ func (s *Store) syncAccount(accountID string) ([]Mail, error) {
 	return mails, nil
 }
 
+// handleCleanupDuplicateFolderCache is the one-off catch-up for a structural gap:
+// mails.id encodes account|folder|uid, so a message moved between folders by anything
+// other than Sift's own move action (the user's own mail client, webmail, a
+// server-side rule) leaves a stale "ghost" row behind under its old folder — the
+// upsert recording its new location never touches the old id. upsertMails now cleans
+// this up going forward for anything it re-fetches; this is the retroactive fix for
+// ghosts that already exist. There's no "last synced" timestamp on mails to tell which
+// of two candidate rows is current, so each affected message gets checked live over
+// IMAP — the only reliable source of truth — and whichever cached copy is confirmed
+// gone from its folder gets removed. A copy that can't be confirmed either way (a
+// lookup failure) is left alone rather than risking deleting a real one.
+// Job-backed (handleOwnerJobSSE, scanjobs.go) — a real backlog here means hundreds of
+// live IMAP lookups, easily slow enough to need persistence and progress, not a single
+// connection that dies the moment a tab closes or a deploy restarts the server.
+func (s *Store) handleCleanupDuplicateFolderCache(w http.ResponseWriter, r *http.Request, owner string) {
+	s.handleOwnerJobSSE(w, r, owner, "cleanup-duplicate-folders", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
+		return s.cleanupDuplicateFolderCache(ctx, owner, onProgress)
+	})
+}
+
+func (s *Store) cleanupDuplicateFolderCache(ctx context.Context, owner string, onProgress func(done, total int)) (any, error) {
+	rows, err := s.db.Query(`
+		SELECT m.message_id, m.account_id
+		FROM mails m
+		JOIN accounts a ON a.id = m.account_id
+		WHERE a.owner_subject = $1 AND m.message_id IS NOT NULL AND m.message_id != ''
+		GROUP BY m.message_id, m.account_id
+		HAVING count(DISTINCT m.folder) > 1`,
+		owner,
+	)
+	if err != nil {
+		return nil, err
+	}
+	type candidate struct{ messageID, accountID string }
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if rows.Scan(&c.messageID, &c.accountID) == nil {
+			candidates = append(candidates, c)
+		}
+	}
+	rows.Close()
+
+	type acctCreds struct {
+		acct     dbAccount
+		password string
+	}
+	credsCache := map[string]acctCreds{}
+
+	removed := 0
+	for i, c := range candidates {
+		if ctx.Err() != nil {
+			break // job cancelled, or the server's shutting down — stop burning IMAP round trips
+		}
+		creds, ok := credsCache[c.accountID]
+		if !ok {
+			acct, password, err := s.loadAccountCreds(c.accountID)
+			if err != nil {
+				if onProgress != nil {
+					onProgress(i+1, len(candidates))
+				}
+				continue
+			}
+			creds = acctCreds{acct, password}
+			credsCache[c.accountID] = creds
+		}
+
+		folderRows, err := s.db.Query("SELECT id, folder FROM mails WHERE account_id = $1 AND message_id = $2", c.accountID, c.messageID)
+		if err != nil {
+			if onProgress != nil {
+				onProgress(i+1, len(candidates))
+			}
+			continue
+		}
+		type cached struct{ id, folder string }
+		var cachedRows []cached
+		for folderRows.Next() {
+			var cr cached
+			if folderRows.Scan(&cr.id, &cr.folder) == nil {
+				cachedRows = append(cachedRows, cr)
+			}
+		}
+		folderRows.Close()
+
+		for _, cr := range cachedRows {
+			uid, err := findUIDByMessageID(creds.acct.Host, creds.acct.Port, creds.acct.Username, creds.password, creds.acct.OAuthProvider, cr.folder, c.messageID)
+			if err != nil {
+				continue
+			}
+			if uid == 0 {
+				if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", cr.id); err == nil {
+					removed++
+				}
+			}
+		}
+		if onProgress != nil {
+			onProgress(i+1, len(candidates))
+		}
+	}
+	return map[string]int{"messagesChecked": len(candidates), "ghostRowsRemoved": removed}, nil
+}
+
 // upsertMails inserts/updates mails for an account inside a single transaction.
 func (s *Store) upsertMails(accountID string, mails []Mail) error {
 	if len(mails) == 0 {
@@ -764,6 +878,22 @@ func (s *Store) upsertMails(accountID string, mails []Mail) error {
 		)
 		if err != nil {
 			return err
+		}
+		// id encodes account|folder|uid, so a message moved by anything other than
+		// Sift's own move action (the user's own mail client, webmail, a server-side
+		// rule) lands under a brand new id here — the ON CONFLICT above never touches
+		// the OLD row, which just sits there forever under its old folder, looking
+		// like the same mail exists in two places at once (it's really one current
+		// copy plus a stale ghost of where it used to be). Anything else cached for
+		// this account under the same Message-ID but a different id is exactly that
+		// ghost, now that this fetch has confirmed where the message actually is.
+		if m.MessageID != "" {
+			if _, err := tx.Exec(
+				"DELETE FROM mails WHERE account_id = $1 AND message_id = $2 AND id != $3",
+				accountID, m.MessageID, m.ID,
+			); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

@@ -236,6 +236,13 @@
     <button id="folderManagerNewRootBtn" type="button" class="settings-row-btn hidden">New folder</button>
     <p id="folderManagerError" class="form-error"></p>
     <div id="folderManagerTree" class="folder-tree"></div>
+    <h3 class="settings-subhead">Maintenance</h3>
+    <p class="smart-history-meta">A mail moved between folders by anything other than this app (your own mail client, webmail, a server-side rule) can leave a stale copy behind under its old folder — looking like the same mail sits in two places at once. One-off cleanup, not something you'd need to run regularly; can take a while on a large mailbox since each one gets checked for real.</p>
+    <button id="cleanupDuplicateFoldersBtn" class="settings-row-btn">Clean up duplicate folder entries</button>
+    <div id="cleanupDuplicatesProgress" class="search-progress hidden">
+      <div class="search-progress-bar"><div id="cleanupDuplicatesProgressFill" class="search-progress-fill"></div></div>
+      <p id="cleanupDuplicatesProgressText" class="search-progress-text"></p>
+    </div>
     <button id="closeFolderManagerBtn" class="close-panel-btn">Close</button>
   </div>
 
@@ -271,8 +278,16 @@
     <button id="runAutoMoveBtn" class="settings-row-btn">Move tagged mail now</button>
     <ul id="autoMoveResults"></ul>
     <p id="smartTaggingSettingsError" class="form-error"></p>
+    <h3 class="settings-subhead">Word profile weighting</h3>
+    <p class="smart-history-meta">
+      Each tag (and Spam) builds a "signature" of the words common in its own past mail, rebuilt every time you run a scan.
+      <strong>Plain</strong>: weight a word by how often it shows up in this tag's own mail.
+      <strong>Distinctive</strong>: also weight down words that show up across most of your other tags too — slower to rebuild, sharper at telling similar tags apart.
+    </p>
+    <div id="wordProfileWeightingOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Bootstrap from existing mail</h3>
     <div id="scanScopeOptions" class="theme-options"></div>
+    <p id="scanChosenFoldersSummary" class="smart-history-meta"></p>
     <button id="scanForTagsBtn" class="settings-row-btn">Scan for tags</button>
     <div id="scanAccountPicker"></div>
     <div id="scanProgress" class="search-progress hidden">
@@ -289,6 +304,7 @@
     <div class="suggestion-bulk-actions">
       <button id="acceptAllSuggestionsBtn" type="button" class="settings-row-btn hidden">Accept all</button>
       <button id="dismissAllSuggestionsBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
+      <button id="clearAllSuggestionsBtn" type="button" class="settings-row-btn hidden">Clear list</button>
     </div>
     <ul id="smartTaggingSuggestions" class="accounts-list"></ul>
     <button id="historyToggleBtn" type="button" class="search-advanced-toggle">History ▾</button>
@@ -309,13 +325,24 @@
       <strong>Review</strong> queues a flagged mail as a suggestion below; <strong>Full-auto</strong> applies the Spam tag and moves it to Junk without waiting for you. Review is the safer default — a spam false positive burying real mail is worse than a missed suggestion.
     </p>
     <div id="spamModeOptions" class="theme-options"></div>
+    <h3 class="settings-subhead">Word profile weighting</h3>
+    <p class="smart-history-meta">
+      Spam builds a "signature" of the words common in mail you've flagged as spam, rebuilt every time you run a scan — same mechanism Smart tagging uses for its own tags, and the same setting (changing it here changes it there too).
+      <strong>Plain</strong>: weight a word by how often it shows up in flagged mail.
+      <strong>Distinctive</strong>: also weight down words that show up across most of your other tags too — slower to rebuild, sharper at telling spam apart from a tag with similar wording.
+    </p>
+    <div id="spamWordProfileWeightingOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Restore wrongly-flagged mail</h3>
     <p class="smart-history-meta">Dismissing a suggestion or undoing a full-auto decision now also moves the mail back to your inbox if it's sitting in Junk — but anything you dismissed before that existed is still stuck there. One-off catch-up, not something you'd need to run more than once.</p>
     <button id="restoreStrandedSpamBtn" class="settings-row-btn">Restore mail stuck in Junk from past dismissals</button>
     <p id="restoreStrandedSpamStatus" class="smart-history-meta"></p>
+    <p class="smart-history-meta">A mail sitting in Junk for any unrelated reason can get tagged Spam automatically (and re-confirmed on every scan) without you ever actually deciding that — this undoes any such tag that was never backed by a real accept, manual apply, or confident auto-apply.</p>
+    <button id="cleanupUnconfirmedSpamBtn" class="settings-row-btn">Undo Spam tags nothing actually decided</button>
+    <p id="cleanupUnconfirmedSpamStatus" class="smart-history-meta"></p>
     <h3 class="settings-subhead">Scan existing mail for spam</h3>
     <p class="smart-history-meta">Retroactively scores mail already sitting in your mailbox — useful for anything that arrived before this existed. Junk/Trash mail is used as training data instead of being re-scored.</p>
     <div id="spamScanScopeOptions" class="theme-options"></div>
+    <p id="spamScanChosenFoldersSummary" class="smart-history-meta"></p>
     <button id="scanForSpamBtn" class="settings-row-btn">Scan for spam</button>
     <div id="spamScanAccountPicker"></div>
     <div id="spamBootstrapProgress" class="search-progress hidden">
@@ -329,6 +356,7 @@
     <div class="suggestion-bulk-actions">
       <button id="acceptAllSpamBtn" type="button" class="settings-row-btn hidden">Accept all</button>
       <button id="dismissAllSpamBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
+      <button id="clearAllSpamBtn" type="button" class="settings-row-btn hidden">Clear list</button>
     </div>
     <ul id="smartSpamSuggestions" class="accounts-list"></ul>
     <button id="closeSmartSpamBtn" class="close-panel-btn">Close</button>

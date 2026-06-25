@@ -3,7 +3,7 @@
 // concepts with different tag sets, just the same "full-auto did this, here's undo"
 // shape). Split out on its own panel so this one thing full-auto mode actually needs
 // doesn't get buried at the bottom of the Smart Tagging/Smart Spam settings pages.
-import { fetchTagHistory, undoTagHistory } from './tags.js';
+import { fetchTagHistory, undoTagHistory, undoTagHistories } from './tags.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
 import { withBusyButton } from './util.js';
 
@@ -88,7 +88,7 @@ function renderGroup(senderEmail, entries) {
   undoGroup.addEventListener('click', async () => {
     errorEl.textContent = '';
     try {
-      await withBusyButton(undoGroup, '…', () => Promise.all(entries.map((e) => undoTagHistory(e.id))));
+      await withBusyButton(undoGroup, '…', () => undoTagHistories(entries.map((e) => e.id)));
     } catch (err) {
       errorEl.textContent = err.message;
       return;
