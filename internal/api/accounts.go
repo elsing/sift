@@ -962,7 +962,7 @@ func (s *Store) moveMailToFolder(mailID, destFolder string) error {
 	if destFolder == "INBOX" {
 		s.markSelfMovedIntoInbox(*accountID)
 	}
-	s.applyFolderTagRule(*accountID, destFolder, messageID)
+	s.applyFolderTagRule(*accountID, destFolder, messageID, "folder_rule")
 	return nil
 }
 

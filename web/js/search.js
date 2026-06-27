@@ -1,4 +1,4 @@
-import { currentFolder, openFolder } from './inbox.js';
+import { currentFolder, openFolder, getSwipeConfig, SWIPE_ACTIONS, attachSwipe } from './inbox.js';
 import { getSelectedAccountIds } from './accountFilter.js';
 import { openMailReaderById, setReaderBack } from './reader.js';
 import { pickFolders } from './folders.js';
@@ -201,6 +201,13 @@ function openSearch() {
   updateAccountScopeLabel();
 }
 
+export function openSearchFrom(email) {
+  openSearch();
+  fromInput.value = email;
+  advancedPanel.classList.remove('hidden');
+  advancedToggle.textContent = 'Advanced filters ▴';
+}
+
 function closeSearch() {
   stopSearch();
   panel.classList.add('hidden');
@@ -362,10 +369,18 @@ function startSearch(mode, resumeToken) {
 
 function renderResults(mails) {
   results.innerHTML = '';
+  const { left, right } = getSwipeConfig();
+  const leftMeta = SWIPE_ACTIONS[left];
+  const rightMeta = SWIPE_ACTIONS[right];
   for (const mail of mails) {
     const li = document.createElement('li');
     li.className = 'row search-result-row' + (mail.unread ? ' unread' : '');
+    li.dataset.id = mail.id;
+    li.dataset.accountId = mail.accountId || '';
     li.innerHTML = `
+      <div class="row-action right-swipe" style="background: var(${rightMeta.colorVar})">${rightMeta.label}</div>
+      <div class="row-action left-swipe" style="background: var(${leftMeta.colorVar})">${leftMeta.label}</div>
+      <div class="row-burst"></div>
       <div class="row-content">
         <div class="unread-dot"></div>
         <div class="row-text">
@@ -376,7 +391,7 @@ function renderResults(mails) {
         <div class="timestamp">${mail.hasAttachments ? '<span class="attachment-clip" title="Has attachments">📎</span>' : ''}${mail.time}</div>
       </div>
     `;
-    li.addEventListener('click', () => {
+    li.querySelector('.row-content').addEventListener('click', () => {
       closeSearch(); // hides the panel only — doesn't clear the results list underneath
       // land in the mail's actual folder (not a reader floating with no context) so
       // swipe actions behave the same as if you'd browsed there normally
@@ -385,6 +400,7 @@ function renderResults(mails) {
       // Back goes to the search results you came from, not the folder it landed you in
       setReaderBack(() => panel.classList.remove('hidden'));
     });
+    attachSwipe(li);
     results.appendChild(li);
   }
   // scrollIntoView checks visibility against the panel's own (unshrunk, full-layout-

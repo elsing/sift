@@ -692,7 +692,12 @@ button:active { transform: scale(0.9); opacity: 0.8; }
    a real flex layout removes the ambiguity instead of fighting it again: the header is
    a normal, non-scrolling flex item, and .mail-reader-scroll below is the only thing
    that actually scrolls. */
-.mail-reader-panel { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+/* Mail reader appears over the full screen immediately — the slide-in bounce the other
+   panels use means buttons are mid-animation when the user first tries to tap them.
+   Plain opacity fade instead so the panel is at its final position from frame one. */
+.mail-reader-panel { display: flex; flex-direction: column; padding: 0; overflow: hidden;
+  transition: opacity 0.15s ease, background-color 0.25s ease; }
+.mail-reader-panel:not(.hidden) { transform: none; }
 .mail-reader-header {
   flex: none; z-index: 1; background: var(--bg);
   display: flex; align-items: center; gap: 8px;
@@ -805,6 +810,9 @@ button:active { transform: scale(0.9); opacity: 0.8; }
 .spam-check-auth .fail { color: var(--delete); }
 .spam-check-reasons { margin: 0; padding-left: 18px; color: var(--text-dim); font-size: 12px; }
 .spam-check-reasons li { margin-bottom: 3px; }
+.reader-find-sender { padding: 20px 0 8px; text-align: center; }
+.reader-find-sender-btn { background: none; border: 1px solid var(--border); border-radius: 999px; color: var(--text-secondary); font-size: 13px; padding: 8px 16px; cursor: pointer; }
+.reader-find-sender-btn:hover { border-color: var(--accent); color: var(--accent); }
 .mail-reader-attachments { margin-top: 12px; padding: 0; }
 .mail-reader-attachment {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -858,7 +866,7 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   letter-spacing: 0.04em; margin: 14px 0 6px;
 }
 #historySection.hidden { display: none; }
-#smartHistorySearch {
+#smartHistorySearch, #autoTagActivitySearch {
   width: 100%; background: var(--input-bg); border: 2px solid var(--border);
   border-radius: 999px; color: var(--text); padding: 8px 14px; font-size: 14px; margin-bottom: 8px;
 }
@@ -983,7 +991,14 @@ button:active { transform: scale(0.9); opacity: 0.8; }
   font-weight: 600; font-size: 14px; padding: 12px 14px; margin: 10px 0 8px;
 }
 .settings-row-btn.logout-row { color: var(--delete); border-color: var(--delete); }
+.scan-bypass-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); margin: 4px 0 2px; cursor: pointer; }
 .suggestion-bulk-actions { display: flex; gap: 8px; }
 .suggestion-bulk-actions .settings-row-btn { width: auto; flex: 1; text-align: center; }
+.spam-threshold-row { padding: 8px 0 4px; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid var(--border); }
+.spam-threshold-row label { font-size: 0.85em; color: var(--text-secondary); }
+.spam-threshold-row input[type=range] { width: 100%; accent-color: var(--accent); }
+.suggestions-count { font-size: 0.82em; color: var(--text-dim); margin: 0; }
 .settings-row-btn.active { color: var(--accent); border-color: var(--accent); }
 .settings-row-btn.hidden { display: none; }
+body:not(.settings-advanced) .advanced-only { display: none !important; }
+.settings-mode-toggle { margin-bottom: 10px; }

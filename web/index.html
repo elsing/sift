@@ -127,20 +127,23 @@
 
   <div id="settingsPanel" class="accounts-panel hidden">
     <h2>Settings</h2>
+    <div class="theme-options settings-mode-toggle">
+      <button class="theme-option" id="settingsModeBasic">Basic</button>
+      <button class="theme-option" id="settingsModeAdvanced">Advanced</button>
+    </div>
     <button id="openPersonalisationBtn" class="settings-row-btn">🎨 Personalisation</button>
     <button id="openTagsBtn" class="settings-row-btn">🏷️ Tags</button>
     <button id="openSmartTaggingBtn" class="settings-row-btn">✨ Smart tagging</button>
     <button id="openSmartSpamBtn" class="settings-row-btn">🚫 Smart spam</button>
     <button id="openFolderManagerBtn" class="settings-row-btn">📁 Manage folders</button>
     <button id="openAutoTagActivityBtn" class="settings-row-btn">🪄 Auto activity</button>
-    <button id="openBackupBtn" class="settings-row-btn">💾 Backup</button>
+    <button id="openBackupBtn" class="settings-row-btn advanced-only">💾 Backup</button>
     <h3 class="settings-subhead">Account</h3>
     <button id="accountsBtn" class="settings-row-btn">👤 Accounts</button>
     <h3 class="settings-subhead">Notifications</h3>
     <button id="enablePushBtn" class="settings-row-btn">🔔 Enable notifications</button>
     <p id="pushError" class="form-error"></p>
-    <h3 class="settings-subhead">Advanced</h3>
-    <button id="dryRunBtn" class="settings-row-btn">🧪 Dry run mode</button>
+    <button id="dryRunBtn" class="settings-row-btn advanced-only">🧪 Dry run mode</button>
     <button id="logoutBtn" class="settings-row-btn logout-row">Log out</button>
     <button id="closeSettingsBtn" class="close-panel-btn">Close</button>
   </div>
@@ -222,6 +225,7 @@
     </div>
     <p class="smart-history-meta">Every tag full-auto mode applied on its own, most recent first. Wrong call? Undo it — that also teaches it not to repeat the mistake.</p>
     <div id="autoActivitySourceOptions" class="theme-options"></div>
+    <input type="search" id="autoTagActivitySearch" class="history-search" placeholder="Search sender or subject…">
     <p id="autoTagActivityError" class="form-error"></p>
     <ul id="autoTagActivityList" class="accounts-list"></ul>
     <button id="closeAutoTagActivityBtn" class="close-panel-btn">Close</button>
@@ -236,9 +240,9 @@
     <button id="folderManagerNewRootBtn" type="button" class="settings-row-btn hidden">New folder</button>
     <p id="folderManagerError" class="form-error"></p>
     <div id="folderManagerTree" class="folder-tree"></div>
-    <h3 class="settings-subhead">Maintenance</h3>
-    <p class="smart-history-meta">A mail moved between folders by anything other than this app (your own mail client, webmail, a server-side rule) can leave a stale copy behind under its old folder — looking like the same mail sits in two places at once. One-off cleanup, not something you'd need to run regularly; can take a while on a large mailbox since each one gets checked for real.</p>
-    <button id="cleanupDuplicateFoldersBtn" class="settings-row-btn">Clean up duplicate folder entries</button>
+    <h3 class="settings-subhead advanced-only">Maintenance</h3>
+    <p class="smart-history-meta advanced-only">A mail moved between folders by anything other than this app (your own mail client, webmail, a server-side rule) can leave a stale copy behind under its old folder — looking like the same mail sits in two places at once. One-off cleanup, not something you'd need to run regularly; can take a while on a large mailbox since each one gets checked for real.</p>
+    <button id="cleanupDuplicateFoldersBtn" class="settings-row-btn advanced-only">Clean up duplicate folder entries</button>
     <div id="cleanupDuplicatesProgress" class="search-progress hidden">
       <div class="search-progress-bar"><div id="cleanupDuplicatesProgressFill" class="search-progress-fill"></div></div>
       <p id="cleanupDuplicatesProgressText" class="search-progress-text"></p>
@@ -270,6 +274,10 @@
       <strong>Full-auto</strong>: matches confident enough (built up from your own tagging history over time) apply immediately; anything less certain still only suggests, same as Review.
     </p>
     <div id="autoTagModeOptions" class="theme-options"></div>
+    <div id="tagAutoApplyThresholdContainer" class="spam-threshold-row hidden advanced-only">
+      <label for="tagAutoApplyThresholdSlider" id="tagAutoApplyThresholdLabel"></label>
+      <input type="range" id="tagAutoApplyThresholdSlider" min="40" max="95" step="5">
+    </div>
     <h3 class="settings-subhead">Auto-move tagged mail after</h3>
     <div class="auto-move-delay-row">
       <input id="autoMoveDelayInput" type="number" min="0" step="1">
@@ -278,13 +286,6 @@
     <button id="runAutoMoveBtn" class="settings-row-btn">Move tagged mail now</button>
     <ul id="autoMoveResults"></ul>
     <p id="smartTaggingSettingsError" class="form-error"></p>
-    <h3 class="settings-subhead">Word profile weighting</h3>
-    <p class="smart-history-meta">
-      Each tag (and Spam) builds a "signature" of the words common in its own past mail, rebuilt every time you run a scan.
-      <strong>Plain</strong>: weight a word by how often it shows up in this tag's own mail.
-      <strong>Distinctive</strong>: also weight down words that show up across most of your other tags too — slower to rebuild, sharper at telling similar tags apart.
-    </p>
-    <div id="wordProfileWeightingOptions" class="theme-options"></div>
     <h3 class="settings-subhead">Bootstrap from existing mail</h3>
     <div id="scanScopeOptions" class="theme-options"></div>
     <p id="scanChosenFoldersSummary" class="smart-history-meta"></p>
@@ -306,6 +307,12 @@
       <button id="dismissAllSuggestionsBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
       <button id="clearAllSuggestionsBtn" type="button" class="settings-row-btn hidden">Clear list</button>
     </div>
+    <div id="tagThresholdContainer" class="spam-threshold-row hidden">
+      <p id="tagSuggestionsTotalCount" class="suggestions-count"></p>
+      <label for="tagThresholdSlider" id="tagThresholdLabel"></label>
+      <input type="range" id="tagThresholdSlider" min="0" max="95" step="5">
+      <p id="tagSuggestionsFilteredCount" class="suggestions-count"></p>
+    </div>
     <ul id="smartTaggingSuggestions" class="accounts-list"></ul>
     <button id="historyToggleBtn" type="button" class="search-advanced-toggle">History ▾</button>
     <div id="historySection" class="hidden">
@@ -325,24 +332,25 @@
       <strong>Review</strong> queues a flagged mail as a suggestion below; <strong>Full-auto</strong> applies the Spam tag and moves it to Junk without waiting for you. Review is the safer default — a spam false positive burying real mail is worse than a missed suggestion.
     </p>
     <div id="spamModeOptions" class="theme-options"></div>
-    <h3 class="settings-subhead">Word profile weighting</h3>
-    <p class="smart-history-meta">
-      Spam builds a "signature" of the words common in mail you've flagged as spam, rebuilt every time you run a scan — same mechanism Smart tagging uses for its own tags, and the same setting (changing it here changes it there too).
-      <strong>Plain</strong>: weight a word by how often it shows up in flagged mail.
-      <strong>Distinctive</strong>: also weight down words that show up across most of your other tags too — slower to rebuild, sharper at telling spam apart from a tag with similar wording.
-    </p>
-    <div id="spamWordProfileWeightingOptions" class="theme-options"></div>
-    <h3 class="settings-subhead">Restore wrongly-flagged mail</h3>
-    <p class="smart-history-meta">Dismissing a suggestion or undoing a full-auto decision now also moves the mail back to your inbox if it's sitting in Junk — but anything you dismissed before that existed is still stuck there. One-off catch-up, not something you'd need to run more than once.</p>
-    <button id="restoreStrandedSpamBtn" class="settings-row-btn">Restore mail stuck in Junk from past dismissals</button>
+    <div id="spamAutoApplyThresholdContainer" class="spam-threshold-row hidden advanced-only">
+      <label for="spamAutoApplyThresholdSlider" id="spamAutoApplyThresholdLabel"></label>
+      <input type="range" id="spamAutoApplyThresholdSlider" min="40" max="95" step="5">
+    </div>
+    <h3 class="settings-subhead advanced-only">Restore wrongly-flagged mail</h3>
+    <p class="smart-history-meta advanced-only">Dismissing a suggestion or undoing a full-auto decision now also moves the mail back to your inbox if it's sitting in Junk — but anything you dismissed before that existed is still stuck there. One-off catch-up, not something you'd need to run more than once.</p>
+    <button id="restoreStrandedSpamBtn" class="settings-row-btn advanced-only">Restore mail stuck in Junk from past dismissals</button>
     <p id="restoreStrandedSpamStatus" class="smart-history-meta"></p>
-    <p class="smart-history-meta">A mail sitting in Junk for any unrelated reason can get tagged Spam automatically (and re-confirmed on every scan) without you ever actually deciding that — this undoes any such tag that was never backed by a real accept, manual apply, or confident auto-apply.</p>
-    <button id="cleanupUnconfirmedSpamBtn" class="settings-row-btn">Undo Spam tags nothing actually decided</button>
+    <p class="smart-history-meta advanced-only">A mail sitting in Junk for any unrelated reason can get tagged Spam automatically (and re-confirmed on every scan) without you ever actually deciding that — this undoes any such tag that was never backed by a real accept, manual apply, or confident auto-apply.</p>
+    <button id="cleanupUnconfirmedSpamBtn" class="settings-row-btn advanced-only">Undo Spam tags nothing actually decided</button>
     <p id="cleanupUnconfirmedSpamStatus" class="smart-history-meta"></p>
     <h3 class="settings-subhead">Scan existing mail for spam</h3>
     <p class="smart-history-meta">Retroactively scores mail already sitting in your mailbox — useful for anything that arrived before this existed. Junk/Trash mail is used as training data instead of being re-scored.</p>
     <div id="spamScanScopeOptions" class="theme-options"></div>
     <p id="spamScanChosenFoldersSummary" class="smart-history-meta"></p>
+    <label class="scan-bypass-row">
+      <input type="checkbox" id="spamBypassDecisionsCheck">
+      Re-scan previously dismissed mail
+    </label>
     <button id="scanForSpamBtn" class="settings-row-btn">Scan for spam</button>
     <div id="spamScanAccountPicker"></div>
     <div id="spamBootstrapProgress" class="search-progress hidden">
@@ -357,6 +365,12 @@
       <button id="acceptAllSpamBtn" type="button" class="settings-row-btn hidden">Accept all</button>
       <button id="dismissAllSpamBtn" type="button" class="settings-row-btn logout-row hidden">Dismiss all</button>
       <button id="clearAllSpamBtn" type="button" class="settings-row-btn hidden">Clear list</button>
+    </div>
+    <div id="spamThresholdContainer" class="spam-threshold-row hidden">
+      <p id="spamSuggestionsTotalCount" class="suggestions-count"></p>
+      <label for="spamThresholdSlider" id="spamThresholdLabel"></label>
+      <input type="range" id="spamThresholdSlider" min="0" max="95" step="5">
+      <p id="spamSuggestionsFilteredCount" class="suggestions-count"></p>
     </div>
     <ul id="smartSpamSuggestions" class="accounts-list"></ul>
     <button id="closeSmartSpamBtn" class="close-panel-btn">Close</button>
@@ -477,6 +491,9 @@
         <p id="spamCheckScore" class="spam-check-score"></p>
         <div id="spamCheckAuth" class="spam-check-auth"></div>
         <ul id="spamCheckReasons" class="spam-check-reasons"></ul>
+      </div>
+      <div class="reader-find-sender">
+        <button id="readerFindSenderBtn" class="reader-find-sender-btn hidden">Search emails from this sender</button>
       </div>
     </div>
   </div>

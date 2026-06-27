@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"strconv"
 	"net/http"
 	"net/mail"
 	"regexp"
@@ -277,6 +278,13 @@ func (s *Store) handleScanSpam(w http.ResponseWriter, r *http.Request, owner str
 	accountID := r.PathValue("id")
 	scope := r.URL.Query().Get("scope")
 	folders := r.URL.Query()["folders"]
+	bypass := r.URL.Query().Get("bypass") == "true"
+	suggestThreshold := spamSuggestScore
+	if t := r.URL.Query().Get("suggestThreshold"); t != "" {
+		if v, err := strconv.ParseFloat(t, 64); err == nil {
+			suggestThreshold = math.Max(0.1, v) // floor at 10% — don't suggest genuinely clean mail
+		}
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -302,10 +310,15 @@ func (s *Store) handleScanSpam(w http.ResponseWriter, r *http.Request, owner str
 			return
 		}
 		go s.runScanJob(jobID, "spam", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
-			summary, err := s.scanAccountForSpam(ctx, accountID, scope, folders, onProgress)
+			summary, err := s.scanAccountForSpam(ctx, accountID, scope, folders, bypass, suggestThreshold, onProgress)
 			if err != nil {
 				return nil, err
 			}
+			// Move any newly-tagged (or previously-tagged-but-stranded) Spam mail to
+			// Junk now — the scan itself only writes to message_tags, it doesn't do
+			// the IMAP move. Without this, full_auto-applied tags sit in the inbox
+			// until the next periodic sync picks them up.
+			s.autoMoveTaggedMail(owner)
 			// spamScanSummary's fields are unexported (package-internal) — map to the
 			// same public shape the client's always read, rather than storing a struct
 			// that'd marshal to "{}" with nothing in it.
@@ -353,7 +366,7 @@ type spamScanSummary struct {
 // treatment, and is excluded from "all folders" entirely — unlike Junk, sitting in
 // Trash isn't a spam verdict at all, just "deleted for any reason", and treating it as
 // confirmed-spam evidence produced real false suggestions on ordinary deleted mail.
-func (s *Store) scanAccountForSpam(ctx context.Context, accountID, scope string, folders []string, progress func(done, total int)) (spamScanSummary, error) {
+func (s *Store) scanAccountForSpam(ctx context.Context, accountID, scope string, folders []string, bypass bool, suggestThreshold float64, progress func(done, total int)) (spamScanSummary, error) {
 	var summary spamScanSummary
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
@@ -459,10 +472,18 @@ func (s *Store) scanAccountForSpam(ctx context.Context, accountID, scope string,
 		// scan always leaves every mail it touches with current diagnostic data —
 		// running it is the one thing that's supposed to fix "not yet scanned".
 		var alreadyDecided bool
-		s.db.QueryRow(
-			"SELECT EXISTS(SELECT 1 FROM message_tags WHERE message_id = $1 AND tag_id = $2) OR EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'dismissed')",
-			m.MessageID, spamTagID,
-		).Scan(&alreadyDecided)
+		if bypass {
+			// Only skip mail that's already tagged — don't let a previous dismiss block re-evaluation
+			s.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM message_tags WHERE message_id = $1 AND tag_id = $2)",
+				m.MessageID, spamTagID,
+			).Scan(&alreadyDecided)
+		} else {
+			s.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM message_tags WHERE message_id = $1 AND tag_id = $2) OR EXISTS(SELECT 1 FROM tag_history WHERE message_id = $1 AND tag_id = $2 AND status = 'dismissed')",
+				m.MessageID, spamTagID,
+			).Scan(&alreadyDecided)
+		}
 
 		// Every mail gets actually scored — including Junk/Trash. Mail already sitting
 		// there isn't exempted from running through scoreSpam (it still needs a real
@@ -507,7 +528,7 @@ func (s *Store) scanAccountForSpam(ctx context.Context, accountID, scope string,
 			summary.trained++
 			mu.Unlock()
 		}
-		if alreadyDecided || score < spamSuggestScore {
+		if alreadyDecided || score < suggestThreshold {
 			if !alreadyDecided {
 				// A still-pending suggestion isn't a decision (alreadyDecided already
 				// excludes those) — it's the engine's own guess from a previous scan, and
@@ -527,7 +548,7 @@ func (s *Store) scanAccountForSpam(ctx context.Context, accountID, scope string,
 		// Review means review — a high score never overrides the mode and applies on
 		// its own (matches scanAccountForTags's identical full_auto-gated logic). Score
 		// alone only takes effect once mode is already full_auto.
-		if mode == "full_auto" && score >= spamAutoApplyScore {
+		if mode == "full_auto" && score >= s.ownerSpamAutoApplyScore(ownerSubject) {
 			s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, spamTagID)
 			s.ensureSpamFolderRule(accountID, spamTagID)
 			mu.Lock()
@@ -834,8 +855,9 @@ func (s *Store) scoreSpam(ownerSubject, spamTagID string, m Mail, body MailBody)
 	// this caused: a single newsletter copy sitting in Junk for unrelated reasons
 	// reinforced every future mail from that sender as "previously flagged spam", with
 	// no actual spam judgment behind it.
+	hist := 0.0
 	if spamTagID != "" {
-		hist := s.senderRatio(ownerSubject, m.SenderEmail, spamTagID, true) // already 0 for a relay-generated address (looksLikeRelayAddress, smarttags.go)
+		hist = s.senderRatio(ownerSubject, m.SenderEmail, spamTagID, true) // already 0 for a relay-generated address (looksLikeRelayAddress, smarttags.go)
 		if !looksLikeRelayAddress(m.SenderEmail) {
 			// Same reasoning as scoreTagsForMail's identical guard (smarttags.go): a relay
 			// alias's domain isn't necessarily covered by domainRatio's own fixed
@@ -860,14 +882,33 @@ func (s *Store) scoreSpam(ownerSubject, spamTagID string, m Mail, body MailBody)
 		score += sig.weight
 		reasons = append(reasons, sig.reason)
 	}
-	// Mail that's already carrying some other tag looks like mail someone (the user,
-	// or smart-tagging) already decided was worth keeping and sorting — not proof it
-	// isn't spam (a compromised sender's mail can still pick up a real tag before
-	// anyone notices), so this dampens rather than excludes. Checked after summing
-	// the signals above, not as one of them — it's a discount on the whole picture,
-	// not a fact about this mail's wording/authentication on its own.
+	// Post-sum discounts — multiplicative, so each one reduces the whole picture rather
+	// than being addable to the signal list. All transparent: each adds its own reason
+	// line so the reader's diagnostic panel shows exactly what reduced the score.
+
+	// Mail already tagged by the user or smart-tagging: clearly decided worth keeping.
 	if len(s.existingTagIDs(m.MessageID)) > 0 {
 		score *= 0.7
+		reasons = append(reasons, "Already tagged — score reduced")
+	}
+	// Mail in a non-Inbox folder the user organized (Subscriptions, Work, etc.) —
+	// definitely not spam if it's been sorted somewhere specific.
+	if m.Folder != "" && m.Folder != "INBOX" {
+		score *= 0.65
+		reasons = append(reasons, fmt.Sprintf("Already in folder %q — score reduced", m.Folder))
+	}
+	// A sender seen frequently in this mailbox with no prior spam history is a known
+	// correspondent, not a random stranger — one-off strangers are meaningfully higher risk.
+	// Uses spam_flags sample count (scored mail) as the proxy for "seen before", which
+	// already exists. hist > 0.1 means the user has flagged them before — if that's set
+	// the reinforcement signal above already ran, so this only fires for clean senders.
+	if hist <= 0.1 {
+		var senderSeen int
+		s.db.QueryRow("SELECT count(*) FROM spam_flags WHERE owner_subject = $1 AND sender_email = $2", ownerSubject, m.SenderEmail).Scan(&senderSeen)
+		if senderSeen >= 5 {
+			score *= 0.8
+			reasons = append(reasons, "Frequent sender with no prior spam history — score reduced")
+		}
 	}
 	if score > 1 {
 		score = 1

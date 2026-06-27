@@ -110,6 +110,7 @@ func (s *Store) StartWatching(ctx context.Context) {
 	go s.watchFolderChanges(ctx)
 	go s.watchAutoMove(ctx)
 	go s.watchFolderMailSync(ctx)
+	go s.runImapJobWorker(ctx)
 }
 
 // watchAccount runs (and indefinitely restarts, with backoff) an IDLE loop for one

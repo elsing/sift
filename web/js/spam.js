@@ -15,13 +15,6 @@ const MODES = [
   { id: 'full_auto', name: 'Full-auto', icon: '⚡' },
 ];
 
-// Mirrors smarttags.js's own WORD_PROFILE_WEIGHTINGS — same setting, same two options,
-// just rendered into this panel's own button group too (it's a shared owner_settings
-// field, not a separate spam-only one).
-const WORD_PROFILE_WEIGHTINGS = [
-  { id: 'plain', name: 'Plain', icon: '📊' },
-  { id: 'distinctive', name: 'Distinctive', icon: '🎯' },
-];
 
 const SCAN_SCOPES = [
   { id: 'all', name: 'All folders', icon: '🗂' },
@@ -32,11 +25,14 @@ let scanScope = 'all';
 const chosenScanFolders = new Set(); // only used when scanScope === 'folders'
 let scanFoldersAccountId = null;
 
-let modeOptions, wordWeightingOptions, errorEl, suggestionsList;
+let modeOptions, errorEl, suggestionsList;
 let scanScopeOptions, scanChosenFoldersSummary, scanAccountPicker, scanProgress, scanProgressFill, scanProgressText, scanResults;
-let currentSettings = { spamMode: 'review', wordProfileWeighting: 'plain' };
+let currentSettings = { spamMode: 'review' };
 let pendingSuggestions = [];
 let activeScanSource = null;
+
+function getSpamThreshold() { return parseInt(localStorage.getItem('spamThreshold') || '40', 10) / 100; }
+function setSpamThreshold(pct) { localStorage.setItem('spamThreshold', String(pct)); }
 
 async function fetchSettings() {
   const res = await fetch('/api/owner-settings');
@@ -69,6 +65,7 @@ function renderModeOptions() {
       try {
         await saveSettings({ spamMode: m.id });
         renderModeOptions();
+        renderSpamAutoApplyThreshold();
       } catch (err) {
         errorEl.textContent = err.message;
         for (const b of modeOptions.children) b.disabled = false;
@@ -78,26 +75,17 @@ function renderModeOptions() {
   }
 }
 
-function renderWordWeightingOptions() {
-  wordWeightingOptions.innerHTML = '';
-  for (const w of WORD_PROFILE_WEIGHTINGS) {
-    const btn = document.createElement('button');
-    btn.className = 'theme-option' + (currentSettings.wordProfileWeighting === w.id ? ' selected' : '');
-    btn.innerHTML = `<span class="theme-option-icon">${w.icon}</span><span>${w.name}</span>`;
-    btn.addEventListener('click', async () => {
-      for (const b of wordWeightingOptions.children) b.disabled = true;
-      errorEl.textContent = '';
-      try {
-        await saveSettings({ wordProfileWeighting: w.id });
-        renderWordWeightingOptions();
-      } catch (err) {
-        errorEl.textContent = err.message;
-        for (const b of wordWeightingOptions.children) b.disabled = false;
-      }
-    });
-    wordWeightingOptions.appendChild(btn);
-  }
+function renderSpamAutoApplyThreshold() {
+  const container = document.getElementById('spamAutoApplyThresholdContainer');
+  const label = document.getElementById('spamAutoApplyThresholdLabel');
+  const isFullAuto = currentSettings.spamMode === 'full_auto';
+  container.classList.toggle('hidden', !isFullAuto);
+  if (!isFullAuto) return;
+  const pct = Math.round((currentSettings.spamAutoApplyScore ?? 0.75) * 100);
+  label.textContent = `Auto-apply above ${pct}% confidence (default: 75%)`;
+  document.getElementById('spamAutoApplyThresholdSlider').value = String(pct);
 }
+
 
 // "Choose folders" only ever highlighted the scope button itself — nothing showed
 // which folders had actually been picked, so re-opening the picker (or just trying to
@@ -192,7 +180,8 @@ function renderSuggestionRow(entry) {
   top.append(name, actions);
   const meta = document.createElement('div');
   meta.className = 'smart-history-meta';
-  meta.textContent = `${entry.senderEmail}${entry.subject ? ' — ' + entry.subject : ''}${entry.folder ? ' (' + entry.folder + ')' : ''}`;
+  const scoreStr = entry.score != null ? ` · ${Math.round(entry.score * 100)}%` : '';
+  meta.textContent = `${entry.senderEmail}${entry.subject ? ' — ' + entry.subject : ''}${entry.folder ? ' (' + entry.folder + ')' : ''}${scoreStr}`;
   li.append(top, meta);
   if (entry.mailId) {
     meta.classList.add('openable');
@@ -320,16 +309,47 @@ function renderSuggestionsFromCache() {
   const acceptAllBtn = document.getElementById('acceptAllSpamBtn');
   const dismissAllBtn = document.getElementById('dismissAllSpamBtn');
   const clearAllBtn = document.getElementById('clearAllSpamBtn');
+  const threshold = getSpamThreshold();
+  const visible = pendingSuggestions.filter((e) => (e.score || 0) >= threshold);
+
+  // Update the static slider (lives outside the list — never rebuilt, so dragging on
+  // mobile doesn't destroy it mid-gesture).
+  const thresholdContainer = document.getElementById('spamThresholdContainer');
+  const thresholdLabel = document.getElementById('spamThresholdLabel');
+  thresholdContainer.classList.toggle('hidden', pendingSuggestions.length === 0);
+  if (thresholdLabel) thresholdLabel.textContent = `Show suggestions above ${Math.round(threshold * 100)}% confidence`;
+  document.getElementById('spamSuggestionsTotalCount').textContent = `${pendingSuggestions.length} suggestion${pendingSuggestions.length === 1 ? '' : 's'} total`;
+  document.getElementById('spamSuggestionsFilteredCount').textContent = `${visible.length} above ${Math.round(threshold * 100)}%`;
+
   suggestionsList.innerHTML = '';
-  acceptAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
-  dismissAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
-  clearAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
-  if (pendingSuggestions.length === 0) {
-    suggestionsList.innerHTML = '<li class="folder-empty-status">No pending suggestions.</li>';
+
+  acceptAllBtn.classList.toggle('hidden', visible.length < 2);
+  dismissAllBtn.classList.toggle('hidden', visible.length < 2);
+  clearAllBtn.classList.toggle('hidden', visible.length < 2);
+
+  // Wire bulk buttons to the visible set, not all pending.
+  acceptAllBtn.onclick = async () => {
+    const ids = visible.map((e) => e.id);
+    dismissAllBtn.disabled = true;
+    try { await acceptSuggestions(ids); } catch (err) { errorEl.textContent = err.message; dismissAllBtn.disabled = false; return; }
+    resolveSuggestions(ids);
+  };
+  dismissAllBtn.onclick = async () => {
+    const ids = visible.map((e) => e.id);
+    acceptAllBtn.disabled = true;
+    try { await dismissSuggestions(ids); } catch (err) { errorEl.textContent = err.message; acceptAllBtn.disabled = false; return; }
+    resolveSuggestions(ids);
+  };
+
+  if (visible.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'folder-empty-status';
+    empty.textContent = pendingSuggestions.length === 0 ? 'No pending suggestions.' : `No suggestions above ${Math.round(threshold * 100)}% — lower the slider to see more.`;
+    suggestionsList.appendChild(empty);
     return;
   }
   const bySender = new Map(); // senderEmail -> entries[]
-  for (const entry of pendingSuggestions) {
+  for (const entry of visible) {
     const key = entry.senderEmail || '';
     if (!bySender.has(key)) bySender.set(key, []);
     bySender.get(key).push(entry);
@@ -433,6 +453,8 @@ function runScan(accountId) {
   else if (scanScope === 'folders') {
     for (const f of chosenScanFolders) params.append('folders', f);
   }
+  if (document.getElementById('spamBypassDecisionsCheck')?.checked) params.set('bypass', 'true');
+  params.set('suggestThreshold', String(getSpamThreshold()));
   const qs = params.toString();
   const source = new EventSource(`/api/accounts/${accountId}/scan-spam${qs ? '?' + qs : ''}`);
   activeScanSource = source;
@@ -517,7 +539,6 @@ async function setupScan() {
 
 export function setupSmartSpamPanel() {
   modeOptions = document.getElementById('spamModeOptions');
-  wordWeightingOptions = document.getElementById('spamWordProfileWeightingOptions');
   errorEl = document.getElementById('smartSpamError');
   suggestionsList = document.getElementById('smartSpamSuggestions');
   scanScopeOptions = document.getElementById('spamScanScopeOptions');
@@ -528,6 +549,26 @@ export function setupSmartSpamPanel() {
   scanProgressText = document.getElementById('spamBootstrapProgressText');
   scanResults = document.getElementById('spamScanResults');
   renderScanScopeOptions();
+
+  document.getElementById('spamAutoApplyThresholdSlider').addEventListener('input', async (e) => {
+    const pct = parseInt(e.target.value, 10);
+    document.getElementById('spamAutoApplyThresholdLabel').textContent = `Auto-apply above ${pct}% confidence (default: 75%)`;
+    try {
+      await saveSettings({ spamAutoApplyScore: pct / 100 });
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
+  // Slider is static in the DOM — wired once here so dragging on mobile never
+  // destroys the element mid-gesture (renderSuggestionsFromCache only updates the
+  // label text and show/hide, never recreates the slider).
+  const slider = document.getElementById('spamThresholdSlider');
+  slider.value = String(Math.round(getSpamThreshold() * 100));
+  slider.addEventListener('input', () => {
+    setSpamThreshold(parseInt(slider.value, 10));
+    renderSuggestionsFromCache();
+  });
 
   document.getElementById('scanForSpamBtn').addEventListener('click', () => {
     errorEl.textContent = '';
@@ -584,31 +625,8 @@ export function setupSmartSpamPanel() {
     scanProgressText.textContent = '';
   });
 
-  document.getElementById('acceptAllSpamBtn').addEventListener('click', async (e) => {
-    e.target.disabled = true;
-    const ids = pendingSuggestions.map((s) => s.id);
-    try {
-      await acceptSuggestions(ids);
-    } catch (err) {
-      errorEl.textContent = err.message;
-    }
-    e.target.disabled = false;
-    resolveSuggestions(ids);
-  });
-
-  document.getElementById('dismissAllSpamBtn').addEventListener('click', async (e) => {
-    if (!(await confirmModal(`Dismiss all ${pendingSuggestions.length} pending suggestions?`))) return;
-    e.target.disabled = true;
-    const ids = pendingSuggestions.map((s) => s.id);
-    try {
-      await dismissSuggestions(ids);
-    } catch (err) {
-      errorEl.textContent = err.message;
-    }
-    e.target.disabled = false;
-    resolveSuggestions(ids);
-  });
-
+  // accept/dismiss bulk handlers are set dynamically in renderSuggestionsFromCache
+  // so they act on the filtered (threshold-gated) set, not all pendingSuggestions.
   document.getElementById('clearAllSpamBtn').addEventListener('click', async (e) => {
     if (!(await confirmModal(`Clear all ${pendingSuggestions.length} pending suggestions? This isn't a verdict either way — any of them can resurface on a future scan.`))) return;
     e.target.disabled = true;
@@ -626,13 +644,17 @@ export function setupSmartSpamPanel() {
     document.getElementById('settingsPanel').classList.add('hidden');
     document.getElementById('smartSpamPanel').classList.remove('hidden');
     errorEl.textContent = '';
+    // Render immediately with cached settings so buttons appear before the network round-trip
+    renderModeOptions();
+    renderSpamAutoApplyThreshold();
     try {
       currentSettings = await fetchSettings();
     } catch (err) {
       errorEl.textContent = err.message;
     }
+    // Re-render with fresh settings in case mode/scores changed since last open
     renderModeOptions();
-    renderWordWeightingOptions();
+    renderSpamAutoApplyThreshold();
     loadSuggestions();
     if (!activeScanSource) resumeRunningScan(); // pick back up a scan a previous page load started and left running
     resumeOwnerJobs(); // same, for restore-stranded/cleanup-unconfirmed

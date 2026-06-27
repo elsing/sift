@@ -10,6 +10,7 @@ import { setupAccountFilter } from './accountFilter.js';
 import { setupSearch } from './search.js';
 import { setupSmartTaggingPanel } from './smarttags.js';
 import { setupSmartSpamPanel } from './spam.js';
+import { fetchTags } from './tags.js';
 
 // One throwing block used to take down every single line after it in this file — it's
 // all synchronous top-level code, so an exception anywhere stops the whole script
@@ -85,6 +86,7 @@ safe('modalKeyboardPadding', () => {
 
 renderLoadingSkeleton();
 fetchMails().then(render).catch((err) => console.error('initial fetchMails failed', err));
+fetchTags().catch(() => {}); // pre-warm so the tag sheet opens instantly on first swipe
 
 safe('setupPullToRefresh', setupPullToRefresh);
 safe('setupInfiniteScroll', setupInfiniteScroll);

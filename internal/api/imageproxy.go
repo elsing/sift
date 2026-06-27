@@ -381,7 +381,7 @@ func (s *Store) prefetchMailImages(acct dbAccount, password string, mails []Mail
 			if score >= spamSuggestScore {
 				status := "suggested"
 				// Review means review — a high score never overrides the mode on its own.
-				if mode == "full_auto" && score >= spamAutoApplyScore {
+				if mode == "full_auto" && score >= s.ownerSpamAutoApplyScore(ownerSubject) {
 					status = "applied"
 					s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, spamTagID)
 					s.ensureSpamFolderRule(acct.ID, spamTagID)

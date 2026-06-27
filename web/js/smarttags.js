@@ -13,10 +13,6 @@ const MODES = [
   { id: 'full_auto', name: 'Full-auto', icon: '⚡' },
 ];
 
-const WORD_PROFILE_WEIGHTINGS = [
-  { id: 'plain', name: 'Plain', icon: '📊' },
-  { id: 'distinctive', name: 'Distinctive', icon: '🎯' },
-];
 
 const SCAN_SCOPES = [
   { id: 'all', name: 'All folders', icon: '🗂' },
@@ -30,8 +26,7 @@ let scanFoldersAccountId = null; // which account chosenScanFolders belongs to
 let modeOptions, delayInput, errorEl, suggestionsList, historyList, historySearch, misplacedList;
 let scanBtn, scanScopeOptions, scanChosenFoldersSummary, scanAccountPicker, scanProgress, scanProgressFill, scanProgressText, scanResults;
 let runAutoMoveBtn, autoMoveResults;
-let currentSettings = { autoTagMode: 'review', autoMoveDelayDays: 3, wordProfileWeighting: 'plain' };
-let wordWeightingOptions;
+let currentSettings = { autoTagMode: 'review', autoMoveDelayDays: 3 };
 
 async function fetchSettings() {
   const res = await fetch('/api/owner-settings');
@@ -66,6 +61,7 @@ function renderModeOptions() {
       try {
         await saveSettings({ autoTagMode: m.id });
         renderModeOptions();
+        renderAutoApplyThreshold();
       } catch (err) {
         errorEl.textContent = err.message;
         for (const b of modeOptions.children) b.disabled = false;
@@ -75,26 +71,17 @@ function renderModeOptions() {
   }
 }
 
-function renderWordWeightingOptions() {
-  wordWeightingOptions.innerHTML = '';
-  for (const w of WORD_PROFILE_WEIGHTINGS) {
-    const btn = document.createElement('button');
-    btn.className = 'theme-option' + (currentSettings.wordProfileWeighting === w.id ? ' selected' : '');
-    btn.innerHTML = `<span class="theme-option-icon">${w.icon}</span><span>${w.name}</span>`;
-    btn.addEventListener('click', async () => {
-      for (const b of wordWeightingOptions.children) b.disabled = true;
-      errorEl.textContent = '';
-      try {
-        await saveSettings({ wordProfileWeighting: w.id });
-        renderWordWeightingOptions();
-      } catch (err) {
-        errorEl.textContent = err.message;
-        for (const b of wordWeightingOptions.children) b.disabled = false;
-      }
-    });
-    wordWeightingOptions.appendChild(btn);
-  }
+function renderAutoApplyThreshold() {
+  const container = document.getElementById('tagAutoApplyThresholdContainer');
+  const label = document.getElementById('tagAutoApplyThresholdLabel');
+  const isFullAuto = currentSettings.autoTagMode === 'full_auto';
+  container.classList.toggle('hidden', !isFullAuto);
+  if (!isFullAuto) return;
+  const pct = Math.round((currentSettings.tagAutoApplyScore ?? 0.75) * 100);
+  label.textContent = `Auto-apply above ${pct}% confidence (default: 75%)`;
+  document.getElementById('tagAutoApplyThresholdSlider').value = String(pct);
 }
+
 
 // "Choose folders" only ever highlighted the scope button itself — nothing showed
 // which folders had actually been picked, so re-opening the picker (or just trying to
@@ -266,6 +253,8 @@ function makeRowOpenable(li, clickTarget, entry) {
 // Tracked at module scope so "Accept all" (a scan can easily leave dozens of these,
 // and accepting them one at a time was the only option) doesn't need its own fetch.
 let pendingSuggestions = [];
+function getTagThreshold() { return parseInt(localStorage.getItem('tagSuggestThreshold') || '0', 10) / 100; }
+function setTagThreshold(pct) { localStorage.setItem('tagSuggestThreshold', String(pct)); }
 // Persists across renderSuggestionsFromCache() calls (e.g. after accepting one row) — without
 // this, expanding a noisy tag's group just to work through it, then accepting one,
 // re-collapsed the group out from under you on every single accept.
@@ -311,12 +300,23 @@ function renderSuggestionsFromCache() {
   const acceptAllBtn = document.getElementById('acceptAllSuggestionsBtn');
   const dismissAllBtn = document.getElementById('dismissAllSuggestionsBtn');
   const clearAllBtn = document.getElementById('clearAllSuggestionsBtn');
+  const threshold = getTagThreshold();
+  const visible = pendingSuggestions.filter((e) => (e.score || 0) >= threshold);
+
+  const thresholdContainer = document.getElementById('tagThresholdContainer');
+  const thresholdLabel = document.getElementById('tagThresholdLabel');
+  thresholdContainer.classList.toggle('hidden', pendingSuggestions.length === 0);
+  if (thresholdLabel) thresholdLabel.textContent = `Show suggestions above ${Math.round(threshold * 100)}% confidence`;
+  document.getElementById('tagSuggestionsTotalCount').textContent = `${pendingSuggestions.length} suggestion${pendingSuggestions.length === 1 ? '' : 's'} total`;
+  document.getElementById('tagSuggestionsFilteredCount').textContent = `${visible.length} above ${Math.round(threshold * 100)}%`;
+
   suggestionsList.innerHTML = '';
-  acceptAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2); // not worth a bulk button for just one
-  dismissAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
-  clearAllBtn.classList.toggle('hidden', pendingSuggestions.length < 2);
-  if (pendingSuggestions.length === 0) {
-    suggestionsList.innerHTML = '<li class="folder-empty-status">No pending suggestions.</li>';
+  acceptAllBtn.classList.toggle('hidden', visible.length < 2);
+  dismissAllBtn.classList.toggle('hidden', visible.length < 2);
+  clearAllBtn.classList.toggle('hidden', visible.length < 2);
+
+  if (visible.length === 0) {
+    suggestionsList.innerHTML = `<li class="folder-empty-status">${pendingSuggestions.length === 0 ? 'No pending suggestions.' : `No suggestions above ${Math.round(threshold * 100)}% — lower the slider to see more.`}</li>`;
     return;
   }
   // Grouped by tag, not one flat list — a scan can easily leave dozens of suggestions
@@ -325,7 +325,7 @@ function renderSuggestionsFromCache() {
   // it's long enough to be the actual problem, so a single noisy tag doesn't have to
   // be scrolled past (or waded through one row at a time) to get at the rest.
   const byTag = new Map(); // tagId -> { tagName, tagColor, entries: [] }
-  for (const entry of pendingSuggestions) {
+  for (const entry of visible) {
     if (!byTag.has(entry.tagId)) byTag.set(entry.tagId, { tagName: entry.tagName, tagColor: entry.tagColor, entries: [] });
     byTag.get(entry.tagId).entries.push(entry);
   }
@@ -415,6 +415,7 @@ function renderSuggestionGroup(tagId, tagName, tagColor, entries) {
 
 // Tracked at module scope for the same "Move all" reason pendingSuggestions is.
 let misplacedMail = [];
+const expandedMisplacedGroups = new Set();
 
 function renderMisplacedRow(entry, onResolved) {
   const li = document.createElement('li');
@@ -472,6 +473,55 @@ function renderMisplacedRow(entry, onResolved) {
   return li;
 }
 
+function renderMisplacedGroup(sender, entries) {
+  const li = document.createElement('li');
+  li.className = 'suggestion-group';
+
+  const header = document.createElement('div');
+  header.className = 'smart-history-row-top suggestion-group-header';
+  const label = document.createElement('span');
+  label.textContent = `${sender} (${entries.length})`;
+
+  const moveAllBtn = document.createElement('button');
+  moveAllBtn.className = 'create-tag-btn';
+  moveAllBtn.textContent = 'Move all';
+  moveAllBtn.addEventListener('click', async () => {
+    try {
+      await withBusyButton(moveAllBtn, 'Moving…', () =>
+        Promise.all(entries.map((e) => moveMail(e.mailId, e.destinationFolder)))
+      );
+      renderMisplaced();
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+  header.append(label, moveAllBtn);
+  li.appendChild(header);
+
+  const list = document.createElement('ul');
+  list.className = 'accounts-list suggestion-group-rows';
+  for (const entry of entries) {
+    list.appendChild(renderMisplacedRow(entry, renderMisplaced));
+  }
+
+  const collapsible = entries.length > 3;
+  const startExpanded = expandedMisplacedGroups.has(sender);
+  if (collapsible && !startExpanded) list.classList.add('hidden');
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'suggestion-group-toggle';
+  toggle.textContent = collapsible ? (startExpanded ? 'Hide ▴' : `Show ${entries.length} ▾`) : '';
+  toggle.classList.toggle('hidden', !collapsible);
+  toggle.addEventListener('click', () => {
+    const showing = list.classList.toggle('hidden') === false;
+    toggle.textContent = showing ? 'Hide ▴' : `Show ${entries.length} ▾`;
+    if (showing) expandedMisplacedGroups.add(sender);
+    else expandedMisplacedGroups.delete(sender);
+  });
+  li.append(list, toggle);
+  return li;
+}
+
 async function renderMisplaced() {
   const relocateAllBtn = document.getElementById('relocateAllBtn');
   try {
@@ -486,8 +536,17 @@ async function renderMisplaced() {
     misplacedList.innerHTML = '<li class="folder-empty-status">Nothing misplaced right now.</li>';
     return;
   }
+  const bySender = new Map();
   for (const entry of misplacedMail) {
-    misplacedList.appendChild(renderMisplacedRow(entry, renderMisplaced));
+    if (!bySender.has(entry.sender)) bySender.set(entry.sender, []);
+    bySender.get(entry.sender).push(entry);
+  }
+  for (const [sender, entries] of bySender) {
+    if (entries.length === 1) {
+      misplacedList.appendChild(renderMisplacedRow(entries[0], renderMisplaced));
+    } else {
+      misplacedList.appendChild(renderMisplacedGroup(sender, entries));
+    }
   }
 }
 
@@ -594,6 +653,7 @@ function runScan(accountId) {
   else if (scanScope === 'folders') {
     for (const f of chosenScanFolders) params.append('folders', f);
   }
+  params.set('suggestThreshold', String(getTagThreshold()));
   const qs = params.toString();
   const source = new EventSource(`/api/accounts/${accountId}/scan-tags${qs ? '?' + qs : ''}`);
   activeScanSource = source;
@@ -761,7 +821,6 @@ async function setupScan() {
 
 export function setupSmartTaggingPanel() {
   modeOptions = document.getElementById('autoTagModeOptions');
-  wordWeightingOptions = document.getElementById('wordProfileWeightingOptions');
   delayInput = document.getElementById('autoMoveDelayInput');
   errorEl = document.getElementById('smartTaggingSettingsError');
   suggestionsList = document.getElementById('smartTaggingSuggestions');
@@ -777,6 +836,24 @@ export function setupSmartTaggingPanel() {
   scanResults = document.getElementById('scanResults');
   runAutoMoveBtn = document.getElementById('runAutoMoveBtn');
   autoMoveResults = document.getElementById('autoMoveResults');
+
+  const tagSuggestSlider = document.getElementById('tagThresholdSlider');
+  tagSuggestSlider.value = String(Math.round(getTagThreshold() * 100));
+  tagSuggestSlider.addEventListener('input', () => {
+    setTagThreshold(parseInt(tagSuggestSlider.value, 10));
+    renderSuggestionsFromCache();
+  });
+
+  document.getElementById('tagAutoApplyThresholdSlider').addEventListener('input', async (e) => {
+    const pct = parseInt(e.target.value, 10);
+    document.getElementById('tagAutoApplyThresholdLabel').textContent = `Auto-apply above ${pct}% confidence (default: 75%)`;
+    try {
+      await saveSettings({ tagAutoApplyScore: pct / 100 });
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
   renderScanScopeOptions();
   const historyToggleBtn = document.getElementById('historyToggleBtn');
   const historySection = document.getElementById('historySection');
@@ -816,7 +893,7 @@ export function setupSmartTaggingPanel() {
 
   document.getElementById('acceptAllSuggestionsBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
-    const ids = pendingSuggestions.map((s) => s.id);
+    const ids = pendingSuggestions.filter((s) => (s.score || 0) >= getTagThreshold()).map((s) => s.id);
     try {
       await acceptSuggestions(ids);
     } catch (err) {
@@ -828,9 +905,9 @@ export function setupSmartTaggingPanel() {
   });
 
   document.getElementById('dismissAllSuggestionsBtn').addEventListener('click', async (e) => {
-    if (!(await confirmModal(`Dismiss all ${pendingSuggestions.length} pending suggestions?`))) return;
+    const ids = pendingSuggestions.filter((s) => (s.score || 0) >= getTagThreshold()).map((s) => s.id);
+    if (!(await confirmModal(`Dismiss all ${ids.length} visible suggestions?`))) return;
     e.target.disabled = true;
-    const ids = pendingSuggestions.map((s) => s.id);
     try {
       await dismissSuggestions(ids);
     } catch (err) {
@@ -841,9 +918,9 @@ export function setupSmartTaggingPanel() {
   });
 
   document.getElementById('clearAllSuggestionsBtn').addEventListener('click', async (e) => {
-    if (!(await confirmModal(`Clear all ${pendingSuggestions.length} pending suggestions? This isn't a verdict either way — any of them can resurface on a future scan.`))) return;
+    const ids = pendingSuggestions.filter((s) => (s.score || 0) >= getTagThreshold()).map((s) => s.id);
+    if (!(await confirmModal(`Clear all ${ids.length} visible suggestions? This isn't a verdict either way — any of them can resurface on a future scan.`))) return;
     e.target.disabled = true;
-    const ids = pendingSuggestions.map((s) => s.id);
     try {
       await clearSuggestions(ids);
     } catch (err) {
@@ -901,14 +978,18 @@ export function setupSmartTaggingPanel() {
     document.getElementById('settingsPanel').classList.add('hidden');
     document.getElementById('smartTaggingPanel').classList.remove('hidden');
     errorEl.textContent = '';
+    // Render immediately with cached settings so buttons appear before the network round-trip
+    renderModeOptions();
+    renderAutoApplyThreshold();
     try {
       currentSettings = await fetchSettings();
     } catch (err) {
       errorEl.textContent = err.message;
     }
+    // Re-render with fresh settings in case mode/scores changed since last open
     delayInput.value = currentSettings.autoMoveDelayDays;
     renderModeOptions();
-    renderWordWeightingOptions();
+    renderAutoApplyThreshold();
     renderMisplaced();
     loadSuggestions();
     if (!activeScanSource) resumeRunningScan(); // pick back up a scan a previous page load started and left running

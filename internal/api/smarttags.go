@@ -301,12 +301,13 @@ func (s *Store) bodyProfileRatio(tokens []string, tagID string) float64 {
 	return score
 }
 
-// ownerWordProfileWeighting defaults to "plain" both when no owner_settings row exists
-// yet and on any lookup error.
 func (s *Store) ownerWordProfileWeighting(ownerSubject string) string {
 	var weighting string
 	if err := s.db.QueryRow("SELECT word_profile_weighting FROM owner_settings WHERE owner_subject = $1", ownerSubject).Scan(&weighting); err != nil {
-		return "plain"
+		return "distinctive"
+	}
+	if weighting != "distinctive" {
+		return "distinctive"
 	}
 	return weighting
 }
@@ -441,11 +442,11 @@ func (s *Store) blockedSenderTags(ownerSubject, senderEmail string) map[string]b
 	return blocked
 }
 
-// scoreTagsForMail returns every tag scoring >= suggestScore for this sender/subject,
+// scoreTagsForMail returns every tag scoring >= minScore for this sender/subject,
 // sorted descending, capped at maxSuggestionsPerMail. bodyTokens is nil from any caller
 // that hasn't fetched this mail's body (the live new-mail path, today) — bodyProfileRatio
 // just contributes 0 in that case, same as a tag with no profile built yet.
-func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject string, bodyTokens []string) []tagScore {
+func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject string, bodyTokens []string, minScore float64) []tagScore {
 	if senderEmail == "" {
 		return nil
 	}
@@ -524,7 +525,7 @@ func (s *Store) scoreTagsForMail(ownerSubject, messageID, senderEmail, subject s
 				score = 0.6*senderScore + 0.25*domainScore + 0.15*subjectScore
 			}
 		}
-		if score >= suggestScore {
+		if score >= minScore {
 			results = append(results, tagScore{TagID: tagID, Score: score})
 		}
 	}
@@ -543,6 +544,32 @@ func (s *Store) ownerAutoTagMode(ownerSubject string) string {
 		return "review"
 	}
 	return mode
+}
+
+// ownerTagAutoApplyScore returns the confidence threshold above which full-auto mode
+// applies a tag without asking. Defaults to the hardcoded constant when unset.
+func (s *Store) ownerTagAutoApplyScore(ownerSubject string) float64 {
+	var score float64
+	if err := s.db.QueryRow("SELECT tag_auto_apply_score FROM owner_settings WHERE owner_subject = $1", ownerSubject).Scan(&score); err != nil {
+		return autoApplyScore
+	}
+	if score < 0.4 || score > 1 {
+		return autoApplyScore
+	}
+	return score
+}
+
+// ownerSpamAutoApplyScore returns the confidence threshold above which full-auto mode
+// applies the Spam tag without asking. Defaults to the hardcoded constant when unset.
+func (s *Store) ownerSpamAutoApplyScore(ownerSubject string) float64 {
+	var score float64
+	if err := s.db.QueryRow("SELECT spam_auto_apply_score FROM owner_settings WHERE owner_subject = $1", ownerSubject).Scan(&score); err != nil {
+		return spamAutoApplyScore
+	}
+	if score < 0.4 || score > 1 {
+		return spamAutoApplyScore
+	}
+	return score
 }
 
 // existingTagIDs returns the tags a message already has — both the live evaluator and
@@ -577,12 +604,12 @@ func (s *Store) evaluateOneMailForSmartTags(ownerSubject, accountID, mode string
 		return
 	}
 	existing := s.existingTagIDs(m.MessageID)
-	for _, c := range s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens) {
+	for _, c := range s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens, suggestScore) {
 		if existing[c.TagID] {
 			continue // already has this tag — nothing to suggest or apply
 		}
 		score := c.Score
-		if mode == "full_auto" && score >= autoApplyScore {
+		if mode == "full_auto" && score >= s.ownerTagAutoApplyScore(ownerSubject) {
 			s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
 			s.recordTagHistory(ownerSubject, accountID, m.MessageID, c.TagID, m.SenderEmail, m.Subject, "smart_auto", "applied", &score, bodyTokens)
 			continue
@@ -763,6 +790,11 @@ func (s *Store) misplacedMail(owner string) ([]MisplacedMail, error) {
 		  AND m.folder != 'INBOX'
 		  AND m.folder NOT ILIKE '%sent%'
 		  AND (SELECT count(*) FROM folder_tag_rules f2 WHERE f2.tag_id = t.id AND f2.account_id = m.account_id) = 1
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message_tags mt2
+		    JOIN folder_tag_rules ftr2 ON ftr2.tag_id = mt2.tag_id AND ftr2.account_id = m.account_id
+		    WHERE mt2.message_id = m.message_id AND ftr2.folder = m.folder
+		  )
 		ORDER BY m.sent_at DESC
 		LIMIT 200`,
 		owner,
@@ -1105,37 +1137,39 @@ func (s *Store) handleBulkAcceptTagHistory(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`
-		INSERT INTO message_tags (message_id, tag_id)
-		SELECT message_id, tag_id FROM tag_history WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'
-		ON CONFLICT DO NOTHING`,
-		ids, owner,
-	); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if _, err := tx.Exec(
-		"UPDATE tag_history SET status = 'applied', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'",
-		ids, owner,
-	); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	// Same immediate check a single accept does — one call covers every newly-applied
-	// tag from this batch, not one call per row.
-	go s.autoMoveTaggedMail(owner)
-	s.broadcaster.publish("mail")
+	// Return immediately — DB writes + IMAP moves are done async. The client gets 204
+	// in < 1ms; the "mail" broadcast arrives when the work actually finishes.
 	w.WriteHeader(http.StatusNoContent)
+	go func() {
+		tx, err := s.db.Begin()
+		if err != nil {
+			log.Printf("bulk-accept begin: %v", err)
+			return
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`
+			INSERT INTO message_tags (message_id, tag_id)
+			SELECT message_id, tag_id FROM tag_history WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'
+			ON CONFLICT DO NOTHING`,
+			ids, owner,
+		); err != nil {
+			log.Printf("bulk-accept insert: %v", err)
+			return
+		}
+		if _, err := tx.Exec(
+			"UPDATE tag_history SET status = 'applied', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested'",
+			ids, owner,
+		); err != nil {
+			log.Printf("bulk-accept update: %v", err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			log.Printf("bulk-accept commit: %v", err)
+			return
+		}
+		s.autoMoveTaggedMail(owner)
+		s.broadcaster.publish("mail")
+	}()
 }
 
 // handleBulkDismissTagHistory is "Dismiss all" — see bulkTagHistoryIDs' own comment.
@@ -1145,30 +1179,26 @@ func (s *Store) handleBulkDismissTagHistory(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	rows, err := s.db.Query(
-		"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested' RETURNING message_id, source",
-		ids, owner,
-	)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	type pair struct{ messageID, source string }
-	var pairs []pair
-	for rows.Next() {
-		var p pair
-		if rows.Scan(&p.messageID, &p.source) == nil {
-			pairs = append(pairs, p)
-		}
-	}
-	rows.Close()
-	// One goroutine per affected message (restoreFromJunkIfSpamDeclined's own
-	// fast/slow path split is what keeps any one of them reasonable even at real bulk
-	// size), but exactly one "mail" publish for the whole batch once they've all
-	// finished — not one per message, which is what turned a 15-message restore into
-	// 15 separate full-view refetches on every connected client (see
-	// restoreFromJunkIfSpamDeclined's own comment on why it doesn't publish itself).
+	// Return immediately — same fire-and-forget rationale as handleBulkAcceptTagHistory.
+	w.WriteHeader(http.StatusNoContent)
 	go func() {
+		rows, err := s.db.Query(
+			"UPDATE tag_history SET status = 'dismissed', resolved_at = now() WHERE id = ANY($1) AND owner_subject = $2 AND status = 'suggested' RETURNING message_id, source",
+			ids, owner,
+		)
+		if err != nil {
+			log.Printf("bulk-dismiss: %v", err)
+			return
+		}
+		type pair struct{ messageID, source string }
+		var pairs []pair
+		for rows.Next() {
+			var p pair
+			if rows.Scan(&p.messageID, &p.source) == nil {
+				pairs = append(pairs, p)
+			}
+		}
+		rows.Close()
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		anyRestored := false
@@ -1188,7 +1218,6 @@ func (s *Store) handleBulkDismissTagHistory(w http.ResponseWriter, r *http.Reque
 			s.broadcaster.publish("mail")
 		}
 	}()
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleBulkClearTagHistory is "Clear list" — see bulkTagHistoryIDs' own comment. No
@@ -1348,24 +1377,29 @@ func (s *Store) handleGetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	delay := 3
 	imageRetention := 90
 	wordWeighting := "plain"
+	tagAutoApply := autoApplyScore
+	spamAutoApply := spamAutoApplyScore
 	var backfillCompletedAt *time.Time
 	s.db.QueryRow(
-		"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at, word_profile_weighting FROM owner_settings WHERE owner_subject = $1", owner,
-	).Scan(&mode, &spamMode, &delay, &imageRetention, &backfillCompletedAt, &wordWeighting)
+		"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, image_backfill_completed_at, word_profile_weighting, tag_auto_apply_score, spam_auto_apply_score FROM owner_settings WHERE owner_subject = $1", owner,
+	).Scan(&mode, &spamMode, &delay, &imageRetention, &backfillCompletedAt, &wordWeighting, &tagAutoApply, &spamAutoApply)
 	writeJSON(w, map[string]any{
 		"autoTagMode": mode, "spamMode": spamMode, "autoMoveDelayDays": delay,
 		"imageCacheRetentionDays": imageRetention, "imageBackfillCompletedAt": backfillCompletedAt,
 		"wordProfileWeighting": wordWeighting,
+		"tagAutoApplyScore": tagAutoApply, "spamAutoApplyScore": spamAutoApply,
 	})
 }
 
 func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, owner string) {
 	var req struct {
-		AutoTagMode             string `json:"autoTagMode"`
-		SpamMode                string `json:"spamMode"`
-		AutoMoveDelayDays       int    `json:"autoMoveDelayDays"`
-		ImageCacheRetentionDays int    `json:"imageCacheRetentionDays"`
-		WordProfileWeighting    string `json:"wordProfileWeighting"`
+		AutoTagMode             string  `json:"autoTagMode"`
+		SpamMode                string  `json:"spamMode"`
+		AutoMoveDelayDays       int     `json:"autoMoveDelayDays"`
+		ImageCacheRetentionDays int     `json:"imageCacheRetentionDays"`
+		WordProfileWeighting    string  `json:"wordProfileWeighting"`
+		TagAutoApplyScore       float64 `json:"tagAutoApplyScore"`
+		SpamAutoApplyScore      float64 `json:"spamAutoApplyScore"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
@@ -1382,13 +1416,7 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 		http.Error(w, "spamMode must be full_auto or review", http.StatusBadRequest)
 		return
 	}
-	if req.WordProfileWeighting == "" {
-		req.WordProfileWeighting = s.ownerWordProfileWeighting(owner) // same "keep untouched if not sent" pattern as spamMode above
-	}
-	if req.WordProfileWeighting != "plain" && req.WordProfileWeighting != "distinctive" {
-		http.Error(w, "wordProfileWeighting must be plain or distinctive", http.StatusBadRequest)
-		return
-	}
+	req.WordProfileWeighting = "distinctive"
 	if req.AutoMoveDelayDays < 0 {
 		req.AutoMoveDelayDays = 0
 	}
@@ -1398,12 +1426,26 @@ func (s *Store) handleSetOwnerSettings(w http.ResponseWriter, r *http.Request, o
 	if req.ImageCacheRetentionDays > imageBackfillMaxDays {
 		req.ImageCacheRetentionDays = imageBackfillMaxDays
 	}
+	if req.TagAutoApplyScore == 0 {
+		req.TagAutoApplyScore = s.ownerTagAutoApplyScore(owner)
+	}
+	if req.TagAutoApplyScore < 0.4 || req.TagAutoApplyScore > 1 {
+		req.TagAutoApplyScore = autoApplyScore
+	}
+	if req.SpamAutoApplyScore == 0 {
+		req.SpamAutoApplyScore = s.ownerSpamAutoApplyScore(owner)
+	}
+	if req.SpamAutoApplyScore < 0.4 || req.SpamAutoApplyScore > 1 {
+		req.SpamAutoApplyScore = spamAutoApplyScore
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, word_profile_weighting) VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, word_profile_weighting, tag_auto_apply_score, spam_auto_apply_score) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (owner_subject) DO UPDATE SET auto_tag_mode = excluded.auto_tag_mode, spam_mode = excluded.spam_mode,
 			auto_move_delay_days = excluded.auto_move_delay_days, image_cache_retention_days = excluded.image_cache_retention_days,
-			word_profile_weighting = excluded.word_profile_weighting`,
+			word_profile_weighting = excluded.word_profile_weighting,
+			tag_auto_apply_score = excluded.tag_auto_apply_score, spam_auto_apply_score = excluded.spam_auto_apply_score`,
 		owner, req.AutoTagMode, req.SpamMode, req.AutoMoveDelayDays, req.ImageCacheRetentionDays, req.WordProfileWeighting,
+		req.TagAutoApplyScore, req.SpamAutoApplyScore,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1449,7 +1491,7 @@ type newTagCandidate struct {
 // just to bootstrap scoring from their inbox specifically. folders, when non-empty,
 // takes precedence over scope entirely — an explicit, user-picked set of folders to
 // scan instead of either "everything" or "just inbox".
-func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string, folders []string, onProgress func(done, total int)) (scanSummary, error) {
+func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string, folders []string, suggestThreshold float64, onProgress func(done, total int)) (scanSummary, error) {
 	summary := scanSummary{}
 	acct, password, err := s.loadAccountCreds(accountID)
 	if err != nil {
@@ -1621,10 +1663,10 @@ func (s *Store) scanAccountForTags(ctx context.Context, accountID, scope string,
 			summary.AlreadyTagged++
 			continue
 		}
-		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens); len(scored) > 0 {
+		if scored := s.scoreTagsForMail(ownerSubject, m.MessageID, m.SenderEmail, m.Subject, bodyTokens, suggestThreshold); len(scored) > 0 {
 			for _, c := range scored {
 				score := c.Score
-				if mode == "full_auto" && score >= autoApplyScore {
+				if mode == "full_auto" && score >= s.ownerTagAutoApplyScore(ownerSubject) {
 					s.db.Exec("INSERT INTO message_tags (message_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", m.MessageID, c.TagID)
 					// Resolves any pending 'suggested' row for this pair to 'applied' too —
 					// covers a mode switch (review then later full_auto) promoting an old
@@ -1712,6 +1754,12 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request, owner str
 	accountID := r.PathValue("id")
 	scope := r.URL.Query().Get("scope") // "inbox" or "" (all folders) — ignored if folders is set
 	folders := r.URL.Query()["folders"] // optional: scan exactly these folders instead of scope
+	suggestThreshold := suggestScore
+	if t := r.URL.Query().Get("suggestThreshold"); t != "" {
+		if v, err := strconv.ParseFloat(t, 64); err == nil {
+			suggestThreshold = math.Max(0.1, v)
+		}
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1737,7 +1785,7 @@ func (s *Store) handleScanTags(w http.ResponseWriter, r *http.Request, owner str
 			return
 		}
 		go s.runScanJob(jobID, "tags", func(ctx context.Context, onProgress func(done, total int)) (any, error) {
-			summary, err := s.scanAccountForTags(ctx, accountID, scope, folders, onProgress)
+			summary, err := s.scanAccountForTags(ctx, accountID, scope, folders, suggestThreshold, onProgress)
 			if err == nil && summary.Applied > 0 {
 				// full_auto mode can apply tags directly during a scan — same gap as accept:
 				// without this, those wouldn't show up in the inbox until something else
@@ -2102,6 +2150,13 @@ func (s *Store) applyTagToFolder(ctx context.Context, accountID, ownerSubject, f
 			break
 		}
 		for _, m := range mails {
+			// Advance the cursor for every mail regardless of tag outcome — previously this
+			// only moved when a mail was newly tagged, so a page of already-tagged mail
+			// (ON CONFLICT DO NOTHING → RowsAffected==0 for all) left beforeUID stuck at
+			// zero and the loop fetched the same first page forever.
+			if m.UID > 0 && (beforeUID == 0 || m.UID < beforeUID) {
+				beforeUID = m.UID
+			}
 			if m.MessageID == "" {
 				continue
 			}
@@ -2117,9 +2172,6 @@ func (s *Store) applyTagToFolder(ctx context.Context, accountID, ownerSubject, f
 			}
 			s.recordTagHistory(ownerSubject, accountID, m.MessageID, tagID, m.SenderEmail, m.Subject, "folder_rule", "applied", nil, nil)
 			applied++
-			if m.UID > 0 && (beforeUID == 0 || m.UID < beforeUID) {
-				beforeUID = m.UID
-			}
 		}
 		if onProgress != nil {
 			onProgress(page, 0)

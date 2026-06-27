@@ -559,7 +559,7 @@ func (s *Store) handleDeleteTagDestination(w http.ResponseWriter, r *http.Reques
 // applyFolderTagRule auto-tags a message if its destination folder has a rule —
 // called right before/after a move completes. Best-effort: a failure here shouldn't
 // fail the move itself.
-func (s *Store) applyFolderTagRule(accountID, destFolder, messageID string) {
+func (s *Store) applyFolderTagRule(accountID, destFolder, messageID, source string) {
 	if messageID == "" {
 		return
 	}
@@ -597,7 +597,7 @@ func (s *Store) applyFolderTagRule(accountID, destFolder, messageID string) {
 	if err := s.db.QueryRow("SELECT owner_subject FROM accounts WHERE id = $1", accountID).Scan(&ownerSubject); err != nil {
 		return
 	}
-	s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, "folder_rule", "applied", nil, nil)
+	s.recordTagHistory(ownerSubject, accountID, messageID, tagID, senderEmail, subject, source, "applied", nil, nil)
 }
 
 // filterByTags keeps only the mails tagged with at least one of tagIDs (an "any of"

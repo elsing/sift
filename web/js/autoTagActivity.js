@@ -13,7 +13,8 @@ const SOURCES = [
 ];
 let activeSource = 'smart_auto';
 
-let listEl, errorEl, sourceOptions;
+let listEl, errorEl, sourceOptions, searchEl;
+let cachedEntries = [];
 
 function timeAgo(iso) {
   const d = new Date(iso);
@@ -129,6 +130,8 @@ function renderSourceOptions() {
     btn.addEventListener('click', () => {
       if (activeSource === s.id) return;
       activeSource = s.id;
+      cachedEntries = [];
+      searchEl.value = '';
       renderSourceOptions();
       render();
     });
@@ -136,24 +139,18 @@ function renderSourceOptions() {
   }
 }
 
-async function render() {
-  errorEl.textContent = '';
-  listEl.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
-  let entries;
-  try {
-    entries = await fetchTagHistory('applied', null, activeSource);
-  } catch (err) {
-    listEl.innerHTML = '';
-    errorEl.textContent = err.message;
-    return;
-  }
+function renderFromCache() {
   listEl.innerHTML = '';
+  const q = (searchEl.value || '').toLowerCase().trim();
+  let entries = cachedEntries;
+  if (q) entries = entries.filter((e) => (e.senderEmail || '').toLowerCase().includes(q) || (e.subject || '').toLowerCase().includes(q));
   if (entries.length === 0) {
-    listEl.innerHTML = `<li class="folder-empty-status">Nothing ${activeSource === 'spam_engine' ? 'flagged' : 'auto-tagged'} yet.</li>`;
+    listEl.innerHTML = `<li class="folder-empty-status">${q ? 'No matches.' : `Nothing ${activeSource === 'spam_engine' ? 'flagged' : 'auto-tagged'} yet.`}</li>`;
     return;
   }
   if (activeSource !== 'spam_engine') {
-    for (const entry of entries) listEl.appendChild(renderRow(entry));
+    // Sort by decision time, newest first
+    entries.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)).forEach((e) => listEl.appendChild(renderRow(e)));
     return;
   }
   const bySender = new Map(); // senderEmail -> entries[]
@@ -162,20 +159,43 @@ async function render() {
     if (!bySender.has(key)) bySender.set(key, []);
     bySender.get(key).push(entry);
   }
-  for (const [senderEmail, group] of bySender) {
+  // Sort groups by most recent entry in each group
+  const groups = [...bySender.entries()].sort((a, b) => {
+    const latestA = a[1].reduce((max, e) => e.createdAt > max ? e.createdAt : max, '');
+    const latestB = b[1].reduce((max, e) => e.createdAt > max ? e.createdAt : max, '');
+    return latestB.localeCompare(latestA);
+  });
+  for (const [senderEmail, group] of groups) {
     listEl.appendChild(renderGroup(senderEmail, group));
   }
+}
+
+async function render() {
+  errorEl.textContent = '';
+  listEl.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
+  try {
+    cachedEntries = await fetchTagHistory('applied', null, activeSource);
+  } catch (err) {
+    listEl.innerHTML = '';
+    errorEl.textContent = err.message;
+    return;
+  }
+  renderFromCache();
 }
 
 export function setupAutoTagActivity() {
   listEl = document.getElementById('autoTagActivityList');
   errorEl = document.getElementById('autoTagActivityError');
   sourceOptions = document.getElementById('autoActivitySourceOptions');
+  searchEl = document.getElementById('autoTagActivitySearch');
+  searchEl.addEventListener('input', renderFromCache);
   const panel = document.getElementById('autoTagActivityPanel');
 
   document.getElementById('openAutoTagActivityBtn').addEventListener('click', () => {
     document.getElementById('settingsPanel').classList.add('hidden');
     panel.classList.remove('hidden');
+    searchEl.value = '';
+    cachedEntries = [];
     renderSourceOptions();
     render();
   });

@@ -448,15 +448,28 @@ func (s *Store) handleRemove(w http.ResponseWriter, r *http.Request, action stri
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if err := s.archiveOrDeleteOnServer(id, action); err != nil {
-		log.Printf("%s mail %s on server: %v", action, id, err)
-		http.Error(w, fmt.Sprintf("couldn't %s on the server: %v", action, err), http.StatusBadGateway)
+
+	var accountID *string
+	var uid *int64
+	var folder string
+	if err := s.db.QueryRow("SELECT account_id, uid, folder FROM mails WHERE id = $1", id).Scan(&accountID, &uid, &folder); err != nil {
+		if err == sql.ErrNoRows {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	if accountID != nil && uid != nil && *uid > 0 {
+		s.enqueueImapJob(*accountID, action, imapJobPayload{UID: uint32(*uid), Folder: folder})
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -476,44 +489,12 @@ func (s *Store) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.moveMailToFolder(id, req.Folder); err != nil {
-		log.Printf("move mail %s to %s: %v", id, req.Folder, err)
-		http.Error(w, "couldn't move that mail: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Store) handleToggleRead(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	if isDryRun(r) {
-		var m Mail
-		row := s.db.QueryRow("SELECT id, sender, subject, snippet, time, unread FROM mails WHERE id = $1", id)
-		if err := row.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread); err != nil {
-			if err == sql.ErrNoRows {
-				http.NotFound(w, r)
-				return
-			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		m.Unread = !m.Unread
-		log.Printf("[dry-run] would toggle read on mail %s", id)
-		writeJSON(w, m)
-		return
-	}
-
-	var m Mail
-	row := s.db.QueryRow(
-		"UPDATE mails SET unread = NOT unread WHERE id = $1 RETURNING id, sender, subject, snippet, time, unread",
-		id,
-	)
-	if err := row.Scan(&m.ID, &m.Sender, &m.Subject, &m.Snippet, &m.Time, &m.Unread); err != nil {
+	var accountID *string
+	var uid *int64
+	var sourceFolder, messageID string
+	if err := s.db.QueryRow(
+		"SELECT account_id, uid, folder, coalesce(message_id, '') FROM mails WHERE id = $1", id,
+	).Scan(&accountID, &uid, &sourceFolder, &messageID); err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
 			return
@@ -521,7 +502,66 @@ func (s *Store) handleToggleRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, m)
+
+	// Apply tag rules now (DB op, instant) so the tag association lands before the
+	// client sees the mail disappear — same timing as the old synchronous path.
+	if accountID != nil && messageID != "" {
+		s.applyFolderTagRule(*accountID, req.Folder, messageID, "manual")
+	}
+
+	if _, err := s.db.Exec("DELETE FROM mails WHERE id = $1", id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if accountID != nil && uid != nil && *uid > 0 {
+		if req.Folder == "INBOX" {
+			s.markSelfMovedIntoInbox(*accountID)
+		}
+		s.enqueueImapJob(*accountID, "move", imapJobPayload{
+			UID:        uint32(*uid),
+			Folder:     sourceFolder,
+			DestFolder: req.Folder,
+		})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleToggleRead(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	if isDryRun(r) {
+		log.Printf("[dry-run] would toggle read on mail %s", id)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	var accountID *string
+	var uid *int64
+	var folder string
+	var unread bool
+	row := s.db.QueryRow(
+		"UPDATE mails SET unread = NOT unread WHERE id = $1 RETURNING account_id, uid, folder, unread", id,
+	)
+	if err := row.Scan(&accountID, &uid, &folder, &unread); err != nil {
+		if err == sql.ErrNoRows {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if accountID != nil && uid != nil && *uid > 0 {
+		kind := "set-read"
+		if unread {
+			kind = "set-unread"
+		}
+		s.enqueueImapJob(*accountID, kind, imapJobPayload{UID: uint32(*uid), Folder: folder})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Store) handleMailBody(w http.ResponseWriter, r *http.Request) {

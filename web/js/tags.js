@@ -14,6 +14,8 @@ try {
   if (stored) cachedTags = JSON.parse(stored);
 } catch {}
 
+export function getCachedTags() { return cachedTags; }
+
 export async function fetchTags(force) {
   if (cachedTags && !force) return cachedTags;
   const res = await fetch('/api/tags');

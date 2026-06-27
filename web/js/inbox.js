@@ -65,7 +65,7 @@ function accountsQueryParam(prefix) {
 // Swipe actions are config-driven so a future settings UI just needs to write new
 // values to localStorage — no gesture/dispatch code to touch. 'move' is special: it
 // doesn't commit immediately, it asks the injected onMoveRequested to open the folder picker.
-const SWIPE_ACTIONS = {
+export const SWIPE_ACTIONS = {
   archive: { label: 'Archive', colorVar: '--archive' },
   delete:  { label: 'Delete',  colorVar: '--delete' },
   move:    { label: 'Move',    colorVar: '--move' },
@@ -73,7 +73,7 @@ const SWIPE_ACTIONS = {
   tag:     { label: 'Tag',    colorVar: '--accent' },
 };
 
-function getSwipeConfig() {
+export function getSwipeConfig() {
   return {
     left: localStorage.getItem('swipeLeft') || 'delete',
     right: localStorage.getItem('swipeRight') || 'move',
@@ -496,7 +496,13 @@ export function setupLiveUpdates() {
     // Force a real refetch in folder mode — the cache-then-network path would
     // otherwise flash the stale cached copy first, which is exactly what a live
     // update is trying to avoid showing.
-    const run = () => fetchMails(!!currentFolder).then(render);
+    //
+    // fetchMails does an intermediate render with just page 1 (list shrinks while
+    // catchUpToDepth reloads silently), which collapses scroll. Save it now and
+    // restore after the final render so a server-pushed event doesn't yank the user
+    // to a different position.
+    const scrollY = window.scrollY;
+    const run = () => fetchMails(!!currentFolder).then(() => { render(); window.scrollTo(0, scrollY); });
     // See activeRowAnimations' own comment — never rebuild the list out from under a
     // swipe animation that's still playing, just wait for it to finish first.
     const runWhenIdle = () => {
@@ -512,7 +518,10 @@ export function setupLiveUpdates() {
     console.warn('live updates: SSE connection error (browser will retry)', es.readyState);
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') fetchMails(!!currentFolder).then(render);
+    if (document.visibilityState === 'visible') {
+      const scrollY = window.scrollY;
+      fetchMails(!!currentFolder).then(() => { render(); window.scrollTo(0, scrollY); });
+    }
   });
 }
 
@@ -821,7 +830,7 @@ function performSwipeAction(row, action, direction) {
 // where a slow deliberate drag (lots of small touchmove deltas) never showed it.
 const MAX_RENDER_SPEED = 45;
 
-function attachSwipe(row) {
+export function attachSwipe(row) {
   const content = row.querySelector('.row-content');
   const rightSwipeBox = row.querySelector('.row-action.right-swipe'); // revealed dragging right (dx > 0)
   const leftSwipeBox = row.querySelector('.row-action.left-swipe');   // revealed dragging left (dx < 0)

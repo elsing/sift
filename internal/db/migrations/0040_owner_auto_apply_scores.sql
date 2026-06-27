@@ -1,0 +1,3 @@
+ALTER TABLE owner_settings
+  ADD COLUMN IF NOT EXISTS tag_auto_apply_score FLOAT NOT NULL DEFAULT 0.75,
+  ADD COLUMN IF NOT EXISTS spam_auto_apply_score FLOAT NOT NULL DEFAULT 0.75;

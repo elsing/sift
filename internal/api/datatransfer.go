@@ -185,10 +185,13 @@ type exportBundle struct {
 		CreatedAt string  `json:"createdAt"`
 	} `json:"spamFlags"`
 	OwnerSettings struct {
-		AutoTagMode             string `json:"autoTagMode"`
-		SpamMode                string `json:"spamMode"`
-		AutoMoveDelayDays       int    `json:"autoMoveDelayDays"`
-		ImageCacheRetentionDays int    `json:"imageCacheRetentionDays"`
+		AutoTagMode             string  `json:"autoTagMode"`
+		SpamMode                string  `json:"spamMode"`
+		AutoMoveDelayDays       int     `json:"autoMoveDelayDays"`
+		ImageCacheRetentionDays int     `json:"imageCacheRetentionDays"`
+		WordProfileWeighting    string  `json:"wordProfileWeighting"`
+		TagAutoApplyScore       float64 `json:"tagAutoApplyScore"`
+		SpamAutoApplyScore      float64 `json:"spamAutoApplyScore"`
 	} `json:"ownerSettings"`
 	// Opaque key/value pass-through for browser-only settings (theme, palette, swipe
 	// actions, etc.) — the server never reads or writes these, just carries them from
@@ -402,9 +405,12 @@ func (s *Store) handleExportData(w http.ResponseWriter, r *http.Request, owner s
 		b.OwnerSettings.SpamMode = "review"
 		b.OwnerSettings.AutoMoveDelayDays = 3
 		b.OwnerSettings.ImageCacheRetentionDays = 90
+		b.OwnerSettings.WordProfileWeighting = "plain"
+		b.OwnerSettings.TagAutoApplyScore = 0.75
+		b.OwnerSettings.SpamAutoApplyScore = 0.75
 		s.db.QueryRow(
-			"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days FROM owner_settings WHERE owner_subject = $1", owner,
-		).Scan(&b.OwnerSettings.AutoTagMode, &b.OwnerSettings.SpamMode, &b.OwnerSettings.AutoMoveDelayDays, &b.OwnerSettings.ImageCacheRetentionDays)
+			"SELECT auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, word_profile_weighting, tag_auto_apply_score, spam_auto_apply_score FROM owner_settings WHERE owner_subject = $1", owner,
+		).Scan(&b.OwnerSettings.AutoTagMode, &b.OwnerSettings.SpamMode, &b.OwnerSettings.AutoMoveDelayDays, &b.OwnerSettings.ImageCacheRetentionDays, &b.OwnerSettings.WordProfileWeighting, &b.OwnerSettings.TagAutoApplyScore, &b.OwnerSettings.SpamAutoApplyScore)
 	}
 
 	w.Header().Set("Content-Disposition", `attachment; filename="sift-backup.json"`)
@@ -646,13 +652,17 @@ func (s *Store) handleImportData(w http.ResponseWriter, r *http.Request, owner s
 
 	if include.settings && b.OwnerSettings.AutoTagMode != "" {
 		tx.Exec(`
-			INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO owner_settings (owner_subject, auto_tag_mode, spam_mode, auto_move_delay_days, image_cache_retention_days, word_profile_weighting, tag_auto_apply_score, spam_auto_apply_score)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (owner_subject) DO UPDATE SET
 				auto_tag_mode = excluded.auto_tag_mode, spam_mode = excluded.spam_mode,
 				auto_move_delay_days = excluded.auto_move_delay_days,
-				image_cache_retention_days = excluded.image_cache_retention_days`,
-			owner, b.OwnerSettings.AutoTagMode, b.OwnerSettings.SpamMode, b.OwnerSettings.AutoMoveDelayDays, b.OwnerSettings.ImageCacheRetentionDays)
+				image_cache_retention_days = excluded.image_cache_retention_days,
+				word_profile_weighting = excluded.word_profile_weighting,
+				tag_auto_apply_score = excluded.tag_auto_apply_score,
+				spam_auto_apply_score = excluded.spam_auto_apply_score`,
+			owner, b.OwnerSettings.AutoTagMode, b.OwnerSettings.SpamMode, b.OwnerSettings.AutoMoveDelayDays, b.OwnerSettings.ImageCacheRetentionDays,
+			b.OwnerSettings.WordProfileWeighting, b.OwnerSettings.TagAutoApplyScore, b.OwnerSettings.SpamAutoApplyScore)
 	}
 
 	if err := tx.Commit(); err != nil {

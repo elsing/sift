@@ -242,6 +242,12 @@ function setupSwipeSide(containerId, storageKey, fallback) {
   apply(localStorage.getItem(storageKey) || fallback);
 }
 
+function applySettingsMode(mode) {
+  document.body.classList.toggle('settings-advanced', mode === 'advanced');
+  document.getElementById('settingsModeBasic').classList.toggle('selected', mode !== 'advanced');
+  document.getElementById('settingsModeAdvanced').classList.toggle('selected', mode === 'advanced');
+}
+
 export function setupSettingsPanel() {
   const panel = document.getElementById('settingsPanel');
   document.getElementById('settingsBtn').addEventListener('click', () => {
@@ -249,6 +255,16 @@ export function setupSettingsPanel() {
   });
   document.getElementById('closeSettingsBtn').addEventListener('click', () => {
     panel.classList.add('hidden');
+  });
+
+  applySettingsMode(localStorage.getItem('settingsMode') || 'basic');
+  document.getElementById('settingsModeBasic').addEventListener('click', () => {
+    localStorage.setItem('settingsMode', 'basic');
+    applySettingsMode('basic');
+  });
+  document.getElementById('settingsModeAdvanced').addEventListener('click', () => {
+    localStorage.setItem('settingsMode', 'advanced');
+    applySettingsMode('advanced');
   });
 
   document.getElementById('openPersonalisationBtn').addEventListener('click', () => {
@@ -535,7 +551,7 @@ export function setupDryRunToggle() {
 
 // localStorage-only personalisation — never reaches the server otherwise, so a
 // backup has to gather and restore these itself alongside the server-side bundle.
-const BACKUP_LOCAL_KEYS = ['theme', 'palette', 'swipeLeft', 'swipeRight', 'funDeleteAnimation', 'autoLoadImages'];
+const BACKUP_LOCAL_KEYS = ['theme', 'palette', 'swipeLeft', 'swipeRight', 'funDeleteAnimation', 'autoLoadImages', 'spamThreshold', 'tagSuggestThreshold'];
 
 function gatherLocalPreferences() {
   const prefs = {};

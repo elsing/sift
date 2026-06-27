@@ -1,12 +1,14 @@
 import { dryRunHeaders } from './util.js';
 import { getMailById, updateMailTags, removeMailById, render } from './inbox.js';
-import { fetchTags, createTag, getMailTags, setMailTags, renderTagChips, fetchTagHistory, renderSuggestionChips } from './tags.js';
+import { fetchTags, getCachedTags, createTag, getMailTags, setMailTags, renderTagChips, fetchTagHistory, renderSuggestionChips } from './tags.js';
 import { openMoveModalForMail } from './folders.js';
+import { openSearchFrom } from './search.js';
 
 let mailReaderPanel, mailReaderScroll, mailReaderBody, mailReaderHtml, mailReaderHtmlWrap, mailReaderLoading, mailReaderLoadingQuip, mailReaderSubject, mailReaderSender, mailReaderTime, mailReaderTags;
 let imagesBlockedBanner, showImagesBtn, trustSenderBtn, mailReaderAttachments;
 let spamNotice, spamNoticeReasons, notSpamBtn;
 let spamCheckScore, spamCheckAuth, spamCheckReasons;
+let readerFindSenderBtn;
 
 // Shown while a mail's body is loading — every single email open hits this, however
 // briefly, so it's worth being a bit more fun than a bare spinner.
@@ -87,6 +89,11 @@ export function setupMailReader() {
   spamCheckScore = document.getElementById('spamCheckScore');
   spamCheckAuth = document.getElementById('spamCheckAuth');
   spamCheckReasons = document.getElementById('spamCheckReasons');
+  readerFindSenderBtn = document.getElementById('readerFindSenderBtn');
+  readerFindSenderBtn.addEventListener('click', () => {
+    closeReaderPanel();
+    openSearchFrom(readerFindSenderBtn.dataset.sender);
+  });
   notSpamBtn.addEventListener('click', async () => {
     notSpamBtn.disabled = true;
     try {
@@ -114,6 +121,8 @@ export function setupMailReader() {
       });
     } catch {
       // best-effort — worst case images stay blocked and "Show images" still works this time
+    } finally {
+      trustSenderBtn.disabled = false;
     }
     imagesBlockedBanner.classList.add('hidden');
     renderMailHtml(lastHtml, 'proxy', lastMailId);
@@ -244,7 +253,9 @@ export async function openMailReader(row) {
 export async function openMailReaderById(id) {
   onBack = null; // caller sets a destination via setReaderBack right after, if it wants one
   currentMailId = id;
-  showMailMeta({});
+  // Use inbox cache immediately so action buttons have accountId before the meta fetch lands.
+  currentMail = getMailById(id) || null;
+  showMailMeta(currentMail || {});
   const metaRes = await fetch(`/api/mails/${id}`);
   if (!metaRes.ok) {
     mailReaderLoading.classList.add('hidden');
@@ -275,6 +286,7 @@ function showMailMeta(mail) {
   mailReaderLoading.classList.remove('hidden');
   mailReaderBody.classList.add('hidden');
   mailReaderHtmlWrap.classList.add('hidden');
+  mailReaderHtml.removeAttribute('srcdoc'); // cancel any in-flight images from the previous mail
   imagesBlockedBanner.classList.add('hidden');
   mailReaderAttachments.innerHTML = '';
   // Cleared synchronously here, not just inside loadMailBody after its fetch resolves
@@ -284,6 +296,9 @@ function showMailMeta(mail) {
   spamCheckScore.textContent = '';
   spamCheckAuth.innerHTML = '';
   spamCheckReasons.innerHTML = '';
+  const sender = mail.senderEmail || '';
+  readerFindSenderBtn.dataset.sender = sender;
+  readerFindSenderBtn.classList.toggle('hidden', !sender);
   mailReaderPanel.classList.remove('hidden');
   mailReaderScroll.scrollTop = 0; // don't carry over scroll position from whatever was open before
 }
@@ -388,14 +403,29 @@ async function openTagSheet(mailId) {
   tagSheetModal.classList.remove('hidden');
   tagSheetError.textContent = '';
   tagNameInput.value = '';
-  tagSheetList.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
+
+  // Render immediately from cache so the sheet opens without a loading flash. The
+  // inbox mail object already carries the current tag set; the global tag list is
+  // persisted in localStorage. Both are revalidated from the server below and the
+  // sheet re-renders if anything changed.
+  const cachedAllTags = getCachedTags();
+  const cachedMailTags = getMailById(mailId)?.tags ?? [];
+  if (cachedAllTags) {
+    lastAllTags = cachedAllTags;
+    currentChecked = new Set(cachedMailTags.map((t) => t.id));
+    renderTagSheetRows(cachedAllTags);
+  } else {
+    tagSheetList.innerHTML = '<li class="folder-empty-status dot-loader">Loading</li>';
+  }
+
+  // Revalidate from server — tags rarely change, getMailTags confirms the real state.
   try {
     const [allTags, mailTags] = await Promise.all([fetchTags(), getMailTags(mailId)]);
     lastAllTags = allTags;
     currentChecked = new Set(mailTags.map((t) => t.id));
     renderTagSheetRows(allTags);
   } catch (err) {
-    tagSheetList.innerHTML = '';
+    if (!cachedAllTags) tagSheetList.innerHTML = '';
     tagSheetError.textContent = err.message;
   }
 }
@@ -499,6 +529,7 @@ function autoLoadImagesEnabled() {
 
 async function loadMailBody(id) {
   const res = await fetch(`/api/mails/${id}/body`);
+  if (id !== currentMailId) return; // reader moved to a different mail while this was in flight
   mailReaderLoading.classList.add('hidden');
   imagesBlockedBanner.classList.add('hidden');
   if (!res.ok) {
