@@ -341,6 +341,7 @@ async function loadSuggestionChips() {
 let tagSheetModal, tagSheetList, tagSheetError, tagNameInput;
 let lastAllTags = []; // re-filtered locally as you type, rather than re-fetched per keystroke
 let currentChecked = new Set(); // persists across re-renders triggered by filtering, not just the initial open
+let tagSheetDirty = false; // true once user has toggled a tag — prevents server re-validate from overwriting local edits
 
 export function setupTagSheet() {
   tagSheetModal = document.getElementById('tagSheetModal');
@@ -403,6 +404,7 @@ async function openTagSheet(mailId) {
   tagSheetModal.classList.remove('hidden');
   tagSheetError.textContent = '';
   tagNameInput.value = '';
+  tagSheetDirty = false;
 
   // Render immediately from cache so the sheet opens without a loading flash. The
   // inbox mail object already carries the current tag set; the global tag list is
@@ -419,10 +421,12 @@ async function openTagSheet(mailId) {
   }
 
   // Revalidate from server — tags rarely change, getMailTags confirms the real state.
+  // Skip overwriting currentChecked if the user has already toggled something while
+  // this fetch was in flight (their local edit wins over the stale server snapshot).
   try {
     const [allTags, mailTags] = await Promise.all([fetchTags(), getMailTags(mailId)]);
     lastAllTags = allTags;
-    currentChecked = new Set(mailTags.map((t) => t.id));
+    if (!tagSheetDirty) currentChecked = new Set(mailTags.map((t) => t.id));
     renderTagSheetRows(allTags);
   } catch (err) {
     if (!cachedAllTags) tagSheetList.innerHTML = '';
@@ -453,10 +457,18 @@ function renderTagSheetRows(allTags) {
     label.textContent = tag.name;
     li.append(checkbox, dot, label);
     checkbox.addEventListener('change', async () => {
+      tagSheetDirty = true;
       if (checkbox.checked) currentChecked.add(tag.id);
       else currentChecked.delete(tag.id);
-      const updated = await setMailTags(currentMailId, Array.from(currentChecked));
-      refreshReaderTags(updated);
+      try {
+        const updated = await setMailTags(currentMailId, Array.from(currentChecked));
+        refreshReaderTags(updated);
+      } catch (err) {
+        // roll back the checkbox and the set so state stays consistent
+        checkbox.checked = !checkbox.checked;
+        if (checkbox.checked) currentChecked.add(tag.id); else currentChecked.delete(tag.id);
+        tagSheetError.textContent = err.message;
+      }
     });
     tagSheetList.appendChild(li);
   }

@@ -725,7 +725,7 @@ func fetchMailBody(acct dbAccount, password, folder string, uid uint32) (MailBod
 // dominated a large-folder scan's total time far more than the actual fetch did.
 func fetchMailBodyOnConn(c *imapclient.Client, uid uint32) (MailBody, error) {
 	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
-		BodySection: []*imap.FetchItemBodySection{{}},
+		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
 	})
 	defer fetchCmd.Close()
 	msgs, err := fetchCmd.Collect()
@@ -751,7 +751,7 @@ func fetchMailBodiesOnConn(c *imapclient.Client, uids []uint32) map[uint32]MailB
 	}
 	fetchCmd := c.Fetch(imap.UIDSetNum(imapUIDs...), &imap.FetchOptions{
 		UID:         true,
-		BodySection: []*imap.FetchItemBodySection{{}},
+		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
 	})
 	defer fetchCmd.Close()
 	msgs, err := fetchCmd.Collect()
@@ -882,7 +882,7 @@ func fetchMailAttachment(acct dbAccount, password, folder string, uid uint32, in
 	}
 
 	fetchCmd := c.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
-		BodySection: []*imap.FetchItemBodySection{{}},
+		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
 	})
 	defer fetchCmd.Close()
 	msgs, err := fetchCmd.Collect()
